@@ -1,1121 +1,312 @@
-import re
 import numpy as np
+import pandas as pd
+from typing import List, Dict, Tuple, Set
+import re
+from datetime import datetime
 import networkx as nx
 import matplotlib.pyplot as plt
-from typing import List, Dict, Tuple, Set, Optional, Any, Union
-from dataclasses import dataclass, field
 from sentence_transformers import SentenceTransformer
-from sklearn.metrics.pairwise import cosine_similarity
-import seaborn as sns
-from collections import defaultdict
-import pandas as pd
-from enum import Enum
+from transformers import pipeline
 import spacy
-from datetime import datetime
-import dateutil.parser
+from collections import defaultdict
+import seaborn as sns
 
-# Import your key info extractor
-
-
-class HallucinationType(Enum):
-    """Types of hallucinations detected."""
-    VALUE_MISMATCH = "value_mismatch"
-    DATE_MISMATCH = "date_mismatch"
-    ENTITY_MISMATCH = "entity_mismatch"
-    FACT_CONTRADICTION = "fact_contradiction"
-    MISSING_REQUIRED_FACT = "missing_required_fact"
-    UNSUPPORTED_FACT = "unsupported_fact"
-
-
-@dataclass
-class ExtractedElement:
-    """Represents an extracted element with context."""
-    element_type: str  # 'value', 'date', 'entity', 'fact'
-    original_text: str
-    normalized_value: Any
-    context: str
-    start_pos: int
-    end_pos: int
-    metadata: Dict[str, Any] = field(default_factory=dict)
-
-
-@dataclass
-class ParagraphNode:
-    """Represents a paragraph with extracted information."""
-    id: int
-    text: str
-    is_reference: bool = False
-    
-    # Raw extractions from KeyInfoExtractor
-    raw_extraction: Dict[str, Any] = field(default_factory=dict)
-    
-    # Processed elements
-    elements: List[ExtractedElement] = field(default_factory=list)
-    
-    # Hallucination detection results
-    hallucinations: List[Dict[str, Any]] = field(default_factory=list)
-    matched_elements: List[Dict[str, Any]] = field(default_factory=list)
-    missing_elements: List[Dict[str, Any]] = field(default_factory=list)
-    
-    hallucination_score: float = 0.0
-    is_hallucinated: bool = False
-
-
-class EnhancedFactExtractor:
-    """Enhanced extraction that builds on KeyInfoExtractor."""
-    
+class HallucinationDetector:
     def __init__(self):
-        self.key_extractor = KeyInfoExtractor()
+        # Initialize models
+        self.sentence_model = SentenceTransformer('all-MiniLM-L6-v2')
+        # Use correct model name for NLI
+        self.nli_model = pipeline("text-classification", model="cross-encoder/nli-deberta-v3-base")
         self.nlp = spacy.load("en_core_web_sm")
         
-        # Written number mappings
-        self.number_words = {
-            'zero': 0, 'one': 1, 'two': 2, 'three': 3, 'four': 4, 'five': 5,
-            'six': 6, 'seven': 7, 'eight': 8, 'nine': 9, 'ten': 10,
-            'eleven': 11, 'twelve': 12, 'thirteen': 13, 'fourteen': 14, 'fifteen': 15,
-            'sixteen': 16, 'seventeen': 17, 'eighteen': 18, 'nineteen': 19, 'twenty': 20,
-            'thirty': 30, 'forty': 40, 'fifty': 50, 'sixty': 60, 'seventy': 70,
-            'eighty': 80, 'ninety': 90, 'hundred': 100, 'thousand': 1000,
-            'million': 1000000, 'billion': 1000000000
+        # Patterns for extraction
+        self.date_pattern = r'\b(?:\d{1,2}[-/]\d{1,2}[-/]\d{2,4}|\d{4}[-/]\d{1,2}[-/]\d{1,2}|(?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)[a-z]* \d{1,2},? \d{4})\b'
+        self.money_pattern = r'\$[\d,]+(?:\.\d{2})?|\b\d+(?:,\d{3})*(?:\.\d{2})?\s*(?:dollars?|USD|cents?)\b'
+        self.number_pattern = r'\b\d+(?:,\d{3})*(?:\.\d+)?\b'
+        
+    def extract_entities(self, text: str) -> Dict[str, Set]:
+        """Extract important information from text"""
+        entities = {
+            'dates': set(re.findall(self.date_pattern, text, re.IGNORECASE)),
+            'money': set(re.findall(self.money_pattern, text, re.IGNORECASE)),
+            'numbers': set(re.findall(self.number_pattern, text)),
+            'named_entities': set(),
+            'facts': []
         }
         
-        # Fact patterns
-        self.fact_patterns = [
-            # Status patterns
-            (r'(\w+(?:\s+\w+){0,3})\s+(?:rule|check|validation)\s+(?:failed|passed|triggered)', 'rule_status'),
-            (r'(?:failed|passed)\s+(?:due to|because of|as)\s+([^.]+)', 'failure_reason'),
-            
-            # Temporal patterns
-            (r'within\s+(?:the\s+)?(?:past|last|next)?\s*(\d+|[a-z]+)\s+(days?|months?|years?)', 'time_period'),
-            (r'(?:from|between)\s+([^to]+)\s+to\s+([^.]+)', 'date_range'),
-            
-            # Value patterns
-            (r'(?:amount|balance|loan|payment|value)\s+(?:of|is|was|equals?)?\s*(?:rs\.?|₹|\$)?\s*([0-9,]+|[a-z\s]+)', 'amount'),
-            (r'(?:outstanding|remaining|available|total)\s+([^.]+)', 'quantity_statement'),
-            
-            # Action patterns
-            (r'(?:has|have)\s+(?:made|completed|done|performed)\s+([^.]+)', 'completed_action'),
-            (r'(?:has|have)\s+(?:a|an)?\s*([^.]+)', 'possession_statement'),
-            
-            # Change patterns
-            (r'(?:change|modification|update)\s+(?:in|to|of)\s+([^.]+)', 'change_statement')
-        ]
+        # Extract named entities using spaCy
+        doc = self.nlp(text)
+        for ent in doc.ents:
+            if ent.label_ in ['PERSON', 'ORG', 'GPE', 'PRODUCT']:
+                entities['named_entities'].add((ent.text, ent.label_))
+        
+        # Extract key facts (sentences with entities)
+        sentences = text.split('.')
+        for sent in sentences:
+            if any(ent in sent for ent_list in [entities['dates'], entities['money']] for ent in ent_list):
+                entities['facts'].append(sent.strip())
+        
+        return entities
     
-    def extract_all_elements(self, text: str) -> Tuple[Dict[str, Any], List[ExtractedElement]]:
-        """Extract all elements from text."""
-        # First use KeyInfoExtractor
-        raw_extraction = self.key_extractor.extract(text)
-        
-        # Process into elements
-        elements = []
-        
-        # Process dates
-        for date_str in raw_extraction.get('dates', []):
-            element = self._create_date_element(date_str, text)
-            if element:
-                elements.append(element)
-        
-        # Process money values
-        for money_str in raw_extraction.get('money', []):
-            element = self._create_money_element(money_str, text)
-            if element:
-                elements.append(element)
-        
-        # Process numbers
-        for number_str in raw_extraction.get('numbers', []):
-            element = self._create_number_element(number_str, text)
-            if element:
-                elements.append(element)
-        
-        # Process entities
-        for entity in raw_extraction.get('entities', []):
-            element = self._create_entity_element(entity, text)
-            if element:
-                elements.append(element)
-        
-        # Extract written numbers not caught by number extractor
-        written_number_elements = self._extract_written_numbers(text)
-        elements.extend(written_number_elements)
-        
-        # Extract facts and statements
-        fact_elements = self._extract_facts(text)
-        elements.extend(fact_elements)
-        
-        # Remove duplicate elements
-        elements = self._deduplicate_elements(elements)
-        
-        return raw_extraction, elements
-    
-    def _create_date_element(self, date_str: str, text: str) -> Optional[ExtractedElement]:
-        """Create element for date."""
-        # Find date in text
-        date_match = None
-        
-        # Try to find the original date format in text
-        # The ISO date might be converted, so we need to find the original
-        try:
-            # Parse the ISO date
-            parsed_date = dateutil.parser.parse(date_str)
-            
-            # Common date patterns to search for
-            date_patterns = [
-                r'\b\d{1,2}[-/]\d{1,2}[-/]\d{2,4}\b',
-                r'\b\d{2,4}[-/]\d{1,2}[-/]\d{1,2}\b',
-                r'\b\d{1,2}\s+(?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)[a-z]*\s+\d{4}\b',
-                r'\b(?:January|February|March|April|May|June|July|August|September|October|November|December)\s+\d{1,2},?\s+\d{4}\b'
-            ]
-            
-            for pattern in date_patterns:
-                for match in re.finditer(pattern, text, re.IGNORECASE):
-                    try:
-                        match_date = dateutil.parser.parse(match.group())
-                        if match_date.date() == parsed_date.date():
-                            date_match = match
-                            break
-                    except:
-                        continue
-                if date_match:
-                    break
-            
-            if date_match:
-                start = date_match.start()
-                end = date_match.end()
-                context_start = max(0, start - 50)
-                context_end = min(len(text), end + 50)
-                
-                return ExtractedElement(
-                    element_type='date',
-                    original_text=date_match.group(),
-                    normalized_value=date_str,  # ISO format
-                    context=text[context_start:context_end],
-                    start_pos=start,
-                    end_pos=end,
-                    metadata={'parsed_date': parsed_date}
-                )
-        except:
-            pass
-        
-        return None
-    
-    def _create_money_element(self, money_str: str, text: str) -> Optional[ExtractedElement]:
-        """Create element for money value."""
-        # Find money string in text
-        start = text.find(money_str)
-        if start == -1:
-            return None
-        
-        end = start + len(money_str)
-        context_start = max(0, start - 50)
-        context_end = min(len(text), end + 50)
-        
-        # Parse value
-        value = self._parse_money_value(money_str)
-        
-        return ExtractedElement(
-            element_type='value',
-            original_text=money_str,
-            normalized_value=value,
-            context=text[context_start:context_end],
-            start_pos=start,
-            end_pos=end,
-            metadata={'value_type': 'money', 'original_format': money_str}
-        )
-    
-    def _create_number_element(self, number_str: str, text: str) -> Optional[ExtractedElement]:
-        """Create element for number."""
-        # Find number in text
-        start = text.find(number_str)
-        if start == -1:
-            return None
-        
-        end = start + len(number_str)
-        context_start = max(0, start - 50)
-        context_end = min(len(text), end + 50)
-        context = text[context_start:context_end]
-        
-        # Determine type based on context
-        value_type = 'number'
-        if any(word in context.lower() for word in ['days', 'months', 'years', 'hours', 'minutes']):
-            value_type = 'duration'
-        elif any(word in context.lower() for word in ['balance', 'amount', 'loan', 'payment', 'cost', 'price']):
-            value_type = 'money'
-        
-        try:
-            value = float(number_str.replace(',', ''))
-        except:
-            return None
-        
-        return ExtractedElement(
-            element_type='value',
-            original_text=number_str,
-            normalized_value=value,
-            context=context,
-            start_pos=start,
-            end_pos=end,
-            metadata={'value_type': value_type}
-        )
-    
-    def _create_entity_element(self, entity_dict: Dict[str, str], text: str) -> Optional[ExtractedElement]:
-        """Create element for entity."""
-        entity_text = entity_dict['text']
-        entity_label = entity_dict['label']
-        
-        # Find entity in text
-        start = text.find(entity_text)
-        if start == -1:
-            return None
-        
-        end = start + len(entity_text)
-        context_start = max(0, start - 50)
-        context_end = min(len(text), end + 50)
-        
-        return ExtractedElement(
-            element_type='entity',
-            original_text=entity_text,
-            normalized_value=entity_text.lower(),
-            context=text[context_start:context_end],
-            start_pos=start,
-            end_pos=end,
-            metadata={'entity_type': entity_label}
-        )
-    
-    def _extract_written_numbers(self, text: str) -> List[ExtractedElement]:
-        """Extract numbers written as words."""
-        elements = []
-        text_lower = text.lower()
-        
-        # Pattern for written numbers
-        # Match patterns like "ten thousand", "fifteen hundred", etc.
-        for match in re.finditer(r'\b([a-z]+)(?:\s+)(thousand|hundred|million|billion)?\b', text_lower):
-            first_word = match.group(1)
-            multiplier_word = match.group(2)
-            
-            if first_word in self.number_words:
-                value = self.number_words[first_word]
-                
-                if multiplier_word and multiplier_word in self.number_words:
-                    value *= self.number_words[multiplier_word]
-                
-                if value > 0:
-                    start = match.start()
-                    end = match.end()
-                    context_start = max(0, start - 50)
-                    context_end = min(len(text), end + 50)
-                    context = text[context_start:context_end]
-                    
-                    # Determine type
-                    value_type = 'number'
-                    if any(word in context.lower() for word in ['amount', 'balance', 'loan', 'payment']):
-                        value_type = 'money'
-                    
-                    elements.append(ExtractedElement(
-                        element_type='value',
-                        original_text=text[start:end],
-                        normalized_value=float(value),
-                        context=context,
-                        start_pos=start,
-                        end_pos=end,
-                        metadata={'value_type': value_type, 'written_number': True}
-                    ))
-        
-        return elements
-    
-    def _extract_facts(self, text: str) -> List[ExtractedElement]:
-        """Extract factual statements."""
-        elements = []
-        
-        # Extract using patterns
-        for pattern, fact_type in self.fact_patterns:
-            for match in re.finditer(pattern, text, re.IGNORECASE):
-                # Get full sentence
-                sent_start = text.rfind('.', 0, match.start())
-                sent_start = sent_start + 1 if sent_start != -1 else 0
-                sent_end = text.find('.', match.end())
-                sent_end = sent_end if sent_end != -1 else len(text)
-                
-                sentence = text[sent_start:sent_end].strip()
-                
-                elements.append(ExtractedElement(
-                    element_type='fact',
-                    original_text=match.group(0),
-                    normalized_value=match.group(0).lower(),
-                    context=sentence,
-                    start_pos=match.start(),
-                    end_pos=match.end(),
-                    metadata={'fact_type': fact_type, 'full_sentence': sentence}
-                ))
-        
-        return elements
-    
-    def _parse_money_value(self, money_str: str) -> float:
-        """Parse money string to float value."""
-        # Remove currency symbols and spaces
-        clean_str = re.sub(r'[₹$£€¥,\s]', '', money_str)
-        
-        # Extract number
-        match = re.search(r'[\d.]+', clean_str)
-        if not match:
-            return 0.0
-        
-        value = float(match.group())
-        
-        # Apply multipliers
-        if any(x in money_str.lower() for x in ['billion', 'b']):
-            value *= 1e9
-        elif any(x in money_str.lower() for x in ['million', 'm']):
-            value *= 1e6
-        elif any(x in money_str.lower() for x in ['thousand', 'k']):
-            value *= 1e3
-        elif any(x in money_str.lower() for x in ['lakh', 'lac', 'l']):
-            value *= 1e5
-        elif any(x in money_str.lower() for x in ['crore', 'cr', 'c']):
-            value *= 1e7
-        
-        return value
-    
-    def _deduplicate_elements(self, elements: List[ExtractedElement]) -> List[ExtractedElement]:
-        """Remove duplicate elements based on position overlap."""
-        if not elements:
-            return elements
-        
-        # Sort by start position
-        elements.sort(key=lambda x: x.start_pos)
-        
-        # Remove overlapping elements
-        deduped = []
-        for elem in elements:
-            # Check if this element overlaps with any already added
-            overlap = False
-            for existing in deduped:
-                if (elem.start_pos >= existing.start_pos and elem.start_pos < existing.end_pos) or \
-                   (elem.end_pos > existing.start_pos and elem.end_pos <= existing.end_pos):
-                    # Keep the longer element
-                    if elem.end_pos - elem.start_pos > existing.end_pos - existing.start_pos:
-                        deduped.remove(existing)
-                    else:
-                        overlap = True
-                    break
-            
-            if not overlap:
-                deduped.append(elem)
-        
-        return deduped
-
-
-class AccurateHallucinationDetector:
-    """Accurate hallucination detection with multiple strategies."""
-    
-    def __init__(self, reference_node: ParagraphNode):
-        self.reference = reference_node
-        self.semantic_model = SentenceTransformer('all-MiniLM-L6-v2')
-        
-        # Build indices for quick lookup
-        self._build_reference_indices()
-    
-    def _build_reference_indices(self):
-        """Build indices for efficient matching."""
-        # Group elements by type
-        self.ref_elements_by_type = defaultdict(list)
-        for elem in self.reference.elements:
-            self.ref_elements_by_type[elem.element_type].append(elem)
-        
-        # Create value index
-        self.ref_values = {}
-        for elem in self.ref_elements_by_type['value']:
-            key = (elem.normalized_value, elem.metadata.get('value_type', 'number'))
-            self.ref_values[key] = elem
-        
-        # Create date index
-        self.ref_dates = {elem.normalized_value: elem for elem in self.ref_elements_by_type['date']}
-        
-        # Create entity index
-        self.ref_entities = {}
-        for elem in self.ref_elements_by_type['entity']:
-            key = (elem.normalized_value, elem.metadata.get('entity_type', 'UNKNOWN'))
-            self.ref_entities[key] = elem
-        
-        # Compute fact embeddings
-        ref_facts = self.ref_elements_by_type['fact']
-        if ref_facts:
-            self.ref_fact_texts = [f.metadata.get('full_sentence', f.context) for f in ref_facts]
-            self.ref_fact_embeddings = self.semantic_model.encode(self.ref_fact_texts)
-        else:
-            self.ref_fact_texts = []
-            self.ref_fact_embeddings = None
-    
-    def detect_hallucinations(self, node: ParagraphNode) -> ParagraphNode:
-        """Detect all types of hallucinations."""
-        if node.is_reference:
-            return node
-        
-        hallucinations = []
-        matched_elements = []
-        missing_elements = []
-        
-        # Check each element type
-        results = self._check_values(node)
-        hallucinations.extend(results['hallucinations'])
-        matched_elements.extend(results['matches'])
-        
-        results = self._check_dates(node)
-        hallucinations.extend(results['hallucinations'])
-        matched_elements.extend(results['matches'])
-        
-        results = self._check_entities(node)
-        hallucinations.extend(results['hallucinations'])
-        matched_elements.extend(results['matches'])
-        
-        results = self._check_facts(node)
-        hallucinations.extend(results['hallucinations'])
-        matched_elements.extend(results['matches'])
-        
-        # Check for missing required elements
-        missing = self._check_missing_elements(node, matched_elements)
-        missing_elements.extend(missing)
-        
-        # Update node
-        node.hallucinations = hallucinations
-        node.matched_elements = matched_elements
-        node.missing_elements = missing_elements
-        
-        # Calculate score
-        total_ref_elements = len(self.reference.elements)
-        total_issues = len(hallucinations) + len(missing_elements)
-        
-        if total_ref_elements > 0:
-            node.hallucination_score = total_issues / total_ref_elements
-            node.is_hallucinated = node.hallucination_score > 0.1
-        
-        return node
-    
-    def _check_values(self, node: ParagraphNode) -> Dict[str, List]:
-        """Check all values against reference."""
-        hallucinations = []
-        matches = []
-        
-        node_values = [e for e in node.elements if e.element_type == 'value']
-        
-        for elem in node_values:
-            value = elem.normalized_value
-            value_type = elem.metadata.get('value_type', 'number')
-            
-            # Look for exact match
-            ref_key = (value, value_type)
-            if ref_key in self.ref_values:
-                matches.append({
-                    'element': elem,
-                    'matched_with': self.ref_values[ref_key],
-                    'match_type': 'exact'
-                })
-            else:
-                # Look for close match with same type
-                close_match = None
-                for (ref_val, ref_type), ref_elem in self.ref_values.items():
-                    if ref_type == value_type:
-                        # Check if values are close
-                        if self._values_are_close(value, ref_val, value_type):
-                            # Check context similarity
-                            if self._contexts_similar(elem.context, ref_elem.context):
-                                close_match = ref_elem
-                                break
-                
-                if close_match:
-                    hallucinations.append({
-                        'type': HallucinationType.VALUE_MISMATCH,
-                        'element': elem,
-                        'expected': close_match.normalized_value,
-                        'expected_text': close_match.original_text,
-                        'got': value,
-                        'got_text': elem.original_text,
-                        'severity': 'high' if value_type == 'money' else 'medium'
-                    })
-                else:
-                    # Value not found in reference
-                    if value_type in ['money', 'duration'] or value > 100:  # Significant values
-                        hallucinations.append({
-                            'type': HallucinationType.UNSUPPORTED_FACT,
-                            'element': elem,
-                            'reason': f"Value '{elem.original_text}' not found in reference",
-                            'severity': 'medium'
-                        })
-        
-        return {'hallucinations': hallucinations, 'matches': matches}
-    
-    def _check_dates(self, node: ParagraphNode) -> Dict[str, List]:
-        """Check dates against reference."""
-        hallucinations = []
-        matches = []
-        
-        node_dates = [e for e in node.elements if e.element_type == 'date']
-        
-        for elem in node_dates:
-            date_iso = elem.normalized_value
-            
-            if date_iso in self.ref_dates:
-                matches.append({
-                    'element': elem,
-                    'matched_with': self.ref_dates[date_iso],
-                    'match_type': 'exact'
-                })
-            else:
-                # Check if it's a different date in similar context
-                context_match = self._find_date_context_match(elem)
-                if context_match:
-                    hallucinations.append({
-                        'type': HallucinationType.DATE_MISMATCH,
-                        'element': elem,
-                        'expected': context_match.normalized_value,
-                        'expected_text': context_match.original_text,
-                        'got': date_iso,
-                        'got_text': elem.original_text,
-                        'severity': 'high'
-                    })
-                else:
-                    hallucinations.append({
-                        'type': HallucinationType.UNSUPPORTED_FACT,
-                        'element': elem,
-                        'reason': f"Date '{elem.original_text}' not found in reference",
-                        'severity': 'medium'
-                    })
-        
-        return {'hallucinations': hallucinations, 'matches': matches}
-    
-    def _check_entities(self, node: ParagraphNode) -> Dict[str, List]:
-        """Check entities against reference."""
-        hallucinations = []
-        matches = []
-        
-        node_entities = [e for e in node.elements if e.element_type == 'entity']
-        
-        for elem in node_entities:
-            entity_norm = elem.normalized_value
-            entity_type = elem.metadata.get('entity_type', 'UNKNOWN')
-            
-            # Look for exact match
-            ref_key = (entity_norm, entity_type)
-            if ref_key in self.ref_entities:
-                matches.append({
-                    'element': elem,
-                    'matched_with': self.ref_entities[ref_key],
-                    'match_type': 'exact'
-                })
-            else:
-                # Look for partial match
-                partial_match = self._find_partial_entity_match(elem)
-                if partial_match:
-                    matches.append({
-                        'element': elem,
-                        'matched_with': partial_match,
-                        'match_type': 'partial'
-                    })
-                else:
-                    # Entity not in reference - only flag if it's significant
-                    if entity_type in ['PERSON', 'ORG', 'GPE']:
-                        hallucinations.append({
-                            'type': HallucinationType.ENTITY_MISMATCH,
-                            'element': elem,
-                            'reason': f"Entity '{elem.original_text}' not found in reference",
-                            'severity': 'low'
-                        })
-        
-        return {'hallucinations': hallucinations, 'matches': matches}
-    
-    def _check_facts(self, node: ParagraphNode) -> Dict[str, List]:
-        """Check facts using semantic similarity."""
-        hallucinations = []
-        matches = []
-        
-        node_facts = [e for e in node.elements if e.element_type == 'fact']
-        
-        if not node_facts or self.ref_fact_embeddings is None:
-            return {'hallucinations': hallucinations, 'matches': matches}
-        
-        # Encode node facts
-        node_fact_texts = [f.metadata.get('full_sentence', f.context) for f in node_facts]
-        node_embeddings = self.semantic_model.encode(node_fact_texts)
-        
-        # Compare each fact
-        for i, elem in enumerate(node_facts):
-            similarities = cosine_similarity([node_embeddings[i]], self.ref_fact_embeddings)[0]
-            max_sim = np.max(similarities)
-            best_idx = np.argmax(similarities)
-            
-            if max_sim > 0.85:  # Very similar - matched
-                matches.append({
-                    'element': elem,
-                    'matched_with': self.ref_elements_by_type['fact'][best_idx],
-                    'similarity': float(max_sim),
-                    'match_type': 'semantic'
-                })
-            elif max_sim > 0.6:  # Somewhat similar - check for contradiction
-                ref_fact = self.ref_elements_by_type['fact'][best_idx]
-                if self._facts_contradict(elem, ref_fact):
-                    hallucinations.append({
-                        'type': HallucinationType.FACT_CONTRADICTION,
-                        'element': elem,
-                        'contradicts': ref_fact,
-                        'reason': 'Fact contradicts reference',
-                        'severity': 'high'
-                    })
-                else:
-                    # Similar but not contradictory - partial match
-                    matches.append({
-                        'element': elem,
-                        'matched_with': ref_fact,
-                        'similarity': float(max_sim),
-                        'match_type': 'partial'
-                    })
-            else:  # Low similarity
-                # Check if it's a significant fact
-                if self._is_significant_fact(elem):
-                    hallucinations.append({
-                        'type': HallucinationType.UNSUPPORTED_FACT,
-                        'element': elem,
-                        'reason': f"Fact not supported by reference",
-                        'severity': 'medium'
-                    })
-        
-        return {'hallucinations': hallucinations, 'matches': matches}
-    
-    def _check_missing_elements(self, node: ParagraphNode, matched_elements: List[Dict]) -> List[Dict]:
-        """Check for important elements missing from the paragraph."""
-        missing = []
-        
-        # Get matched reference elements
-        matched_ref_elements = {m['matched_with'].start_pos for m in matched_elements if 'matched_with' in m}
-        
-        # Check each reference element
-        for ref_elem in self.reference.elements:
-            if ref_elem.start_pos not in matched_ref_elements:
-                # Check if it's an important element
-                if self._is_important_element(ref_elem):
-                    missing.append({
-                        'type': HallucinationType.MISSING_REQUIRED_FACT,
-                        'reference_element': ref_elem,
-                        'severity': 'high' if ref_elem.element_type in ['value', 'date'] else 'medium'
-                    })
-        
-        return missing
-    
-    def _values_are_close(self, val1: float, val2: float, value_type: str) -> bool:
-        """Check if two values are close enough to be the same."""
-        if val1 == val2:
-            return True
-        
-        # Different tolerance for different types
-        if value_type == 'money':
-            # 1% tolerance for money
-            return abs(val1 - val2) / max(val1, val2) < 0.01
-        elif value_type == 'duration':
-            # Exact match for durations
-            return val1 == val2
-        else:
-            # 5% tolerance for other numbers
-            return abs(val1 - val2) / max(val1, val2) < 0.05
-    
-    def _contexts_similar(self, context1: str, context2: str) -> bool:
-        """Check if two contexts are similar."""
-        # Tokenize and clean
-        words1 = set(context1.lower().split())
-        words2 = set(context2.lower().split())
-        
-        # Remove stopwords
-        stopwords = {'the', 'a', 'an', 'is', 'are', 'was', 'were', 'in', 'on', 'at', 'to', 'for', 'of', 'with', 'by'}
-        words1 -= stopwords
-        words2 -= stopwords
-        
-        if not words1 or not words2:
-            return False
-        
-        # Calculate Jaccard similarity
-        intersection = len(words1 & words2)
-        union = len(words1 | words2)
-        
-        return intersection / union > 0.3
-    
-    def _find_date_context_match(self, elem: ExtractedElement) -> Optional[ExtractedElement]:
-        """Find if a different date appears in similar context."""
-        best_match = None
-        best_similarity = 0
-        
-        for ref_date in self.ref_dates.values():
-            similarity = self._context_similarity_score(elem.context, ref_date.context)
-            if similarity > best_similarity and similarity > 0.5:
-                best_similarity = similarity
-                best_match = ref_date
-        
-        return best_match
-    
-    def _find_partial_entity_match(self, elem: ExtractedElement) -> Optional[ExtractedElement]:
-        """Find partial entity matches."""
-        entity_words = set(elem.normalized_value.split())
-        
-        for ref_entity in self.ref_entities.values():
-            ref_words = set(ref_entity.normalized_value.split())
-            
-            # Check word overlap
-            overlap = len(entity_words & ref_words)
-            if overlap > 0 and overlap >= min(len(entity_words), len(ref_words)) * 0.5:
-                return ref_entity
-        
-        return None
-    
-    def _facts_contradict(self, fact1: ExtractedElement, fact2: ExtractedElement) -> bool:
-        """Check if two facts contradict each other."""
-        text1 = fact1.metadata.get('full_sentence', fact1.original_text).lower()
-        text2 = fact2.metadata.get('full_sentence', fact2.original_text).lower()
-        
-        # Negation indicators
-        negations = ['not', 'no', 'never', 'failed', 'didn\'t', 'cannot', 'can\'t', 'unable']
-        affirmations = ['yes', 'passed', 'succeeded', 'completed', 'done', 'made', 'has', 'have']
-        
-        has_negation1 = any(neg in text1 for neg in negations)
-        has_negation2 = any(neg in text2 for neg in negations)
-        has_affirmation1 = any(aff in text1 for aff in affirmations)
-        has_affirmation2 = any(aff in text2 for aff in affirmations)
-        
-        # One negative, one positive = contradiction
-        if (has_negation1 and has_affirmation2) or (has_affirmation1 and has_negation2):
-            return True
-        
-        # Check for specific contradictions
-        if 'failed' in text1 and 'passed' in text2:
-            return True
-        if 'passed' in text1 and 'failed' in text2:
-            return True
-        
-        return False
-    
-    def _is_significant_fact(self, elem: ExtractedElement) -> bool:
-        """Check if a fact is significant enough to flag."""
-        fact_type = elem.metadata.get('fact_type', '')
-        
-        # Always significant
-        if fact_type in ['rule_status', 'failure_reason', 'amount']:
-            return True
-        
-        # Check content
-        text = elem.original_text.lower()
-        significant_keywords = ['failed', 'passed', 'completed', 'outstanding', 'available', 'required']
-        
-        return any(keyword in text for keyword in significant_keywords)
-    
-    def _is_important_element(self, elem: ExtractedElement) -> bool:
-        """Check if an element is important enough to be required."""
-        # All dates and money values are important
-        if elem.element_type == 'date':
-            return True
-        
-        if elem.element_type == 'value' and elem.metadata.get('value_type') == 'money':
-            return True
-        
-        # Important facts
-        if elem.element_type == 'fact':
-            fact_type = elem.metadata.get('fact_type', '')
-            if fact_type in ['rule_status', 'failure_reason', 'amount']:
-                return True
-        
-        return False
-    
-    def _context_similarity_score(self, context1: str, context2: str) -> float:
-        """Calculate similarity score between contexts."""
-        # Use embeddings for better similarity
-        embeddings = self.semantic_model.encode([context1, context2])
-        similarity = cosine_similarity([embeddings[0]], [embeddings[1]])[0][0]
+    def semantic_similarity(self, text1: str, text2: str) -> float:
+        """Calculate semantic similarity between two texts"""
+        embeddings = self.sentence_model.encode([text1, text2])
+        similarity = np.dot(embeddings[0], embeddings[1]) / (np.linalg.norm(embeddings[0]) * np.linalg.norm(embeddings[1]))
         return float(similarity)
-
-
-class RobustHallucinationScorer:
-    """Main scorer with robust error handling and reporting."""
     
-    def __init__(self):
-        self.extractor = EnhancedFactExtractor()
-        self.semantic_model = SentenceTransformer('all-MiniLM-L6-v2')
+    def check_entailment(self, premise: str, hypothesis: str) -> Dict[str, float]:
+        """Check if premise entails hypothesis using NLI model"""
+        # Format input for the model
+        input_text = f"{premise} [SEP] {hypothesis}"
+        result = self.nli_model(input_text)
+        
+        # Convert to entailment scores
+        entailment_scores = {
+            'entailment': 0.0,
+            'neutral': 0.0,
+            'contradiction': 0.0
+        }
+        
+        # Map model outputs to standard labels
+        label_mapping = {
+            'ENTAILMENT': 'entailment',
+            'NEUTRAL': 'neutral',
+            'CONTRADICTION': 'contradiction'
+        }
+        
+        for item in result:
+            label = item['label'].upper()
+            if label in label_mapping:
+                entailment_scores[label_mapping[label]] = item['score']
+        
+        return entailment_scores
     
-    def analyze_paragraphs(self, paragraphs: List[str], reference_idx: int = 0) -> Dict[str, Any]:
-        """Analyze paragraphs for hallucinations with comprehensive reporting."""
+    def compare_entities(self, entities1: Dict, entities2: Dict) -> float:
+        """Compare extracted entities between two texts"""
+        consistency_scores = []
         
-        if not paragraphs:
-            raise ValueError("No paragraphs provided")
+        # Compare dates
+        if entities1['dates'] and entities2['dates']:
+            date_overlap = len(entities1['dates'] & entities2['dates']) / max(len(entities1['dates']), len(entities2['dates']))
+            consistency_scores.append(date_overlap)
         
-        if reference_idx < 0 or reference_idx >= len(paragraphs):
-            raise ValueError(f"Invalid reference index: {reference_idx}")
+        # Compare money values
+        if entities1['money'] and entities2['money']:
+            money_overlap = len(entities1['money'] & entities2['money']) / max(len(entities1['money']), len(entities2['money']))
+            consistency_scores.append(money_overlap)
         
-        print(f"\n{'='*60}")
-        print(f"HALLUCINATION DETECTION ANALYSIS")
-        print(f"{'='*60}")
-        print(f"Reference paragraph: {reference_idx}")
-        print(f"Total paragraphs: {len(paragraphs)}")
+        # Compare named entities
+        if entities1['named_entities'] and entities2['named_entities']:
+            ne_overlap = len(entities1['named_entities'] & entities2['named_entities']) / max(len(entities1['named_entities']), len(entities2['named_entities']))
+            consistency_scores.append(ne_overlap)
         
-        # Extract from all paragraphs
-        nodes = []
+        return np.mean(consistency_scores) if consistency_scores else 1.0
+    
+    def classify_hallucination(self, reference_text: str, candidate_text: str) -> Dict:
+        """Classify if candidate text contains hallucinations compared to reference"""
+        # Extract entities
+        ref_entities = self.extract_entities(reference_text)
+        cand_entities = self.extract_entities(candidate_text)
+        
+        # Calculate metrics
+        semantic_sim = self.semantic_similarity(reference_text, candidate_text)
+        entity_consistency = self.compare_entities(ref_entities, cand_entities)
+        entailment_scores = self.check_entailment(reference_text, candidate_text)
+        
+        # Combine scores for final classification
+        hallucination_score = (
+            (1 - semantic_sim) * 0.3 +
+            (1 - entity_consistency) * 0.4 +
+            entailment_scores['contradiction'] * 0.3
+        )
+        
+        is_hallucinated = hallucination_score > 0.5
+        
+        return {
+            'is_hallucinated': is_hallucinated,
+            'hallucination_score': hallucination_score,
+            'semantic_similarity': semantic_sim,
+            'entity_consistency': entity_consistency,
+            'entailment_scores': entailment_scores,
+            'extracted_entities': {
+                'reference': ref_entities,
+                'candidate': cand_entities
+            }
+        }
+    
+    def build_consistency_graph(self, paragraphs: List[str], reference_idx: int = 0) -> nx.DiGraph:
+        """Build a directed graph of paragraph consistencies"""
+        G = nx.DiGraph()
+        n = len(paragraphs)
+        
+        # Add nodes
         for i, para in enumerate(paragraphs):
-            print(f"\n--- Processing paragraph {i} ---")
-            
-            raw_extraction, elements = self.extractor.extract_all_elements(para)
-            
-            node = ParagraphNode(
-                id=i,
-                text=para,
-                is_reference=(i == reference_idx),
-                raw_extraction=raw_extraction,
-                elements=elements
-            )
-            
-            # Print extraction summary
-            self._print_extraction_summary(node)
-            
-            nodes.append(node)
+            G.add_node(i, text=para[:50] + "...", is_reference=(i == reference_idx))
         
-        # Get reference node
-        reference_node = nodes[reference_idx]
+        # Add edges with consistency scores
+        consistency_matrix = np.zeros((n, n))
         
-        # Detect hallucinations
-        print(f"\n{'='*60}")
-        print("DETECTING HALLUCINATIONS")
-        print(f"{'='*60}")
+        for i in range(n):
+            for j in range(n):
+                if i != j:
+                    result = self.classify_hallucination(paragraphs[i], paragraphs[j])
+                    consistency = 1 - result['hallucination_score']
+                    consistency_matrix[i][j] = consistency
+                    
+                    # Add edge if consistency is above threshold
+                    if consistency > 0.5:
+                        G.add_edge(i, j, weight=consistency, 
+                                 semantic_sim=result['semantic_similarity'],
+                                 entity_consistency=result['entity_consistency'])
         
-        detector = AccurateHallucinationDetector(reference_node)
-        
-        for node in nodes:
-            if not node.is_reference:
-                print(f"\nAnalyzing paragraph {node.id}...")
-                detector.detect_hallucinations(node)
-                self._print_detection_summary(node)
-        
-        # Generate comprehensive report
-        report = self._generate_detailed_report(nodes)
-        summary = self._generate_summary(nodes)
-        
-        # Compute similarities
-        texts = [n.text for n in nodes]
-        embeddings = self.semantic_model.encode(texts)
-        similarity_matrix = cosine_similarity(embeddings)
-        
-        return {
-            'nodes': nodes,
-            'report': report,
-            'summary': summary,
-            'similarity_matrix': similarity_matrix
-        }
+        return G, consistency_matrix
     
-    def _print_extraction_summary(self, node: ParagraphNode):
-        """Print summary of extracted elements."""
-        print(f"  Extracted elements:")
+    def calculate_graph_metrics(self, G: nx.DiGraph) -> Dict:
+        """Calculate graph-based consistency metrics"""
+        metrics = {}
         
-        # Group by type
-        by_type = defaultdict(list)
-        for elem in node.elements:
-            by_type[elem.element_type].append(elem)
+        # Basic metrics
+        metrics['num_nodes'] = G.number_of_nodes()
+        metrics['num_edges'] = G.number_of_edges()
+        metrics['density'] = nx.density(G)
         
-        for elem_type, elems in by_type.items():
-            print(f"    {elem_type.upper()}:")
-            for elem in elems[:3]:  # Show first 3
-                if elem_type == 'value':
-                    print(f"      - {elem.original_text} = {elem.normalized_value} ({elem.metadata.get('value_type', 'number')})")
-                elif elem_type == 'date':
-                    print(f"      - {elem.original_text} = {elem.normalized_value}")
-                elif elem_type == 'entity':
-                    print(f"      - {elem.original_text} ({elem.metadata.get('entity_type', 'UNKNOWN')})")
-                elif elem_type == 'fact':
-                    print(f"      - {elem.original_text[:50]}... ({elem.metadata.get('fact_type', 'statement')})")
-            
-            if len(elems) > 3:
-                print(f"      ... and {len(elems) - 3} more")
-    
-    def _print_detection_summary(self, node: ParagraphNode):
-        """Print summary of detection results."""
-        print(f"  Results:")
-        print(f"    Matched elements: {len(node.matched_elements)}")
-        print(f"    Hallucinations: {len(node.hallucinations)}")
-        print(f"    Missing elements: {len(node.missing_elements)}")
-        print(f"    Hallucination score: {node.hallucination_score:.2f}")
+        # Centrality measures
+        metrics['in_degree_centrality'] = nx.in_degree_centrality(G)
+        metrics['out_degree_centrality'] = nx.out_degree_centrality(G)
+        metrics['pagerank'] = nx.pagerank(G, weight='weight')
         
-        if node.hallucinations:
-            print(f"    Hallucination details:")
-            for hall in node.hallucinations[:3]:
-                print(f"      - {hall['type'].value}: {hall.get('reason', 'See details')}")
-                if 'expected' in hall and 'got' in hall:
-                    print(f"        Expected: {hall['expected_text']}")
-                    print(f"        Got: {hall['got_text']}")
-    
-    def _generate_detailed_report(self, nodes: List[ParagraphNode]) -> pd.DataFrame:
-        """Generate detailed report DataFrame."""
-        report_data = []
+        # Clustering and connectivity
+        undirected_G = G.to_undirected()
+        metrics['clustering_coefficient'] = nx.average_clustering(undirected_G, weight='weight')
+        metrics['is_strongly_connected'] = nx.is_strongly_connected(G)
         
-        for node in nodes:
-            if node.is_reference:
-                report_data.append({
-                    'Paragraph ID': node.id,
-                    'Type': 'REFERENCE',
-                    'Text Preview': node.text[:100] + '...',
-                    'Total Elements': len(node.elements),
-                    'Dates': len([e for e in node.elements if e.element_type == 'date']),
-                    'Values': len([e for e in node.elements if e.element_type == 'value']),
-                    'Facts': len([e for e in node.elements if e.element_type == 'fact']),
-                    'Hallucinations': '-',
-                    'Missing': '-',
-                    'Score': '-',
-                    'Status': 'REFERENCE'
-                })
-            else:
-                # Count hallucination types
-                hall_types = defaultdict(int)
-                for hall in node.hallucinations:
-                    hall_types[hall['type'].value] += 1
-                
-                hall_summary = ', '.join([f"{k}:{v}" for k, v in hall_types.items()]) if hall_types else 'None'
-                
-                report_data.append({
-                    'Paragraph ID': node.id,
-                    'Type': 'TEST',
-                    'Text Preview': node.text[:100] + '...',
-                    'Total Elements': len(node.elements),
-                    'Dates': len([e for e in node.elements if e.element_type == 'date']),
-                    'Values': len([e for e in node.elements if e.element_type == 'value']),
-                    'Facts': len([e for e in node.elements if e.element_type == 'fact']),
-                    'Hallucinations': hall_summary,
-                    'Missing': len(node.missing_elements),
-                    'Score': f"{node.hallucination_score:.2f}",
-                    'Status': 'HALLUCINATED' if node.is_hallucinated else 'VALID'
-                })
-        
-        return pd.DataFrame(report_data)
-    
-    def _generate_summary(self, nodes: List[ParagraphNode]) -> Dict[str, Any]:
-        """Generate summary statistics."""
-        test_nodes = [n for n in nodes if not n.is_reference]
-        
-        # Count hallucination types
-        all_hallucinations = []
-        for node in test_nodes:
-            all_hallucinations.extend(node.hallucinations)
-        
-        hall_by_type = defaultdict(int)
-        for hall in all_hallucinations:
-            hall_by_type[hall['type'].value] += 1
-        
-        # Severity counts
-        severity_counts = defaultdict(int)
-        for hall in all_hallucinations:
-            severity_counts[hall.get('severity', 'medium')] += 1
-        
-        return {
-            'total_test_paragraphs': len(test_nodes),
-            'hallucinated_paragraphs': sum(1 for n in test_nodes if n.is_hallucinated),
-            'total_hallucinations': len(all_hallucinations),
-            'hallucinations_by_type': dict(hall_by_type),
-            'hallucinations_by_severity': dict(severity_counts),
-            'average_score': np.mean([n.hallucination_score for n in test_nodes]) if test_nodes else 0
-        }
-    
-    def visualize_results(self, results: Dict[str, Any], save_path: Optional[str] = None):
-        """Create comprehensive visualization."""
-        nodes = results['nodes']
-        
-        fig, axes = plt.subplots(2, 2, figsize=(16, 12))
-        
-        # 1. Hallucination scores bar chart
-        ax = axes[0, 0]
-        test_nodes = [n for n in nodes if not n.is_reference]
-        if test_nodes:
-            ids = [n.id for n in test_nodes]
-            scores = [n.hallucination_score for n in test_nodes]
-            colors = ['red' if n.is_hallucinated else 'green' for n in test_nodes]
-            
-            ax.bar(ids, scores, color=colors, alpha=0.7)
-            ax.set_xlabel('Paragraph ID')
-            ax.set_ylabel('Hallucination Score')
-            ax.set_title('Hallucination Scores by Paragraph')
-            ax.axhline(y=0.1, color='r', linestyle='--', label='Threshold')
-            ax.legend()
-        
-        # 2. Hallucination type distribution
-        ax = axes[0, 1]
-        summary = results['summary']
-        if summary['hallucinations_by_type']:
-            types = list(summary['hallucinations_by_type'].keys())
-            counts = list(summary['hallucinations_by_type'].values())
-            
-            ax.pie(counts, labels=types, autopct='%1.1f%%')
-            ax.set_title('Distribution of Hallucination Types')
+        # Calculate overall consistency score
+        if G.number_of_edges() > 0:
+            edge_weights = [G[u][v]['weight'] for u, v in G.edges()]
+            metrics['average_edge_weight'] = np.mean(edge_weights)
+            metrics['consistency_variance'] = np.var(edge_weights)
         else:
-            ax.text(0.5, 0.5, 'No hallucinations detected', 
-                   ha='center', va='center', transform=ax.transAxes)
-            ax.set_title('Distribution of Hallucination Types')
+            metrics['average_edge_weight'] = 0
+            metrics['consistency_variance'] = 0
         
-        # 3. Similarity heatmap
-        ax = axes[1, 0]
-        sim_matrix = results['similarity_matrix']
-        sns.heatmap(sim_matrix, annot=True, fmt='.2f', cmap='coolwarm',
-                   xticklabels=[f"P{i}" for i in range(len(nodes))],
-                   yticklabels=[f"P{i}{'(REF)' if n.is_reference else ''}" for i, n in enumerate(nodes)],
-                   ax=ax)
-        ax.set_title('Paragraph Similarity Matrix')
+        # Final consistency score (weighted combination)
+        metrics['final_consistency_score'] = (
+            metrics['average_edge_weight'] * 0.4 +
+            metrics['density'] * 0.2 +
+            metrics['clustering_coefficient'] * 0.2 +
+            (1 - metrics['consistency_variance']) * 0.2
+        )
         
-        # 4. Summary statistics
-        ax = axes[1, 1]
-        ax.axis('off')
+        return metrics
+    
+    def visualize_graph(self, G: nx.DiGraph, consistency_matrix: np.ndarray, 
+                       save_path: str = "hallucination_graph.png"):
+        """Visualize the consistency graph"""
+        fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(16, 8))
         
-        summary_text = f"""Summary Statistics:
+        # Graph visualization
+        pos = nx.spring_layout(G, k=2, iterations=50)
         
-Total Test Paragraphs: {summary['total_test_paragraphs']}
-Hallucinated Paragraphs: {summary['hallucinated_paragraphs']}
-Total Hallucinations: {summary['total_hallucinations']}
-Average Score: {summary['average_score']:.3f}
-
-Hallucinations by Severity:
-"""
-        for severity, count in summary.get('hallucinations_by_severity', {}).items():
-            summary_text += f"  {severity}: {count}\n"
+        # Node colors based on PageRank
+        pagerank = nx.pagerank(G, weight='weight')
+        node_colors = [pagerank[node] for node in G.nodes()]
         
-        ax.text(0.1, 0.9, summary_text, transform=ax.transAxes,
-               fontsize=12, verticalalignment='top', fontfamily='monospace')
-        ax.set_title('Summary Statistics')
+        # Edge colors based on weights
+        edges = G.edges()
+        weights = [G[u][v]['weight'] for u, v in edges]
+        
+        # Draw graph
+        nx.draw_networkx_nodes(G, pos, node_color=node_colors, 
+                              cmap='RdYlGn', node_size=1000, ax=ax1)
+        nx.draw_networkx_labels(G, pos, ax=ax1)
+        nx.draw_networkx_edges(G, pos, edge_color=weights, edge_cmap=plt.cm.Blues, 
+                              width=2, alpha=0.6, ax=ax1)
+        
+        # Add colorbar for edges
+        sm = plt.cm.ScalarMappable(cmap=plt.cm.Blues, 
+                                   norm=plt.Normalize(vmin=min(weights), vmax=max(weights)))
+        sm.set_array([])
+        cbar = plt.colorbar(sm, ax=ax1)
+        cbar.set_label('Consistency Score', rotation=270, labelpad=20)
+        
+        ax1.set_title("Paragraph Consistency Graph")
+        ax1.axis('off')
+        
+        # Heatmap visualization
+        sns.heatmap(consistency_matrix, annot=True, fmt='.2f', cmap='RdYlGn', 
+                   square=True, ax=ax2, cbar_kws={'label': 'Consistency'})
+        ax2.set_title("Pairwise Consistency Matrix")
+        ax2.set_xlabel("Target Paragraph")
+        ax2.set_ylabel("Source Paragraph")
         
         plt.tight_layout()
-        
-        if save_path:
-            plt.savefig(save_path, dpi=300, bbox_inches='tight')
+        plt.savefig(save_path, dpi=300, bbox_inches='tight')
         plt.show()
-
+        
+        return fig
+    
+    def analyze_paragraphs(self, reference_paragraph: str, candidate_paragraphs: List[str], 
+                          visualize: bool = True) -> Dict:
+        """Main analysis function"""
+        # Combine all paragraphs for analysis
+        all_paragraphs = [reference_paragraph] + candidate_paragraphs
+        
+        # Build consistency graph
+        G, consistency_matrix = self.build_consistency_graph(all_paragraphs, reference_idx=0)
+        
+        # Calculate metrics
+        graph_metrics = self.calculate_graph_metrics(G)
+        
+        # Classify each candidate paragraph
+        classifications = []
+        for i, candidate in enumerate(candidate_paragraphs, 1):
+            result = self.classify_hallucination(reference_paragraph, candidate)
+            result['paragraph_index'] = i
+            classifications.append(result)
+        
+        # Visualize if requested
+        if visualize:
+            self.visualize_graph(G, consistency_matrix)
+        
+        # Compile results
+        results = {
+            'graph': G,
+            'consistency_matrix': consistency_matrix,
+            'graph_metrics': graph_metrics,
+            'classifications': classifications,
+            'summary': {
+                'total_paragraphs': len(all_paragraphs),
+                'hallucinated_count': sum(1 for c in classifications if c['is_hallucinated']),
+                'average_consistency': graph_metrics['average_edge_weight'],
+                'final_consistency_score': graph_metrics['final_consistency_score']
+            }
+        }
+        
+        return results
 
 # Example usage
 if __name__ == "__main__":
-    # Test with your example
-    reference = """The addreze freeze rule failed as the particiapnt has a change in addresss within the past 10 days of the transaction date (23-05-2024 to 30-05-2024). He also has a outstanding loan amount of ten thousand. He has made all the available withdrawals for the year. his avaialable balance is 10000"""
+    # Initialize detector
+    detector = HallucinationDetector()
     
-    test_paragraphs = [
-        reference,  # Reference
-        
-        # Similar but with minor variations
-        """The address freeze rule failed because the participant had an address change within the past 10 days of the transaction date (23-05-2024 to 30-05-2024). He has an outstanding loan of ten thousand. He has made all available withdrawals for the year. Available balance is 10000.""",
-        
-        # Wrong dates
-        """The address freeze rule failed as the participant has a change in address within the past 10 days of the transaction date (15-05-2024 to 25-05-2024). He also has an outstanding loan amount of ten thousand. He has made all the available withdrawals for the year. His available balance is 10000.""",
-        
-        # Wrong values
-        """The address freeze rule failed as the participant has a change in address within the past 10 days of the transaction date (23-05-2024 to 30-05-2024). He also has an outstanding loan amount of fifteen thousand. He has made all the available withdrawals for the year. His available balance is 15000.""",
-        
-        # Contradicting facts
-        """The address freeze rule passed as the participant has no change in address within the past 10 days of the transaction date (23-05-2024 to 30-05-2024). He has no outstanding loans. He has not made all withdrawals for the year. His available balance is 10000."""
+    # Example data
+    reference = "The company reported revenue of $2.5 million in Q4 2023, with a 15% increase from the previous quarter. The CEO John Smith announced the expansion plans on January 15, 2024."
+    
+    candidates = [
+        "In Q4 2023, the company's revenue reached $2.5 million, marking a 15% growth compared to Q3. CEO John Smith revealed expansion strategies on January 15, 2024.",
+        "The firm generated $3.2 million in revenue during Q4 2023, showing 20% growth. CEO John Smith discussed expansion on January 20, 2024.",
+        "Revenue for Q4 2023 was $2.5 million with significant growth. The company plans to expand operations as announced by leadership in early 2024."
     ]
     
-    # Run analysis
-    scorer = RobustHallucinationScorer()
-    results = scorer.analyze_paragraphs(test_paragraphs)
+    # Analyze
+    results = detector.analyze_paragraphs(reference, candidates)
     
-    # Display results
-    print(f"\n{'='*60}")
-    print("FINAL REPORT")
-    print(f"{'='*60}")
-    print(results['report'].to_string(index=False))
+    # Print results
+    print(f"Final Consistency Score: {results['summary']['final_consistency_score']:.3f}")
+    print(f"Hallucinated Paragraphs: {results['summary']['hallucinated_count']}/{len(candidates)}")
     
-    print(f"\n{'='*60}")
-    print("SUMMARY")
-    print(f"{'='*60}")
-    for key, value in results['summary'].items():
-        print(f"{key}: {value}")
-    
-    # Visualize
-    scorer.visualize_results(results, "hallucination_analysis.png")
+    for classification in results['classifications']:
+        print(f"\nParagraph {classification['paragraph_index']}:")
+        print(f"  Hallucinated: {classification['is_hallucinated']}")
+        print(f"  Hallucination Score: {classification['hallucination_score']:.3f}")
+        print(f"  Semantic Similarity: {classification['semantic_similarity']:.3f}")
