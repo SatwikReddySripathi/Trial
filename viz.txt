@@ -1,0 +1,783 @@
+import plotly.graph_objects as go
+from plotly.subplots import make_subplots
+import networkx as nx
+import numpy as np
+from typing import Dict, List
+import json
+
+class EnhancedInteractiveVisualizer:
+    """Additional interactive visualization features for the hallucination detector"""
+    
+    def create_3d_network_visualization(self, G: nx.DiGraph, metrics: Dict, 
+                                      save_path: str = "3d_hallucination_network.html") -> go.Figure:
+        """Create a 3D interactive network visualization"""
+        # Use 3D spring layout
+        pos = nx.spring_layout(G, dim=3, k=3, iterations=50)
+        
+        # Extract node positions
+        node_x = [pos[node][0] for node in G.nodes()]
+        node_y = [pos[node][1] for node in G.nodes()]
+        node_z = [pos[node][2] for node in G.nodes()]
+        
+        # Create edge traces
+        edge_traces = []
+        for edge in G.edges():
+            x0, y0, z0 = pos[edge[0]]
+            x1, y1, z1 = pos[edge[1]]
+            weight = G[edge[0]][edge[1]]['weight']
+            
+            edge_trace = go.Scatter3d(
+                x=[x0, x1, None],
+                y=[y0, y1, None],
+                z=[z0, z1, None],
+                mode='lines',
+                line=dict(
+                    color=f'rgba({int(255*(1-weight))}, {int(255*weight)}, 0, 0.6)',
+                    width=weight * 10
+                ),
+                hoverinfo='none',
+                showlegend=False
+            )
+            edge_traces.append(edge_trace)
+        
+        # Create node trace with detailed hover info
+        node_text = []
+        node_colors = []
+        node_sizes = []
+        
+        for node in G.nodes():
+            # Hover text with all metrics
+            hover_text = f"<b>Paragraph {node}</b><br>"
+            hover_text += f"PageRank: {metrics['pagerank'][node]:.3f}<br>"
+            hover_text += f"Betweenness: {metrics['betweenness_centrality'][node]:.3f}<br>"
+            hover_text += f"Clustering: {metrics['clustering_coefficient'][node]:.3f}<br>"
+            hover_text += f"In-degree: {metrics['in_degree'][node]}<br>"
+            hover_text += f"Out-degree: {metrics['out_degree'][node]}<br>"
+            if 'communities' in metrics:
+                for i, comm in enumerate(metrics['communities']):
+                    if node in comm:
+                        hover_text += f"Community: {i+1}<br>"
+                        break
+            hover_text += f"<br>Text preview:<br>{G.nodes[node]['text'][:100]}..."
+            
+            node_text.append(hover_text)
+            node_colors.append(metrics['pagerank'][node])
+            node_sizes.append(30 + 100 * metrics['betweenness_centrality'][node])
+        
+        node_trace = go.Scatter3d(
+            x=node_x,
+            y=node_y,
+            z=node_z,
+            mode='markers+text',
+            text=[f"P{i}" for i in G.nodes()],
+            textposition="top center",
+            hovertext=node_text,
+            hoverinfo='text',
+            marker=dict(
+                size=node_sizes,
+                color=node_colors,
+                colorscale='Viridis',
+                showscale=True,
+                colorbar=dict(
+                    title="PageRank",
+                    x=1.1
+                ),
+                line=dict(color='darkgray', width=2),
+                symbol='circle'
+            )
+        )
+        
+        # Create figure
+        fig = go.Figure(data=edge_traces + [node_trace])
+        
+        # Update layout for better 3D visualization
+        fig.update_layout(
+            title={
+                'text': "3D Hallucination Network - Rotate with Mouse",
+                'font': {'size': 20}
+            },
+            showlegend=False,
+            scene=dict(
+                xaxis=dict(showgrid=False, showticklabels=False, title=''),
+                yaxis=dict(showgrid=False, showticklabels=False, title=''),
+                zaxis=dict(showgrid=False, showticklabels=False, title=''),
+                bgcolor='rgba(240, 240, 240, 0.9)'
+            ),
+            height=800,
+            hovermode='closest'
+        )
+        
+        fig.write_html(save_path)
+        return fig
+    
+    def create_temporal_flow_animation(self, G: nx.DiGraph, metrics: Dict,
+                                     save_path: str = "temporal_flow_animation.html") -> go.Figure:
+        """Create an animated visualization showing information flow over time"""
+        info_flow = metrics['information_flow']
+        pos = nx.spring_layout(G, k=2, iterations=50)
+        
+        # Create frames for animation
+        frames = []
+        max_level = info_flow['max_propagation_distance']
+        
+        for level in range(max_level + 1):
+            # Get nodes up to current level
+            active_nodes = []
+            for l in range(level + 1):
+                active_nodes.extend(info_flow['propagation_levels'].get(l, []))
+            
+            # Create node trace for this frame
+            node_x = []
+            node_y = []
+            node_colors = []
+            node_text = []
+            
+            for node in G.nodes():
+                node_x.append(pos[node][0])
+                node_y.append(pos[node][1])
+                
+                if node in active_nodes:
+                    # Color based on level
+                    node_level = next(l for l, nodes in info_flow['propagation_levels'].items() if node in nodes)
+                    color = node_level / max_level if max_level > 0 else 0
+                    node_colors.append(color)
+                    node_text.append(f"P{node} (Level {node_level})")
+                else:
+                    node_colors.append(-1)  # Gray for inactive
+                    node_text.append(f"P{node}")
+            
+            frame_trace = go.Scatter(
+                x=node_x,
+                y=node_y,
+                mode='markers+text',
+                text=node_text,
+                textposition="top center",
+                marker=dict(
+                    size=25,
+                    color=node_colors,
+                    colorscale=[[0, 'lightgray'], [0.001, 'green'], [1, 'red']],
+                    cmin=-1,
+                    cmax=max_level,
+                    showscale=True
+                ),
+                name=f'Level {level}'
+            )
+            
+            frames.append(go.Frame(data=[frame_trace], name=str(level)))
+        
+        # Create initial figure
+        fig = go.Figure(
+            data=[frames[0].data[0]],
+            frames=frames
+        )
+        
+        # Add play/pause buttons
+        fig.update_layout(
+            updatemenus=[{
+                'type': 'buttons',
+                'showactive': False,
+                'buttons': [
+                    {
+                        'label': 'Play',
+                        'method': 'animate',
+                        'args': [None, {
+                            'frame': {'duration': 1000, 'redraw': True},
+                            'fromcurrent': True,
+                            'mode': 'immediate'
+                        }]
+                    },
+                    {
+                        'label': 'Pause',
+                        'method': 'animate',
+                        'args': [[None], {
+                            'frame': {'duration': 0, 'redraw': False},
+                            'mode': 'immediate'
+                        }]
+                    }
+                ]
+            }],
+            sliders=[{
+                'steps': [
+                    {
+                        'args': [[str(level)], {
+                            'frame': {'duration': 0, 'redraw': True},
+                            'mode': 'immediate'
+                        }],
+                        'label': f'Level {level}',
+                        'method': 'animate'
+                    }
+                    for level in range(max_level + 1)
+                ],
+                'active': 0,
+                'y': 0,
+                'len': 0.9,
+                'x': 0.1,
+                'xanchor': 'left',
+                'y': 0,
+                'yanchor': 'top'
+            }],
+            title="Information Flow Animation - Watch How Information Propagates",
+            xaxis=dict(showgrid=False, zeroline=False, showticklabels=False),
+            yaxis=dict(showgrid=False, zeroline=False, showticklabels=False),
+            height=600
+        )
+        
+        fig.write_html(save_path)
+        return fig
+    
+    def create_dashboard_with_filters(self, G: nx.DiGraph, metrics: Dict, classifications: List[Dict],
+                                    save_path: str = "interactive_dashboard.html") -> None:
+        """Create a comprehensive dashboard with filtering capabilities"""
+        
+        # Prepare data for the dashboard
+        nodes_data = []
+        for node in G.nodes():
+            node_info = {
+                'id': node,
+                'label': f"P{node}",
+                'pagerank': metrics['pagerank'][node],
+                'betweenness': metrics['betweenness_centrality'][node],
+                'clustering': metrics['clustering_coefficient'][node],
+                'in_degree': metrics['in_degree'][node],
+                'out_degree': metrics['out_degree'][node],
+                'is_reference': G.nodes[node].get('is_reference', False),
+                'text': G.nodes[node]['full_text']
+            }
+            
+            # Add classification info if not reference
+            if not node_info['is_reference'] and node > 0:
+                classification = classifications[node - 1]
+                node_info['is_hallucinated'] = classification['is_hallucinated']
+                node_info['hallucination_score'] = classification['hallucination_score']
+            else:
+                node_info['is_hallucinated'] = False
+                node_info['hallucination_score'] = 0.0
+            
+            nodes_data.append(node_info)
+        
+        # Create HTML template with JavaScript for interactivity
+        html_template = """
+        <!DOCTYPE html>
+        <html>
+        <head>
+            <title>Hallucination Detection Dashboard</title>
+            <script src="https://cdn.plot.ly/plotly-latest.min.js"></script>
+            <style>
+                body { font-family: Arial, sans-serif; margin: 20px; }
+                .container { max-width: 1400px; margin: 0 auto; }
+                .filters { background: #f0f0f0; padding: 15px; border-radius: 5px; margin-bottom: 20px; }
+                .filter-group { display: inline-block; margin-right: 20px; }
+                .chart-container { margin-bottom: 30px; }
+                .paragraph-details { 
+                    background: #ffffff; 
+                    border: 1px solid #ddd; 
+                    padding: 15px; 
+                    margin-top: 20px;
+                    border-radius: 5px;
+                    max-height: 300px;
+                    overflow-y: auto;
+                }
+                .metric-card {
+                    display: inline-block;
+                    background: #fff;
+                    border: 1px solid #ddd;
+                    padding: 15px;
+                    margin: 10px;
+                    border-radius: 5px;
+                    min-width: 200px;
+                }
+                h1, h2 { color: #333; }
+                .hallucinated { color: #d32f2f; font-weight: bold; }
+                .consistent { color: #388e3c; font-weight: bold; }
+            </style>
+        </head>
+        <body>
+            <div class="container">
+                <h1>Interactive Hallucination Detection Dashboard</h1>
+                
+                <div class="filters">
+                    <div class="filter-group">
+                        <label>Show:</label>
+                        <select id="nodeFilter" onchange="updateVisualization()">
+                            <option value="all">All Paragraphs</option>
+                            <option value="hallucinated">Hallucinated Only</option>
+                            <option value="consistent">Consistent Only</option>
+                        </select>
+                    </div>
+                    <div class="filter-group">
+                        <label>Metric Threshold:</label>
+                        <input type="range" id="thresholdSlider" min="0" max="1" step="0.1" value="0.5" 
+                               onchange="updateThreshold()">
+                        <span id="thresholdValue">0.5</span>
+                    </div>
+                    <div class="filter-group">
+                        <label>Color by:</label>
+                        <select id="colorMetric" onchange="updateVisualization()">
+                            <option value="pagerank">PageRank</option>
+                            <option value="betweenness">Betweenness</option>
+                            <option value="hallucination_score">Hallucination Score</option>
+                        </select>
+                    </div>
+                </div>
+                
+                <div class="metric-card">
+                    <h3>Summary Statistics</h3>
+                    <div id="summaryStats"></div>
+                </div>
+                
+                <div class="chart-container">
+                    <div id="networkGraph"></div>
+                </div>
+                
+                <div class="chart-container">
+                    <div id="parallelCoordinates"></div>
+                </div>
+                
+                <div class="paragraph-details" id="paragraphDetails">
+                    <h3>Paragraph Details</h3>
+                    <p>Click on a node to see paragraph details...</p>
+                </div>
+            </div>
+            
+            <script>
+                // Data passed from Python
+                const nodesData = """ + json.dumps(nodes_data) + """;
+                const edgesData = """ + json.dumps([
+                    {
+                        'source': u, 
+                        'target': v, 
+                        'weight': G[u][v]['weight'],
+                        'semantic_sim': G[u][v]['semantic_sim']
+                    } 
+                    for u, v in G.edges()
+                ]) + """;
+                
+                let currentFilter = 'all';
+                let currentThreshold = 0.5;
+                let currentColorMetric = 'pagerank';
+                
+                function updateVisualization() {
+                    currentFilter = document.getElementById('nodeFilter').value;
+                    currentColorMetric = document.getElementById('colorMetric').value;
+                    drawNetwork();
+                    drawParallelCoordinates();
+                    updateSummaryStats();
+                }
+                
+                function updateThreshold() {
+                    currentThreshold = parseFloat(document.getElementById('thresholdSlider').value);
+                    document.getElementById('thresholdValue').textContent = currentThreshold.toFixed(1);
+                    drawNetwork();
+                }
+                
+                function filterNodes() {
+                    if (currentFilter === 'all') return nodesData;
+                    if (currentFilter === 'hallucinated') 
+                        return nodesData.filter(n => n.is_hallucinated);
+                    if (currentFilter === 'consistent') 
+                        return nodesData.filter(n => !n.is_hallucinated && !n.is_reference);
+                    return nodesData;
+                }
+                
+                function drawNetwork() {
+                    const filteredNodes = filterNodes();
+                    const nodeIds = new Set(filteredNodes.map(n => n.id));
+                    const filteredEdges = edgesData.filter(e => 
+                        nodeIds.has(e.source) && nodeIds.has(e.target) && e.weight >= currentThreshold
+                    );
+                    
+                    // Create edge traces
+                    const edgeTraces = filteredEdges.map(edge => ({
+                        x: [getNodeX(edge.source), getNodeX(edge.target)],
+                        y: [getNodeY(edge.source), getNodeY(edge.target)],
+                        mode: 'lines',
+                        line: {
+                            color: `rgba(${255*(1-edge.weight)}, ${255*edge.weight}, 0, 0.6)`,
+                            width: edge.weight * 5
+                        },
+                        hoverinfo: 'text',
+                        hovertext: `Weight: ${edge.weight.toFixed(3)}`,
+                        type: 'scatter'
+                    }));
+                    
+                    // Create node trace
+                    const nodeTrace = {
+                        x: filteredNodes.map(n => getNodeX(n.id)),
+                        y: filteredNodes.map(n => getNodeY(n.id)),
+                        mode: 'markers+text',
+                        text: filteredNodes.map(n => n.label),
+                        textposition: 'top center',
+                        marker: {
+                            size: filteredNodes.map(n => 20 + n.betweenness * 50),
+                            color: filteredNodes.map(n => n[currentColorMetric]),
+                            colorscale: 'Viridis',
+                            showscale: true,
+                            colorbar: {
+                                title: currentColorMetric
+                            }
+                        },
+                        hoverinfo: 'text',
+                        hovertext: filteredNodes.map(n => 
+                            `${n.label}<br>` +
+                            `PageRank: ${n.pagerank.toFixed(3)}<br>` +
+                            `Betweenness: ${n.betweenness.toFixed(3)}<br>` +
+                            `Status: ${n.is_hallucinated ? 'Hallucinated' : 'Consistent'}`
+                        ),
+                        type: 'scatter',
+                        customdata: filteredNodes
+                    };
+                    
+                    const layout = {
+                        title: 'Interactive Consistency Network',
+                        showlegend: false,
+                        xaxis: {showgrid: false, zeroline: false, showticklabels: false},
+                        yaxis: {showgrid: false, zeroline: false, showticklabels: false},
+                        hovermode: 'closest',
+                        height: 600
+                    };
+                    
+                    Plotly.newPlot('networkGraph', [...edgeTraces, nodeTrace], layout);
+                    
+                    // Add click event
+                    document.getElementById('networkGraph').on('plotly_click', function(data) {
+                        if (data.points.length > 0 && data.points[0].customdata) {
+                            showParagraphDetails(data.points[0].customdata);
+                        }
+                    });
+                }
+                
+                function getNodeX(nodeId) {
+                    // Simple circular layout - can be replaced with more sophisticated layout
+                    const angle = (nodeId / nodesData.length) * 2 * Math.PI;
+                    return Math.cos(angle);
+                }
+                
+                function getNodeY(nodeId) {
+                    const angle = (nodeId / nodesData.length) * 2 * Math.PI;
+                    return Math.sin(angle);
+                }
+                
+                function drawParallelCoordinates() {
+                    const filteredNodes = filterNodes();
+                    
+                    const trace = {
+                        type: 'parcoords',
+                        line: {
+                            color: filteredNodes.map(n => n.hallucination_score),
+                            colorscale: 'RdYlGn',
+                            reversescale: true,
+                            showscale: true,
+                            colorbar: {
+                                title: 'Hallucination Score'
+                            }
+                        },
+                        dimensions: [
+                            {
+                                label: 'Paragraph',
+                                values: filteredNodes.map(n => n.id),
+                                ticktext: filteredNodes.map(n => n.label)
+                            },
+                            {
+                                label: 'PageRank',
+                                values: filteredNodes.map(n => n.pagerank)
+                            },
+                            {
+                                label: 'Betweenness',
+                                values: filteredNodes.map(n => n.betweenness)
+                            },
+                            {
+                                label: 'Clustering',
+                                values: filteredNodes.map(n => n.clustering)
+                            },
+                            {
+                                label: 'In-Degree',
+                                values: filteredNodes.map(n => n.in_degree)
+                            },
+                            {
+                                label: 'Out-Degree',
+                                values: filteredNodes.map(n => n.out_degree)
+                            }
+                        ]
+                    };
+                    
+                    const layout = {
+                        title: 'Multi-Metric Analysis',
+                        height: 400
+                    };
+                    
+                    Plotly.newPlot('parallelCoordinates', [trace], layout);
+                }
+                
+                function showParagraphDetails(node) {
+                    const detailsDiv = document.getElementById('paragraphDetails');
+                    const statusClass = node.is_hallucinated ? 'hallucinated' : 'consistent';
+                    
+                    detailsDiv.innerHTML = `
+                        <h3>${node.label} - <span class="${statusClass}">
+                            ${node.is_hallucinated ? 'Hallucinated' : 'Consistent'}
+                        </span></h3>
+                        <p><strong>Metrics:</strong></p>
+                        <ul>
+                            <li>PageRank: ${node.pagerank.toFixed(3)}</li>
+                            <li>Betweenness Centrality: ${node.betweenness.toFixed(3)}</li>
+                            <li>Clustering Coefficient: ${node.clustering.toFixed(3)}</li>
+                            <li>In-Degree: ${node.in_degree}</li>
+                            <li>Out-Degree: ${node.out_degree}</li>
+                            <li>Hallucination Score: ${node.hallucination_score.toFixed(3)}</li>
+                        </ul>
+                        <p><strong>Text:</strong></p>
+                        <p>${node.text}</p>
+                    `;
+                }
+                
+                function updateSummaryStats() {
+                    const filteredNodes = filterNodes();
+                    const hallucinatedCount = filteredNodes.filter(n => n.is_hallucinated).length;
+                    const avgPagerank = filteredNodes.reduce((sum, n) => sum + n.pagerank, 0) / filteredNodes.length;
+                    
+                    document.getElementById('summaryStats').innerHTML = `
+                        <p>Total Paragraphs: ${filteredNodes.length}</p>
+                        <p>Hallucinated: ${hallucinatedCount}</p>
+                        <p>Average PageRank: ${avgPagerank.toFixed(3)}</p>
+                    `;
+                }
+                
+                // Initial render
+                updateVisualization();
+            </script>
+        </body>
+        </html>
+        """
+        
+        with open(save_path, 'w') as f:
+            f.write(html_template)
+        
+        print(f"Interactive dashboard saved as '{save_path}'")
+    
+    def create_force_directed_graph(self, G: nx.DiGraph, metrics: Dict,
+                                  save_path: str = "force_directed_graph.html") -> None:
+        """Create a D3.js force-directed graph"""
+        
+        # Prepare data for D3
+        nodes = []
+        for node in G.nodes():
+            nodes.append({
+                "id": node,
+                "label": f"P{node}",
+                "pagerank": metrics['pagerank'][node],
+                "betweenness": metrics['betweenness_centrality'][node],
+                "group": 0  # Will be updated with community detection
+            })
+        
+        # Assign groups based on communities
+        if 'communities' in metrics:
+            for i, community in enumerate(metrics['communities']):
+                for node_id in community:
+                    for node in nodes:
+                        if node['id'] == node_id:
+                            node['group'] = i
+        
+        links = []
+        for u, v in G.edges():
+            links.append({
+                "source": u,
+                "target": v,
+                "weight": G[u][v]['weight']
+            })
+        
+        # Create HTML with D3.js
+        html_template = """
+        <!DOCTYPE html>
+        <html>
+        <head>
+            <title>Force-Directed Hallucination Graph</title>
+            <script src="https://d3js.org/d3.v7.min.js"></script>
+            <style>
+                .links line {
+                    stroke-opacity: 0.6;
+                }
+                .nodes circle {
+                    stroke: #fff;
+                    stroke-width: 1.5px;
+                    cursor: pointer;
+                }
+                .nodes text {
+                    font: 12px sans-serif;
+                    pointer-events: none;
+                }
+                .tooltip {
+                    position: absolute;
+                    text-align: left;
+                    padding: 10px;
+                    font: 12px sans-serif;
+                    background: rgba(0, 0, 0, 0.8);
+                    color: white;
+                    border-radius: 5px;
+                    pointer-events: none;
+                    opacity: 0;
+                }
+            </style>
+        </head>
+        <body>
+            <h1>Force-Directed Hallucination Network</h1>
+            <div id="graph"></div>
+            <div class="tooltip"></div>
+            
+            <script>
+                const nodes = """ + json.dumps(nodes) + """;
+                const links = """ + json.dumps(links) + """;
+                
+                const width = 960;
+                const height = 600;
+                
+                const svg = d3.select("#graph")
+                    .append("svg")
+                    .attr("width", width)
+                    .attr("height", height);
+                
+                const color = d3.scaleOrdinal(d3.schemeCategory10);
+                
+                const simulation = d3.forceSimulation(nodes)
+                    .force("link", d3.forceLink(links).id(d => d.id).distance(d => (1 - d.weight) * 100))
+                    .force("charge", d3.forceManyBody().strength(-300))
+                    .force("center", d3.forceCenter(width / 2, height / 2));
+                
+                const link = svg.append("g")
+                    .attr("class", "links")
+                    .selectAll("line")
+                    .data(links)
+                    .enter().append("line")
+                    .attr("stroke-width", d => d.weight * 5)
+                    .attr("stroke", d => d3.interpolateRdYlGn(d.weight));
+                
+                const node = svg.append("g")
+                    .attr("class", "nodes")
+                    .selectAll("g")
+                    .data(nodes)
+                    .enter().append("g")
+                    .call(d3.drag()
+                        .on("start", dragstarted)
+                        .on("drag", dragged)
+                        .on("end", dragended));
+                
+                node.append("circle")
+                    .attr("r", d => 10 + d.pagerank * 30)
+                    .attr("fill", d => color(d.group));
+                
+                node.append("text")
+                    .attr("dx", 12)
+                    .attr("dy", ".35em")
+                    .text(d => d.label);
+                
+                const tooltip = d3.select(".tooltip");
+                
+                node.on("mouseover", function(event, d) {
+                    tooltip.transition()
+                        .duration(200)
+                        .style("opacity", .9);
+                    tooltip.html(`<strong>${d.label}</strong><br/>
+                                 PageRank: ${d.pagerank.toFixed(3)}<br/>
+                                 Betweenness: ${d.betweenness.toFixed(3)}<br/>
+                                 Community: ${d.group + 1}`)
+                        .style("left", (event.pageX + 10) + "px")
+                        .style("top", (event.pageY - 28) + "px");
+                })
+                .on("mouseout", function(d) {
+                    tooltip.transition()
+                        .duration(500)
+                        .style("opacity", 0);
+                });
+                
+                simulation.on("tick", () => {
+                    link
+                        .attr("x1", d => d.source.x)
+                        .attr("y1", d => d.source.y)
+                        .attr("x2", d => d.target.x)
+                        .attr("y2", d => d.target.y);
+                    
+                    node
+                        .attr("transform", d => `translate(${d.x},${d.y})`);
+                });
+                
+                function dragstarted(event, d) {
+                    if (!event.active) simulation.alphaTarget(0.3).restart();
+                    d.fx = d.x;
+                    d.fy = d.y;
+                }
+                
+                function dragged(event, d) {
+                    d.fx = event.x;
+                    d.fy = event.y;
+                }
+                
+                function dragended(event, d) {
+                    if (!event.active) simulation.alphaTarget(0);
+                    d.fx = null;
+                    d.fy = null;
+                }
+            </script>
+        </body>
+        </html>
+        """
+        
+        with open(save_path, 'w') as f:
+            f.write(html_template)
+        
+        print(f"Force-directed graph saved as '{save_path}'")
+
+
+# Extension to the main detector class
+def create_all_interactive_visualizations(detector, results):
+    """Create all interactive visualizations"""
+    visualizer = EnhancedInteractiveVisualizer()
+    
+    # Extract necessary data
+    G = results['graph']
+    metrics = results['graph_metrics']
+    classifications = results['classifications']
+    
+    # Create 3D network
+    print("Creating 3D network visualization...")
+    visualizer.create_3d_network_visualization(G, metrics)
+    
+    # Create temporal flow animation
+    print("Creating temporal flow animation...")
+    visualizer.create_temporal_flow_animation(G, metrics)
+    
+    # Create interactive dashboard
+    print("Creating interactive dashboard...")
+    visualizer.create_dashboard_with_filters(G, metrics, classifications)
+    
+    # Create force-directed graph
+    print("Creating force-directed graph...")
+    visualizer.create_force_directed_graph(G, metrics)
+    
+    print("\nAll visualizations created!")
+    print("Files generated:")
+    print("- 3d_hallucination_network.html")
+    print("- temporal_flow_animation.html")
+    print("- interactive_dashboard.html")
+    print("- force_directed_graph.html")
+
+
+# Example usage
+if __name__ == "__main__":
+    from advanced_hallucination_detector import AdvancedHallucinationDetector
+    
+    # Initialize detector
+    detector = AdvancedHallucinationDetector()
+    
+    # Example data
+    reference = "The company reported revenue of $2.5 million in Q4 2023, with a 15% increase from the previous quarter."
+    candidates = [
+        "In Q4 2023, the company's revenue reached $2.5 million, marking a 15% growth compared to Q3.",
+        "The firm generated $3.2 million in revenue during Q4 2023, showing 20% growth.",
+        "Revenue for Q4 2023 was $2.5 million with significant growth.",
+        "Q4 2023 saw the company achieve $1.8 million in revenue, a 10% decline."
+    ]
+    
+    # Run analysis
+    results = detector.analyze_paragraphs(reference, candidates, visualize=True)
+    
+    # Create additional interactive visualizations
+    create_all_interactive_visualizations(detector, results)
