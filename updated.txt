@@ -1,0 +1,750 @@
+import plotly.graph_objects as go
+from plotly.subplots import make_subplots
+import networkx as nx
+import numpy as np
+from typing import Dict, List, Tuple
+import json
+import textwrap
+
+class HallucinationFocusedVisualizer:
+    """Interactive visualizer with red hallucinations and green consistent nodes"""
+    
+    def __init__(self):
+        self.hallucination_color = '#FF0000'  # Red
+        self.consistent_color_scale = ['#90EE90', '#228B22']  # Light green to dark green
+        self.reference_color = '#0000FF'  # Blue for reference
+        
+    def get_node_color(self, node_id: int, G: nx.DiGraph, metrics: Dict, 
+                       classifications: List[Dict]) -> str:
+        """Get color for node based on hallucination status and PageRank"""
+        # Check if reference node
+        if G.nodes[node_id].get('is_reference', False):
+            return self.reference_color
+        
+        # Check if hallucinated
+        if node_id > 0 and node_id <= len(classifications):
+            classification = classifications[node_id - 1]
+            if classification['is_hallucinated']:
+                return self.hallucination_color
+        
+        # Consistent node - color by PageRank
+        pagerank = metrics['pagerank'][node_id]
+        # Normalize PageRank to 0-1 for color scaling
+        all_pageranks = list(metrics['pagerank'].values())
+        min_pr = min(all_pageranks)
+        max_pr = max(all_pageranks)
+        normalized_pr = (pagerank - min_pr) / (max_pr - min_pr) if max_pr > min_pr else 0.5
+        
+        # Interpolate between light and dark green
+        return f'rgb({int(144 - 110 * normalized_pr)}, {int(238 - 99 * normalized_pr)}, {int(144 - 110 * normalized_pr)})'
+    
+    def create_detailed_hover_text(self, node_id: int, G: nx.DiGraph, metrics: Dict,
+                                 classifications: List[Dict]) -> str:
+        """Create detailed hover text with all information"""
+        node_data = G.nodes[node_id]
+        
+        # Start with node identifier
+        hover_text = f"<b>Paragraph {node_id}</b><br><br>"
+        
+        # Add status
+        if node_data.get('is_reference', False):
+            hover_text += "<b>Status:</b> REFERENCE (Ground Truth)<br>"
+        elif node_id > 0 and node_id <= len(classifications):
+            classification = classifications[node_id - 1]
+            status = "HALLUCINATED" if classification['is_hallucinated'] else "CONSISTENT"
+            color = "red" if classification['is_hallucinated'] else "green"
+            hover_text += f"<b>Status:</b> <span style='color:{color}'>{status}</span><br>"
+            hover_text += f"<b>Hallucination Score:</b> {classification['hallucination_score']:.3f}<br>"
+            hover_text += f"<b>Semantic Similarity:</b> {classification['semantic_similarity']:.3f}<br>"
+            
+            # Add consistency details
+            consistency = classification['consistency_results']
+            hover_text += "<br><b>Factual Consistency:</b><br>"
+            hover_text += f"- Dates: {consistency['date_consistency']:.3f}<br>"
+            hover_text += f"- Money: {consistency['money_consistency']:.3f}<br>"
+            hover_text += f"- Numbers: {consistency['number_consistency']:.3f}<br>"
+            hover_text += f"- Entities: {consistency['entity_consistency']:.3f}<br>"
+        
+        # Add graph metrics
+        hover_text += "<br><b>Graph Metrics:</b><br>"
+        hover_text += f"- PageRank: {metrics['pagerank'][node_id]:.3f}<br>"
+        hover_text += f"- Betweenness: {metrics['betweenness_centrality'][node_id]:.3f}<br>"
+        hover_text += f"- Clustering: {metrics['clustering_coefficient'][node_id]:.3f}<br>"
+        hover_text += f"- In-degree: {metrics['in_degree'][node_id]}<br>"
+        hover_text += f"- Out-degree: {metrics['out_degree'][node_id]}<br>"
+        
+        # Add community information
+        if 'communities' in metrics:
+            for i, comm in enumerate(metrics['communities']):
+                if node_id in comm:
+                    hover_text += f"- Community: {i+1}<br>"
+                    break
+        
+        # Add paragraph text (wrapped)
+        full_text = node_data.get('full_text', '')
+        wrapped_text = '<br>'.join(textwrap.wrap(full_text, width=60))
+        hover_text += f"<br><b>Text:</b><br>{wrapped_text}"
+        
+        return hover_text
+    
+    def create_enhanced_network_visualization(self, G: nx.DiGraph, metrics: Dict,
+                                            classifications: List[Dict], consistency_matrix: np.ndarray,
+                                            save_path: str = "enhanced_hallucination_network.html") -> go.Figure:
+        """Create main interactive network with color-coded nodes"""
+        
+        # Create figure with subplots
+        fig = make_subplots(
+            rows=2, cols=2,
+            subplot_titles=('Hallucination Detection Network', 'Consistency Heatmap',
+                          'Status Distribution', 'Detailed Metrics'),
+            specs=[[{'type': 'scatter'}, {'type': 'heatmap'}],
+                   [{'type': 'bar'}, {'type': 'table'}]],
+            row_heights=[0.6, 0.4],
+            horizontal_spacing=0.1,
+            vertical_spacing=0.15
+        )
+        
+        # Layout for network
+        pos = nx.spring_layout(G, k=3, iterations=50, seed=42)
+        
+        # 1. Network Graph with enhanced edges
+        # Draw edges with gradient based on consistency
+        for edge in G.edges():
+            x0, y0 = pos[edge[0]]
+            x1, y1 = pos[edge[1]]
+            weight = G[edge[0]][edge[1]]['weight']
+            
+            # Edge color based on weight
+            if weight < 0.3:
+                edge_color = 'rgba(255, 0, 0, 0.4)'  # Red for low consistency
+            elif weight < 0.7:
+                edge_color = 'rgba(255, 165, 0, 0.4)'  # Orange for medium
+            else:
+                edge_color = 'rgba(0, 255, 0, 0.4)'  # Green for high
+            
+            edge_trace = go.Scatter(
+                x=[x0, x1, None],
+                y=[y0, y1, None],
+                mode='lines',
+                line=dict(width=weight * 5, color=edge_color),
+                hoverinfo='text',
+                hovertext=f'Consistency: {weight:.3f}',
+                showlegend=False
+            )
+            fig.add_trace(edge_trace, row=1, col=1)
+        
+        # Prepare node data
+        node_x = []
+        node_y = []
+        node_colors = []
+        node_sizes = []
+        node_texts = []
+        hover_texts = []
+        node_symbols = []
+        
+        for node in G.nodes():
+            x, y = pos[node]
+            node_x.append(x)
+            node_y.append(y)
+            
+            # Get color based on status
+            color = self.get_node_color(node, G, metrics, classifications)
+            node_colors.append(color)
+            
+            # Size based on PageRank + base size
+            node_sizes.append(20 + 60 * metrics['pagerank'][node])
+            
+            # Text label
+            node_texts.append(f"P{node}")
+            
+            # Symbol - square for reference, circle for others
+            node_symbols.append('square' if G.nodes[node].get('is_reference', False) else 'circle')
+            
+            # Detailed hover text
+            hover_texts.append(self.create_detailed_hover_text(node, G, metrics, classifications))
+        
+        # Create node trace
+        node_trace = go.Scatter(
+            x=node_x,
+            y=node_y,
+            mode='markers+text',
+            text=node_texts,
+            textposition="top center",
+            hovertext=hover_texts,
+            hoverinfo='text',
+            marker=dict(
+                size=node_sizes,
+                color=node_colors,
+                symbol=node_symbols,
+                line=dict(width=2, color='black')
+            ),
+            showlegend=False
+        )
+        fig.add_trace(node_trace, row=1, col=1)
+        
+        # Add legend manually
+        legend_traces = [
+            go.Scatter(x=[None], y=[None], mode='markers',
+                      marker=dict(size=15, color=self.reference_color, symbol='square'),
+                      showlegend=True, name='Reference'),
+            go.Scatter(x=[None], y=[None], mode='markers',
+                      marker=dict(size=15, color=self.hallucination_color),
+                      showlegend=True, name='Hallucinated'),
+            go.Scatter(x=[None], y=[None], mode='markers',
+                      marker=dict(size=15, color='#228B22'),
+                      showlegend=True, name='Consistent (High PR)'),
+            go.Scatter(x=[None], y=[None], mode='markers',
+                      marker=dict(size=15, color='#90EE90'),
+                      showlegend=True, name='Consistent (Low PR)')
+        ]
+        for trace in legend_traces:
+            fig.add_trace(trace, row=1, col=1)
+        
+        # 2. Enhanced Consistency Heatmap
+        # Create custom colorscale
+        heatmap_colorscale = [
+            [0.0, 'red'],       # Low consistency
+            [0.5, 'yellow'],    # Medium consistency
+            [1.0, 'green']      # High consistency
+        ]
+        
+        # Create annotations for heatmap
+        annotations = []
+        for i in range(len(consistency_matrix)):
+            for j in range(len(consistency_matrix)):
+                if i != j:  # Don't annotate diagonal
+                    annotations.append(
+                        dict(
+                            x=j,
+                            y=i,
+                            text=f"{consistency_matrix[i, j]:.2f}",
+                            showarrow=False,
+                            font=dict(size=8)
+                        )
+                    )
+        
+        heatmap_trace = go.Heatmap(
+            z=consistency_matrix,
+            x=[f"P{i}" for i in range(len(consistency_matrix))],
+            y=[f"P{i}" for i in range(len(consistency_matrix))],
+            colorscale=heatmap_colorscale,
+            hovertemplate='From: %{y}<br>To: %{x}<br>Consistency: %{z:.3f}<extra></extra>'
+        )
+        fig.add_trace(heatmap_trace, row=1, col=2)
+        
+        # 3. Status Distribution Bar Chart
+        status_counts = {
+            'Reference': 1,
+            'Hallucinated': sum(1 for c in classifications if c['is_hallucinated']),
+            'Consistent': sum(1 for c in classifications if not c['is_hallucinated'])
+        }
+        
+        bar_trace = go.Bar(
+            x=list(status_counts.keys()),
+            y=list(status_counts.values()),
+            marker_color=[self.reference_color, self.hallucination_color, '#228B22'],
+            text=list(status_counts.values()),
+            textposition='auto'
+        )
+        fig.add_trace(bar_trace, row=2, col=1)
+        
+        # 4. Detailed Metrics Table
+        # Create summary statistics
+        hallucinated_nodes = [i+1 for i, c in enumerate(classifications) if c['is_hallucinated']]
+        consistent_nodes = [i+1 for i, c in enumerate(classifications) if not c['is_hallucinated']]
+        
+        avg_hallucination_score = np.mean([c['hallucination_score'] for c in classifications])
+        avg_semantic_sim = np.mean([c['semantic_similarity'] for c in classifications])
+        
+        table_data = [
+            ['Metric', 'Value'],
+            ['Total Paragraphs', str(len(G.nodes()))],
+            ['Hallucinated Count', str(len(hallucinated_nodes))],
+            ['Hallucinated Nodes', str(hallucinated_nodes) if hallucinated_nodes else 'None'],
+            ['Consistent Nodes', str(consistent_nodes) if consistent_nodes else 'None'],
+            ['Avg Hallucination Score', f"{avg_hallucination_score:.3f}"],
+            ['Avg Semantic Similarity', f"{avg_semantic_sim:.3f}"],
+            ['Graph Density', f"{metrics['density']:.3f}"],
+            ['Modularity', f"{metrics['modularity']:.3f}"],
+            ['Final Consistency Score', f"{metrics['final_consistency_score']:.3f}"]
+        ]
+        
+        table_trace = go.Table(
+            header=dict(
+                values=['<b>Metric</b>', '<b>Value</b>'],
+                font=dict(size=12, color='white'),
+                fill_color='darkblue',
+                align='left'
+            ),
+            cells=dict(
+                values=[[row[0] for row in table_data[1:]], 
+                       [row[1] for row in table_data[1:]]],
+                font=dict(size=11),
+                align='left',
+                fill_color=[['lightgray', 'white'] * len(table_data)]
+            )
+        )
+        fig.add_trace(table_trace, row=2, col=2)
+        
+        # Update layout
+        fig.update_layout(
+            title={
+                'text': "Hallucination Detection Analysis - Red: Hallucinated, Green: Consistent (by PageRank), Blue: Reference",
+                'font': {'size': 18}
+            },
+            height=1000,
+            showlegend=True,
+            legend=dict(
+                x=0.02,
+                y=0.98,
+                bgcolor='rgba(255, 255, 255, 0.8)',
+                bordercolor='black',
+                borderwidth=1
+            )
+        )
+        
+        # Update axes
+        fig.update_xaxes(showgrid=False, zeroline=False, showticklabels=False, row=1, col=1)
+        fig.update_yaxes(showgrid=False, zeroline=False, showticklabels=False, row=1, col=1)
+        fig.update_xaxes(title="Paragraph", row=2, col=1)
+        fig.update_yaxes(title="Count", row=2, col=1)
+        
+        # Save
+        fig.write_html(save_path)
+        return fig
+    
+    def create_interactive_paragraph_explorer(self, G: nx.DiGraph, metrics: Dict,
+                                            classifications: List[Dict],
+                                            save_path: str = "paragraph_explorer.html") -> None:
+        """Create an interactive explorer focused on paragraph content"""
+        
+        # Prepare data for all paragraphs
+        paragraphs_data = []
+        
+        for node_id in G.nodes():
+            node_data = G.nodes[node_id]
+            
+            # Base information
+            para_info = {
+                'id': node_id,
+                'text': node_data.get('full_text', ''),
+                'is_reference': node_data.get('is_reference', False)
+            }
+            
+            # Add status and scores
+            if para_info['is_reference']:
+                para_info['status'] = 'REFERENCE'
+                para_info['color'] = self.reference_color
+                para_info['hallucination_score'] = 0.0
+            elif node_id > 0 and node_id <= len(classifications):
+                classification = classifications[node_id - 1]
+                para_info['status'] = 'HALLUCINATED' if classification['is_hallucinated'] else 'CONSISTENT'
+                para_info['color'] = self.hallucination_color if classification['is_hallucinated'] else '#228B22'
+                para_info['hallucination_score'] = classification['hallucination_score']
+                para_info['semantic_similarity'] = classification['semantic_similarity']
+                para_info['consistency_results'] = classification['consistency_results']
+                
+                # Extract entities if available
+                if 'extracted_entities' in classification:
+                    para_info['entities'] = {
+                        'dates': list(classification['extracted_entities']['candidate'].get('dates', [])),
+                        'money': list(classification['extracted_entities']['candidate'].get('money', [])),
+                        'numbers': list(classification['extracted_entities']['candidate'].get('numbers', [])),
+                        'named_entities': [f"{e[0]} ({e[1]})" for e in 
+                                         classification['extracted_entities']['candidate'].get('named_entities', [])]
+                    }
+            
+            # Add graph metrics
+            para_info['pagerank'] = metrics['pagerank'][node_id]
+            para_info['betweenness'] = metrics['betweenness_centrality'][node_id]
+            para_info['in_degree'] = metrics['in_degree'][node_id]
+            para_info['out_degree'] = metrics['out_degree'][node_id]
+            
+            paragraphs_data.append(para_info)
+        
+        # Create HTML template
+        html_template = """
+        <!DOCTYPE html>
+        <html>
+        <head>
+            <title>Paragraph Explorer - Hallucination Detection</title>
+            <style>
+                body {
+                    font-family: Arial, sans-serif;
+                    margin: 20px;
+                    background-color: #f5f5f5;
+                }
+                .container {
+                    max-width: 1200px;
+                    margin: 0 auto;
+                }
+                h1 {
+                    color: #333;
+                    text-align: center;
+                }
+                .paragraph-card {
+                    background: white;
+                    border-radius: 8px;
+                    padding: 20px;
+                    margin-bottom: 20px;
+                    box-shadow: 0 2px 4px rgba(0,0,0,0.1);
+                    border-left: 5px solid;
+                }
+                .reference {
+                    border-left-color: #0000FF;
+                }
+                .hallucinated {
+                    border-left-color: #FF0000;
+                    background-color: #ffebee;
+                }
+                .consistent {
+                    border-left-color: #228B22;
+                    background-color: #e8f5e9;
+                }
+                .status-badge {
+                    display: inline-block;
+                    padding: 4px 12px;
+                    border-radius: 20px;
+                    color: white;
+                    font-weight: bold;
+                    font-size: 14px;
+                    margin-bottom: 10px;
+                }
+                .metrics-grid {
+                    display: grid;
+                    grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
+                    gap: 15px;
+                    margin-top: 15px;
+                }
+                .metric-item {
+                    background: #f8f9fa;
+                    padding: 10px;
+                    border-radius: 5px;
+                }
+                .metric-label {
+                    font-weight: bold;
+                    color: #666;
+                    font-size: 12px;
+                }
+                .metric-value {
+                    font-size: 18px;
+                    color: #333;
+                }
+                .paragraph-text {
+                    margin: 15px 0;
+                    line-height: 1.6;
+                    padding: 15px;
+                    background: #fafafa;
+                    border-radius: 5px;
+                }
+                .entities-section {
+                    margin-top: 15px;
+                    padding: 10px;
+                    background: #f0f0f0;
+                    border-radius: 5px;
+                }
+                .entity-type {
+                    font-weight: bold;
+                    color: #555;
+                    margin-top: 5px;
+                }
+                .entity-list {
+                    margin-left: 20px;
+                    color: #333;
+                }
+                .consistency-details {
+                    display: grid;
+                    grid-template-columns: repeat(4, 1fr);
+                    gap: 10px;
+                    margin-top: 10px;
+                }
+                .consistency-item {
+                    text-align: center;
+                    padding: 8px;
+                    background: white;
+                    border-radius: 5px;
+                }
+            </style>
+        </head>
+        <body>
+            <div class="container">
+                <h1>Paragraph Analysis - Hallucination Detection</h1>
+                <div id="paragraphs">
+        """
+        
+        # Add each paragraph card
+        for para in sorted(paragraphs_data, key=lambda x: x['id']):
+            status_color = para['color']
+            status_class = para['status'].lower()
+            
+            card_html = f"""
+                <div class="paragraph-card {status_class}">
+                    <div style="display: flex; justify-content: space-between; align-items: center;">
+                        <h2>Paragraph {para['id']}</h2>
+                        <span class="status-badge" style="background-color: {status_color}">
+                            {para['status']}
+                        </span>
+                    </div>
+                    
+                    <div class="paragraph-text">
+                        {para['text']}
+                    </div>
+                    
+                    <div class="metrics-grid">
+                        <div class="metric-item">
+                            <div class="metric-label">PageRank</div>
+                            <div class="metric-value">{para['pagerank']:.3f}</div>
+                        </div>
+                        <div class="metric-item">
+                            <div class="metric-label">Betweenness</div>
+                            <div class="metric-value">{para['betweenness']:.3f}</div>
+                        </div>
+                        <div class="metric-item">
+                            <div class="metric-label">In-Degree</div>
+                            <div class="metric-value">{para['in_degree']}</div>
+                        </div>
+                        <div class="metric-item">
+                            <div class="metric-label">Out-Degree</div>
+                            <div class="metric-value">{para['out_degree']}</div>
+                        </div>
+            """
+            
+            # Add hallucination score and similarity for non-reference
+            if not para['is_reference'] and 'hallucination_score' in para:
+                card_html += f"""
+                        <div class="metric-item">
+                            <div class="metric-label">Hallucination Score</div>
+                            <div class="metric-value" style="color: {'red' if para['hallucination_score'] > 0.5 else 'green'}">
+                                {para['hallucination_score']:.3f}
+                            </div>
+                        </div>
+                        <div class="metric-item">
+                            <div class="metric-label">Semantic Similarity</div>
+                            <div class="metric-value">{para.get('semantic_similarity', 0):.3f}</div>
+                        </div>
+                """
+            
+            card_html += "</div>"  # Close metrics-grid
+            
+            # Add consistency details if available
+            if 'consistency_results' in para:
+                cons = para['consistency_results']
+                card_html += """
+                    <div class="entities-section">
+                        <div class="entity-type">Factual Consistency:</div>
+                        <div class="consistency-details">
+                """
+                for key, value in cons.items():
+                    if key != 'overall_consistency':
+                        label = key.replace('_', ' ').title()
+                        color = 'green' if value > 0.7 else ('orange' if value > 0.3 else 'red')
+                        card_html += f"""
+                            <div class="consistency-item">
+                                <div style="color: {color}; font-size: 20px;">
+                                    {value:.2f}
+                                </div>
+                                <div style="font-size: 12px; color: #666;">
+                                    {label}
+                                </div>
+                            </div>
+                        """
+                card_html += "</div></div>"
+            
+            # Add extracted entities if available
+            if 'entities' in para:
+                card_html += '<div class="entities-section"><h4>Extracted Entities:</h4>'
+                for entity_type, entities in para['entities'].items():
+                    if entities:
+                        card_html += f'<div class="entity-type">{entity_type.title()}:</div>'
+                        card_html += f'<div class="entity-list">{", ".join(entities)}</div>'
+                card_html += '</div>'
+            
+            card_html += "</div>"  # Close paragraph-card
+            html_template += card_html
+        
+        html_template += """
+                </div>
+            </div>
+        </body>
+        </html>
+        """
+        
+        with open(save_path, 'w', encoding='utf-8') as f:
+            f.write(html_template)
+        
+        print(f"Paragraph explorer saved as '{save_path}'")
+    
+    def create_3d_network_with_labels(self, G: nx.DiGraph, metrics: Dict,
+                                    classifications: List[Dict],
+                                    save_path: str = "3d_labeled_network.html") -> go.Figure:
+        """Create 3D network with paragraph previews"""
+        
+        # 3D layout
+        pos = nx.spring_layout(G, dim=3, k=3, iterations=50)
+        
+        # Edge traces
+        edge_traces = []
+        for edge in G.edges():
+            x0, y0, z0 = pos[edge[0]]
+            x1, y1, z1 = pos[edge[1]]
+            weight = G[edge[0]][edge[1]]['weight']
+            
+            # Color based on weight
+            if weight < 0.3:
+                edge_color = 'rgba(255, 0, 0, 0.4)'
+            elif weight < 0.7:
+                edge_color = 'rgba(255, 165, 0, 0.4)'
+            else:
+                edge_color = 'rgba(0, 255, 0, 0.4)'
+            
+            edge_trace = go.Scatter3d(
+                x=[x0, x1, None],
+                y=[y0, y1, None],
+                z=[z0, z1, None],
+                mode='lines',
+                line=dict(color=edge_color, width=weight * 10),
+                hoverinfo='none',
+                showlegend=False
+            )
+            edge_traces.append(edge_trace)
+        
+        # Node trace
+        node_x = []
+        node_y = []
+        node_z = []
+        node_colors = []
+        node_sizes = []
+        hover_texts = []
+        node_symbols = []
+        
+        for node in G.nodes():
+            x, y, z = pos[node]
+            node_x.append(x)
+            node_y.append(y)
+            node_z.append(z)
+            
+            # Get color
+            color = self.get_node_color(node, G, metrics, classifications)
+            node_colors.append(color)
+            
+            # Size based on PageRank
+            node_sizes.append(30 + 100 * metrics['pagerank'][node])
+            
+            # Detailed hover text
+            hover_texts.append(self.create_detailed_hover_text(node, G, metrics, classifications))
+            
+            # Symbol
+            if G.nodes[node].get('is_reference', False):
+                node_symbols.append('square')
+            else:
+                node_symbols.append('circle')
+        
+        node_trace = go.Scatter3d(
+            x=node_x,
+            y=node_y,
+            z=node_z,
+            mode='markers+text',
+            text=[f"P{i}" for i in G.nodes()],
+            textposition="top center",
+            hovertext=hover_texts,
+            hoverinfo='text',
+            marker=dict(
+                size=node_sizes,
+                color=node_colors,
+                symbol=node_symbols,
+                line=dict(color='black', width=2)
+            )
+        )
+        
+        # Create figure
+        fig = go.Figure(data=edge_traces + [node_trace])
+        
+        # Update layout
+        fig.update_layout(
+            title={
+                'text': "3D Hallucination Network - Rotate to Explore",
+                'font': {'size': 20}
+            },
+            scene=dict(
+                xaxis=dict(showgrid=False, showticklabels=False),
+                yaxis=dict(showgrid=False, showticklabels=False),
+                zaxis=dict(showgrid=False, showticklabels=False),
+                bgcolor='rgba(240, 240, 240, 0.9)',
+                camera=dict(
+                    eye=dict(x=1.5, y=1.5, z=1.5)
+                )
+            ),
+            height=800,
+            showlegend=False,
+            hovermode='closest'
+        )
+        
+        # Add annotations for status legend
+        fig.add_annotation(
+            text="<b>Legend:</b><br>" +
+                 "<span style='color:blue'>■</span> Reference<br>" +
+                 "<span style='color:red'>■</span> Hallucinated<br>" +
+                 "<span style='color:green'>■</span> Consistent",
+            xref="paper", yref="paper",
+            x=0.02, y=0.98,
+            showarrow=False,
+            bgcolor="rgba(255, 255, 255, 0.8)",
+            bordercolor="black",
+            borderwidth=1
+        )
+        
+        fig.write_html(save_path)
+        return fig
+
+
+# Extension function to create all visualizations
+def create_hallucination_focused_visualizations(detector, results):
+    """Create all hallucination-focused interactive visualizations"""
+    visualizer = HallucinationFocusedVisualizer()
+    
+    # Extract data
+    G = results['graph']
+    metrics = results['graph_metrics']
+    classifications = results['classifications']
+    consistency_matrix = results['consistency_matrix']
+    
+    print("Creating hallucination-focused visualizations...")
+    
+    # 1. Enhanced network visualization
+    print("1. Creating enhanced network visualization...")
+    visualizer.create_enhanced_network_visualization(
+        G, metrics, classifications, consistency_matrix
+    )
+    
+    # 2. Paragraph explorer
+    print("2. Creating paragraph explorer...")
+    visualizer.create_interactive_paragraph_explorer(
+        G, metrics, classifications
+    )
+    
+    # 3. 3D labeled network
+    print("3. Creating 3D labeled network...")
+    visualizer.create_3d_network_with_labels(
+        G, metrics, classifications
+    )
+    
+    print("\nAll visualizations created!")
+    print("Files generated:")
+    print("- enhanced_hallucination_network.html (Main dashboard)")
+    print("- paragraph_explorer.html (Detailed paragraph view)")
+    print("- 3d_labeled_network.html (3D interactive network)")
+    
+    return {
+        'enhanced_network': 'enhanced_hallucination_network.html',
+        'paragraph_explorer': 'paragraph_explorer.html',
+        '3d_network': '3d_labeled_network.html'
+    }
+
+
+# Example usage
+if __name__ == "__main__":
+    # This would be used with the AdvancedHallucinationDetector
+    print("Use this with the AdvancedHallucinationDetector results")
+    print("Example:")
+    print("  results = detector.analyze_paragraphs(reference, candidates)")
+    print("  create_hallucination_focused_visualizations(detector, results)")
