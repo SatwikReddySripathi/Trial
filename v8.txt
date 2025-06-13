@@ -1,0 +1,735 @@
+"""
+Interactive Force-Directed Hallucination Detection System
+========================================================
+A complete system with draggable nodes where:
+- Drag any node and connected nodes follow
+- No axis labels for cleaner visualization
+- Better hover formatting
+- Color coding: Blue (reference), Red (hallucinated), Green (consistent)
+"""
+
+import numpy as np
+from typing import List, Dict, Tuple, Set
+import re
+import networkx as nx
+from sklearn.metrics.pairwise import cosine_similarity
+from sklearn.feature_extraction.text import TfidfVectorizer
+import nltk
+from nltk.tokenize import sent_tokenize, word_tokenize
+from collections import defaultdict
+import warnings
+from scipy.stats import entropy
+from sentence_transformers import SentenceTransformer
+from transformers import pipeline
+import torch
+import webbrowser
+import os
+import json
+import textwrap
+
+warnings.filterwarnings('ignore')
+
+# Download required NLTK data
+nltk.download('punkt', quiet=True)
+nltk.download('stopwords', quiet=True)
+nltk.download('averaged_perceptron_tagger', quiet=True)
+nltk.download('maxent_ne_chunker', quiet=True)
+nltk.download('words', quiet=True)
+
+
+class HallucinationDetector3D:
+    """Interactive Force-Directed Hallucination Detection System"""
+    
+    def __init__(self, use_gpu=False):
+        """Initialize the detector with all models"""
+        self.device = 'cuda' if use_gpu and torch.cuda.is_available() else 'cpu'
+        print(f"Initializing Interactive Hallucination Detector on {self.device}...")
+        
+        # Models
+        print("Loading models...")
+        self.sentence_model = SentenceTransformer('all-MiniLM-L6-v2')
+        self.sentence_model.to(self.device)
+        
+        self.nli_pipeline = pipeline(
+            "text-classification", 
+            model="cross-encoder/nli-deberta-v3-base",
+            device=0 if self.device == 'cuda' else -1
+        )
+        
+        self.tfidf_vectorizer = TfidfVectorizer(
+            max_features=1000,
+            ngram_range=(1, 3),
+            stop_words='english'
+        )
+        
+        # Patterns for entity extraction
+        self.patterns = {
+            'date': r'\b(?:\d{1,2}[-/]\d{1,2}[-/]\d{2,4}|\d{4}[-/]\d{1,2}[-/]\d{1,2}|(?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)[a-z]* \d{1,2},? \d{4})\b',
+            'money': r'\$[\d,]+(?:\.\d{2})?|\b\d+(?:,\d{3})*(?:\.\d{2})?\s*(?:dollars?|USD|cents?)\b',
+            'number': r'\b\d+(?:,\d{3})*(?:\.\d+)?%?\b',
+            'percentage': r'\b\d+(?:\.\d+)?%'
+        }
+        
+        # Thresholds
+        self.thresholds = {
+            'semantic': 0.7,
+            'semantic_weak': 0.5,
+            'entailment': 0.6,
+            'contradiction': 0.3,
+            'hallucination': 0.5,
+            'factual': 0.7
+        }
+        
+        print("Initialization complete!")
+    
+    def extract_entities(self, text: str) -> Dict:
+        """Extract entities from text"""
+        entities = {
+            'dates': set(re.findall(self.patterns['date'], text, re.IGNORECASE)),
+            'money': set(re.findall(self.patterns['money'], text, re.IGNORECASE)),
+            'numbers': set(re.findall(self.patterns['number'], text)),
+            'percentages': set(re.findall(self.patterns['percentage'], text)),
+            'facts': []
+        }
+        
+        sentences = sent_tokenize(text)
+        for sent in sentences:
+            if any(re.search(self.patterns[p], sent) for p in ['date', 'money', 'percentage']):
+                entities['facts'].append(sent.strip())
+        
+        return entities
+    
+    def calculate_entropy(self, text: str) -> float:
+        """Calculate text entropy"""
+        words = word_tokenize(text.lower())
+        stopwords = set(nltk.corpus.stopwords.words('english'))
+        words = [w for w in words if w.isalnum() and w not in stopwords]
+        
+        if not words:
+            return 0.0
+        
+        word_freq = defaultdict(int)
+        for word in words:
+            word_freq[word] += 1
+        
+        total = len(words)
+        probs = [count/total for count in word_freq.values()]
+        return entropy(probs)
+    
+    def semantic_similarity(self, text1: str, text2: str) -> float:
+        """Calculate semantic similarity"""
+        embeddings = self.sentence_model.encode([text1, text2])
+        transformer_sim = cosine_similarity([embeddings[0]], [embeddings[1]])[0][0]
+        
+        try:
+            tfidf_matrix = self.tfidf_vectorizer.fit_transform([text1, text2])
+            tfidf_sim = cosine_similarity(tfidf_matrix[0:1], tfidf_matrix[1:2])[0][0]
+        except:
+            tfidf_sim = 0.0
+        
+        return float((transformer_sim + tfidf_sim) / 2)
+    
+    def check_entailment(self, premise: str, hypothesis: str) -> Dict[str, float]:
+        """Check entailment between texts"""
+        results = self.nli_pipeline(f"{premise} [SEP] {hypothesis}")
+        
+        scores = {'entailment': 0.0, 'neutral': 0.0, 'contradiction': 0.0}
+        mapping = {'ENTAILMENT': 'entailment', 'NEUTRAL': 'neutral', 'CONTRADICTION': 'contradiction'}
+        
+        for result in results:
+            label = result['label'].upper()
+            if label in mapping:
+                scores[mapping[label]] = result['score']
+        
+        return scores
+    
+    def check_factual_consistency(self, entities1: Dict, entities2: Dict) -> float:
+        """Check consistency between entity sets"""
+        consistencies = []
+        
+        for key in ['dates', 'money', 'numbers', 'percentages']:
+            if entities1[key] and entities2[key]:
+                intersection = len(entities1[key] & entities2[key])
+                union = len(entities1[key] | entities2[key])
+                consistencies.append(intersection / union if union > 0 else 0)
+            elif entities1[key] or entities2[key]:
+                consistencies.append(0.0)
+        
+        return np.mean(consistencies) if consistencies else 1.0
+    
+    def classify_hallucination(self, reference: str, candidate: str) -> Dict:
+        """Classify if candidate is hallucinated"""
+        ref_entities = self.extract_entities(reference)
+        cand_entities = self.extract_entities(candidate)
+        
+        semantic_sim = self.semantic_similarity(reference, candidate)
+        entailment_scores = self.check_entailment(reference, candidate)
+        factual_consistency = self.check_factual_consistency(ref_entities, cand_entities)
+        
+        hallucination_score = (
+            (1 - semantic_sim) * 0.25 +
+            (1 - factual_consistency) * 0.35 +
+            entailment_scores['contradiction'] * 0.25 +
+            (1 - entailment_scores['entailment']) * 0.15
+        )
+        
+        if ref_entities['dates'] and cand_entities['dates']:
+            if not ref_entities['dates'] & cand_entities['dates']:
+                hallucination_score = min(hallucination_score + 0.2, 1.0)
+        
+        if ref_entities['money'] and cand_entities['money']:
+            if not ref_entities['money'] & cand_entities['money']:
+                hallucination_score = min(hallucination_score + 0.2, 1.0)
+        
+        return {
+            'is_hallucinated': hallucination_score > self.thresholds['hallucination'],
+            'hallucination_score': hallucination_score,
+            'semantic_similarity': semantic_sim,
+            'entailment_scores': entailment_scores,
+            'factual_consistency': factual_consistency
+        }
+    
+    def calculate_pairwise_consistency(self, text1: str, text2: str) -> Dict:
+        """Calculate consistency between any two texts"""
+        entities1 = self.extract_entities(text1)
+        entities2 = self.extract_entities(text2)
+        
+        semantic_sim = self.semantic_similarity(text1, text2)
+        entailment_scores = self.check_entailment(text1, text2)
+        factual_consistency = self.check_factual_consistency(entities1, entities2)
+        
+        consistency_score = (
+            semantic_sim * 0.4 +
+            factual_consistency * 0.3 +
+            entailment_scores['entailment'] * 0.2 +
+            (1 - entailment_scores['contradiction']) * 0.1
+        )
+        
+        return {
+            'consistency_score': consistency_score,
+            'semantic_similarity': semantic_sim,
+            'factual_consistency': factual_consistency,
+            'entailment': entailment_scores['entailment'],
+            'contradiction': entailment_scores['contradiction']
+        }
+    
+    def build_full_graph(self, paragraphs: List[str]) -> Tuple[nx.Graph, List[Dict], Dict]:
+        """Build graph with all consistency connections"""
+        n = len(paragraphs)
+        G = nx.Graph()
+        
+        # Add nodes
+        for i, text in enumerate(paragraphs):
+            G.add_node(i,
+                      text=text,
+                      is_reference=(i == 0),
+                      entropy=self.calculate_entropy(text),
+                      length=len(text.split()))
+        
+        # Classify each paragraph against reference
+        classifications = []
+        for i in range(1, n):
+            classification = self.classify_hallucination(paragraphs[0], paragraphs[i])
+            classification['paragraph_id'] = i
+            classifications.append(classification)
+        
+        # Build edges
+        edge_details = {}
+        for i in range(n):
+            for j in range(i + 1, n):
+                consistency = self.calculate_pairwise_consistency(paragraphs[i], paragraphs[j])
+                
+                if consistency['consistency_score'] >= self.thresholds['semantic_weak']:
+                    both_hallucinated = False
+                    one_hallucinated = False
+                    
+                    if i > 0 and j > 0:
+                        i_hall = classifications[i-1]['is_hallucinated']
+                        j_hall = classifications[j-1]['is_hallucinated']
+                        both_hallucinated = i_hall and j_hall
+                        one_hallucinated = i_hall or j_hall
+                    elif i == 0 and j > 0:
+                        one_hallucinated = classifications[j-1]['is_hallucinated']
+                    
+                    G.add_edge(i, j,
+                             weight=consistency['consistency_score'],
+                             semantic_similarity=consistency['semantic_similarity'],
+                             factual_consistency=consistency['factual_consistency'],
+                             both_hallucinated=both_hallucinated,
+                             one_hallucinated=one_hallucinated,
+                             is_strong=consistency['consistency_score'] >= self.thresholds['semantic'])
+                    
+                    edge_details[(i, j)] = consistency
+        
+        return G, classifications, edge_details
+    
+    def calculate_metrics(self, G: nx.Graph) -> Dict:
+        """Calculate graph metrics"""
+        metrics = {
+            'pagerank': nx.pagerank(G, weight='weight') if G.number_of_edges() > 0 else {n: 1/G.number_of_nodes() for n in G.nodes()},
+            'betweenness': nx.betweenness_centrality(G, weight=lambda u,v,d: 1/d['weight'] if d['weight'] > 0 else 1),
+            'closeness': nx.closeness_centrality(G, distance=lambda u,v,d: 1/d['weight'] if d['weight'] > 0 else 1),
+            'clustering': nx.clustering(G, weight='weight'),
+            'degree': dict(G.degree()),
+            'components': list(nx.connected_components(G)),
+            'isolated': list(nx.isolates(G))
+        }
+        
+        return metrics
+    
+    def create_interactive_force_graph(self, G: nx.Graph, metrics: Dict, classifications: List[Dict],
+                                     save_path: str = "hallucination_force_graph.html") -> str:
+        """Create interactive force-directed graph using D3.js"""
+        
+        # Prepare nodes data
+        nodes = []
+        for node in G.nodes():
+            # Determine color and status
+            if G.nodes[node].get('is_reference', False):
+                color = '#0066CC'
+                status = 'REFERENCE'
+            elif node in metrics['isolated']:
+                color = '#808080'
+                status = 'ISOLATED'
+            elif node > 0 and node <= len(classifications):
+                if classifications[node - 1]['is_hallucinated']:
+                    color = '#FF0000'
+                    status = 'HALLUCINATED'
+                else:
+                    # Green shade based on PageRank
+                    pr = metrics['pagerank'][node]
+                    max_pr = max(v for k, v in metrics['pagerank'].items() if k != 0)
+                    normalized_pr = pr / max_pr if max_pr > 0 else 0.5
+                    green = int(100 + 155 * normalized_pr)
+                    color = f'#{0:02x}{green:02x}{0:02x}'
+                    status = 'CONSISTENT'
+            else:
+                color = '#808080'
+                status = 'UNKNOWN'
+            
+            # Create node object
+            node_obj = {
+                'id': node,
+                'label': f'P{node}',
+                'color': color,
+                'status': status,
+                'size': 10 + 30 * metrics['pagerank'][node],
+                'pagerank': metrics['pagerank'][node],
+                'degree': metrics['degree'][node],
+                'text': G.nodes[node]['text'][:200] + '...' if len(G.nodes[node]['text']) > 200 else G.nodes[node]['text']
+            }
+            
+            if node > 0 and node <= len(classifications):
+                node_obj['hallucination_score'] = classifications[node - 1]['hallucination_score']
+                node_obj['semantic_similarity'] = classifications[node - 1]['semantic_similarity']
+            
+            nodes.append(node_obj)
+        
+        # Prepare edges data
+        links = []
+        for u, v, data in G.edges(data=True):
+            # Determine edge color
+            if data['both_hallucinated']:
+                color = '#FFA500'  # Orange
+            elif data['one_hallucinated']:
+                color = '#FFFF00'  # Yellow
+            elif data['is_strong']:
+                color = '#00FF00'  # Green
+            else:
+                color = '#CCCCCC'  # Light gray
+            
+            links.append({
+                'source': u,
+                'target': v,
+                'weight': data['weight'],
+                'color': color,
+                'width': 1 + data['weight'] * 5
+            })
+        
+        # Create HTML with D3.js force-directed graph
+        html_content = f"""
+<!DOCTYPE html>
+<html>
+<head>
+    <title>Interactive Hallucination Detection Graph</title>
+    <script src="https://d3js.org/d3.v7.min.js"></script>
+    <style>
+        body {{
+            font-family: Arial, sans-serif;
+            margin: 0;
+            padding: 20px;
+            background-color: #f5f5f5;
+        }}
+        #graph {{
+            background-color: white;
+            border: 1px solid #ddd;
+            border-radius: 8px;
+            box-shadow: 0 2px 4px rgba(0,0,0,0.1);
+        }}
+        .tooltip {{
+            position: absolute;
+            text-align: left;
+            padding: 12px;
+            font: 12px sans-serif;
+            background: rgba(0, 0, 0, 0.9);
+            color: white;
+            border-radius: 8px;
+            pointer-events: none;
+            opacity: 0;
+            transition: opacity 0.3s;
+            max-width: 400px;
+            line-height: 1.4;
+        }}
+        .legend {{
+            position: absolute;
+            top: 20px;
+            right: 20px;
+            background: rgba(255, 255, 255, 0.9);
+            padding: 15px;
+            border-radius: 8px;
+            border: 1px solid #ddd;
+        }}
+        .legend-item {{
+            margin: 5px 0;
+            display: flex;
+            align-items: center;
+        }}
+        .legend-color {{
+            width: 20px;
+            height: 20px;
+            margin-right: 8px;
+            border: 1px solid #333;
+            border-radius: 3px;
+        }}
+        h1 {{
+            color: #333;
+            margin-bottom: 10px;
+        }}
+        .controls {{
+            margin-bottom: 20px;
+        }}
+        button {{
+            padding: 8px 16px;
+            margin-right: 10px;
+            border: none;
+            border-radius: 4px;
+            background-color: #4CAF50;
+            color: white;
+            cursor: pointer;
+            font-size: 14px;
+        }}
+        button:hover {{
+            background-color: #45a049;
+        }}
+    </style>
+</head>
+<body>
+    <h1>Hallucination Detection Graph - Interactive Force Layout</h1>
+    <div class="controls">
+        <button onclick="resetSimulation()">Reset View</button>
+        <button onclick="toggleLabels()">Toggle Labels</button>
+    </div>
+    <div id="graph"></div>
+    <div class="tooltip"></div>
+    <div class="legend">
+        <h3 style="margin-top: 0;">Node Types</h3>
+        <div class="legend-item">
+            <div class="legend-color" style="background-color: #0066CC;"></div>
+            <span>Reference</span>
+        </div>
+        <div class="legend-item">
+            <div class="legend-color" style="background-color: #FF0000;"></div>
+            <span>Hallucinated</span>
+        </div>
+        <div class="legend-item">
+            <div class="legend-color" style="background-color: #00FF00;"></div>
+            <span>Consistent</span>
+        </div>
+        <div class="legend-item">
+            <div class="legend-color" style="background-color: #808080;"></div>
+            <span>Isolated</span>
+        </div>
+        <h3>Edge Types</h3>
+        <div class="legend-item">
+            <div class="legend-color" style="background-color: #00FF00;"></div>
+            <span>Strong Consistent</span>
+        </div>
+        <div class="legend-item">
+            <div class="legend-color" style="background-color: #FFA500;"></div>
+            <span>Between Hallucinated</span>
+        </div>
+        <div class="legend-item">
+            <div class="legend-color" style="background-color: #FFFF00;"></div>
+            <span>Mixed Connection</span>
+        </div>
+    </div>
+    
+    <script>
+        // Data
+        const nodes = {json.dumps(nodes)};
+        const links = {json.dumps(links)};
+        
+        // Dimensions
+        const width = window.innerWidth - 60;
+        const height = window.innerHeight - 200;
+        
+        // Create SVG
+        const svg = d3.select("#graph")
+            .append("svg")
+            .attr("width", width)
+            .attr("height", height);
+        
+        // Create zoom behavior
+        const zoom = d3.zoom()
+            .scaleExtent([0.1, 10])
+            .on("zoom", zoomed);
+        
+        svg.call(zoom);
+        
+        const g = svg.append("g");
+        
+        // Create tooltip
+        const tooltip = d3.select(".tooltip");
+        
+        // Create force simulation
+        const simulation = d3.forceSimulation(nodes)
+            .force("link", d3.forceLink(links).id(d => d.id).distance(100).strength(d => d.weight))
+            .force("charge", d3.forceManyBody().strength(-300))
+            .force("center", d3.forceCenter(width / 2, height / 2))
+            .force("collision", d3.forceCollide().radius(d => d.size + 5));
+        
+        // Create links
+        const link = g.append("g")
+            .selectAll("line")
+            .data(links)
+            .enter().append("line")
+            .attr("stroke", d => d.color)
+            .attr("stroke-width", d => d.width)
+            .attr("stroke-opacity", 0.6);
+        
+        // Create nodes
+        const node = g.append("g")
+            .selectAll("circle")
+            .data(nodes)
+            .enter().append("circle")
+            .attr("r", d => d.size)
+            .attr("fill", d => d.color)
+            .attr("stroke", "#333")
+            .attr("stroke-width", 2)
+            .style("cursor", "pointer")
+            .call(drag(simulation));
+        
+        // Create labels
+        const labels = g.append("g")
+            .selectAll("text")
+            .data(nodes)
+            .enter().append("text")
+            .text(d => d.label)
+            .attr("font-size", 12)
+            .attr("dx", d => d.size + 5)
+            .attr("dy", 4)
+            .style("pointer-events", "none");
+        
+        // Node hover
+        node.on("mouseover", function(event, d) {{
+            // Show tooltip
+            let html = `<strong>${{d.label}} - ${{d.status}}</strong><br/>`;
+            html += `PageRank: ${{d.pagerank.toFixed(3)}}<br/>`;
+            html += `Connections: ${{d.degree}}<br/>`;
+            
+            if (d.hallucination_score !== undefined) {{
+                html += `Hallucination Score: ${{d.hallucination_score.toFixed(3)}}<br/>`;
+                html += `Similarity to Reference: ${{d.semantic_similarity.toFixed(3)}}<br/>`;
+            }}
+            
+            html += `<br/><strong>Text:</strong><br/>`;
+            html += d.text;
+            
+            tooltip.html(html)
+                .style("left", (event.pageX + 10) + "px")
+                .style("top", (event.pageY - 10) + "px")
+                .style("opacity", 1);
+            
+            // Highlight node and connections
+            d3.select(this).attr("stroke-width", 4);
+            
+            // Highlight connected edges
+            link.style("stroke-opacity", l => 
+                (l.source.id === d.id || l.target.id === d.id) ? 1 : 0.2
+            );
+            
+            // Fade unconnected nodes
+            node.style("opacity", n => {{
+                if (n.id === d.id) return 1;
+                const connected = links.some(l => 
+                    (l.source.id === d.id && l.target.id === n.id) ||
+                    (l.target.id === d.id && l.source.id === n.id)
+                );
+                return connected ? 1 : 0.3;
+            }});
+        }})
+        .on("mouseout", function() {{
+            tooltip.style("opacity", 0);
+            d3.select(this).attr("stroke-width", 2);
+            link.style("stroke-opacity", 0.6);
+            node.style("opacity", 1);
+        }});
+        
+        // Update positions on tick
+        simulation.on("tick", () => {{
+            link
+                .attr("x1", d => d.source.x)
+                .attr("y1", d => d.source.y)
+                .attr("x2", d => d.target.x)
+                .attr("y2", d => d.target.y);
+            
+            node
+                .attr("cx", d => d.x)
+                .attr("cy", d => d.y);
+            
+            labels
+                .attr("x", d => d.x)
+                .attr("y", d => d.y);
+        }});
+        
+        // Drag functions
+        function drag(simulation) {{
+            function dragstarted(event, d) {{
+                if (!event.active) simulation.alphaTarget(0.3).restart();
+                d.fx = d.x;
+                d.fy = d.y;
+            }}
+            
+            function dragged(event, d) {{
+                d.fx = event.x;
+                d.fy = event.y;
+            }}
+            
+            function dragended(event, d) {{
+                if (!event.active) simulation.alphaTarget(0);
+                d.fx = null;
+                d.fy = null;
+            }}
+            
+            return d3.drag()
+                .on("start", dragstarted)
+                .on("drag", dragged)
+                .on("end", dragended);
+        }}
+        
+        // Zoom function
+        function zoomed(event) {{
+            g.attr("transform", event.transform);
+        }}
+        
+        // Control functions
+        function resetSimulation() {{
+            simulation.alpha(1).restart();
+            svg.transition().duration(750).call(
+                zoom.transform,
+                d3.zoomIdentity
+            );
+        }}
+        
+        let labelsVisible = true;
+        function toggleLabels() {{
+            labelsVisible = !labelsVisible;
+            labels.style("display", labelsVisible ? "block" : "none");
+        }}
+    </script>
+</body>
+</html>
+"""
+        
+        # Save HTML file
+        with open(save_path, 'w', encoding='utf-8') as f:
+            f.write(html_content)
+        
+        return save_path
+    
+    def analyze(self, reference: str, candidates: List[str], output_dir: str = ".") -> Dict:
+        """Complete analysis pipeline"""
+        print("\n" + "="*60)
+        print("INTERACTIVE HALLUCINATION DETECTION ANALYSIS")
+        print("="*60)
+        
+        # Combine paragraphs
+        all_paragraphs = [reference] + candidates
+        
+        # Build graph
+        print("\nBuilding consistency graph...")
+        G, classifications, edge_details = self.build_full_graph(all_paragraphs)
+        
+        # Calculate metrics
+        print("Calculating graph metrics...")
+        metrics = self.calculate_metrics(G)
+        
+        # Create visualization
+        print("Creating interactive force-directed graph...")
+        viz_path = os.path.join(output_dir, "hallucination_interactive.html")
+        self.create_interactive_force_graph(G, metrics, classifications, viz_path)
+        
+        # Print summary
+        print("\n" + "-"*60)
+        print("ANALYSIS SUMMARY")
+        print("-"*60)
+        print(f"Total paragraphs: {len(all_paragraphs)}")
+        print(f"Hallucinated: {sum(1 for c in classifications if c['is_hallucinated'])}")
+        print(f"Consistent with reference: {sum(1 for c in classifications if not c['is_hallucinated'])}")
+        print(f"Total connections: {G.number_of_edges()}")
+        print(f"Isolated paragraphs: {len(metrics['isolated'])}")
+        
+        print(f"\nVisualization saved to: {viz_path}")
+        print("\nINTERACTION GUIDE:")
+        print("- Drag nodes to rearrange (connected nodes will follow)")
+        print("- Hover over nodes to see details")
+        print("- Zoom with mouse wheel")
+        print("- Pan by dragging background")
+        print("- Click 'Reset View' to recenter")
+        
+        print("\nOpening in browser...")
+        webbrowser.open(f'file://{os.path.abspath(viz_path)}')
+        
+        return {
+            'graph': G,
+            'metrics': metrics,
+            'classifications': classifications,
+            'edge_details': edge_details,
+            'visualization': viz_path
+        }
+
+
+# Example usage
+if __name__ == "__main__":
+    # Initialize detector
+    detector = HallucinationDetector3D(use_gpu=False)
+    
+    # Example data
+    reference = """The company reported revenue of $2.5 million in Q4 2023, with a 15% increase from the previous quarter. 
+    CEO John Smith announced expansion plans on January 15, 2024, targeting the Asian market. 
+    The profit margin improved to 22% due to cost optimization."""
+    
+    candidates = [
+        """Q4 2023 revenue reached $2.5 million, marking 15% quarterly growth. 
+        John Smith revealed Asian market expansion on January 15, 2024. 
+        Profit margins rose to 22% through cost optimization.""",
+        
+        """The company earned $3.2 million in Q4 2023, a 20% increase. 
+        CEO John Smith discussed expansion plans on January 20, 2024. 
+        Profit margins reached 25% after cost controls.""",
+        
+        """Revenue of $3.2 million was reported for Q4 2023, up 20%. 
+        The January 20, 2024 announcement by John Smith outlined expansion. 
+        Cost controls yielded 25% profit margins.""",
+        
+        """Q4 2023 saw losses of $1.8 million, down 30%. 
+        John Smith announced layoffs and cancelled all expansion plans. 
+        The company is considering bankruptcy options.""",
+        
+        """Financial results show $2.5 million revenue in Q4 2023, up 15%. 
+        Asian market expansion was announced by CEO John Smith on January 15, 2024. 
+        Cost optimizations improved margins to 22%."""
+    ]
+    
+    # Run analysis
+    results = detector.analyze(reference, candidates)
