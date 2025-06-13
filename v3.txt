@@ -625,7 +625,7 @@ class CompleteHallucinationDetectionSystem:
         
         # Graph metrics
         hover_text += "<br><b>Graph Metrics:</b><br>"
-        hover_text += f"  • Connections: {G.degree(node)}<br>"
+        hover_text += f"  • Connections: {G.degree(node_id)}<br>"
         hover_text += f"  • PageRank: {metrics['pagerank'][node_id]:.3f}<br>"
         hover_text += f"  • Betweenness: {metrics['betweenness_centrality'][node_id]:.3f}<br>"
         hover_text += f"  • Closeness: {metrics['closeness_centrality'][node_id]:.3f}<br>"
@@ -910,7 +910,7 @@ class CompleteHallucinationDetectionSystem:
             )
         )
         
-        # Update axes
+        # Update 2D axes
         fig.update_xaxes(title="PageRank", row=1, col=2)
         fig.update_yaxes(title="Hallucination Score", row=1, col=2)
         fig.update_xaxes(title="Component", row=1, col=3)
