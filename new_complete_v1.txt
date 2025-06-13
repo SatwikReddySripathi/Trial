@@ -1,0 +1,1043 @@
+import numpy as np
+import pandas as pd
+from typing import List, Dict, Tuple, Set, Optional
+import re
+from datetime import datetime
+import networkx as nx
+import matplotlib.pyplot as plt
+from sklearn.metrics.pairwise import cosine_similarity
+from sklearn.feature_extraction.text import TfidfVectorizer
+import nltk
+from nltk.tokenize import sent_tokenize, word_tokenize
+from collections import defaultdict
+import seaborn as sns
+import plotly.graph_objects as go
+import plotly.express as px
+from plotly.subplots import make_subplots
+import json
+from networkx.algorithms import community
+import warnings
+import textwrap
+from scipy.stats import entropy
+from sentence_transformers import SentenceTransformer
+from transformers import pipeline
+import torch
+
+warnings.filterwarnings('ignore')
+
+# Download required NLTK data
+nltk.download('punkt', quiet=True)
+nltk.download('averaged_perceptron_tagger', quiet=True)
+nltk.download('maxent_ne_chunker', quiet=True)
+nltk.download('words', quiet=True)
+nltk.download('stopwords', quiet=True)
+
+class CompleteHallucinationDetector:
+    """Complete hallucination detection system with all features"""
+    
+    def __init__(self, use_gpu=False):
+        """Initialize all models and components"""
+        # Device configuration
+        self.device = 'cuda' if use_gpu and torch.cuda.is_available() else 'cpu'
+        print(f"Using device: {self.device}")
+        
+        # Initialize models
+        print("Loading models...")
+        self.sentence_model = SentenceTransformer('all-MiniLM-L6-v2')
+        self.sentence_model.to(self.device)
+        
+        # NLI model for entailment
+        self.nli_pipeline = pipeline(
+            "text-classification", 
+            model="cross-encoder/nli-deberta-v3-base",
+            device=0 if self.device == 'cuda' else -1
+        )
+        
+        # TF-IDF for additional similarity
+        self.tfidf_vectorizer = TfidfVectorizer(
+            max_features=1000,
+            ngram_range=(1, 3),
+            stop_words='english'
+        )
+        
+        # Patterns for entity extraction
+        self.patterns = {
+            'date': r'\b(?:\d{1,2}[-/]\d{1,2}[-/]\d{2,4}|\d{4}[-/]\d{1,2}[-/]\d{1,2}|(?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)[a-z]* \d{1,2},? \d{4})\b',
+            'money': r'\$[\d,]+(?:\.\d{2})?|\b\d+(?:,\d{3})*(?:\.\d{2})?\s*(?:dollars?|USD|cents?)\b',
+            'number': r'\b\d+(?:,\d{3})*(?:\.\d+)?%?\b',
+            'percentage': r'\b\d+(?:\.\d+)?%',
+            'email': r'\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Z|a-z]{2,}\b',
+            'phone': r'\b(?:\+?1[-.]?)?\(?[0-9]{3}\)?[-.]?[0-9]{3}[-.]?[0-9]{4}\b'
+        }
+        
+        # Color schemes
+        self.colors = {
+            'hallucination': '#FF0000',  # Red
+            'reference': '#0000FF',      # Blue
+            'consistent_high': '#006400', # Dark green
+            'consistent_low': '#90EE90'   # Light green
+        }
+        
+        print("Initialization complete!")
+    
+    def extract_entities(self, text: str) -> Dict[str, any]:
+        """Extract all types of entities and information from text"""
+        entities = {
+            'dates': set(),
+            'money': set(),
+            'numbers': set(),
+            'percentages': set(),
+            'emails': set(),
+            'phones': set(),
+            'named_entities': set(),
+            'key_phrases': set(),
+            'facts': [],
+            'word_count': len(text.split()),
+            'sentence_count': len(sent_tokenize(text))
+        }
+        
+        # Extract using patterns
+        for pattern_name, pattern in self.patterns.items():
+            matches = re.findall(pattern, text, re.IGNORECASE)
+            entities[pattern_name + 's' if not pattern_name.endswith('s') else pattern_name] = set(matches)
+        
+        # Extract named entities using NLTK
+        try:
+            tokens = word_tokenize(text)
+            pos_tags = nltk.pos_tag(tokens)
+            chunks = nltk.ne_chunk(pos_tags, binary=False)
+            
+            for chunk in chunks:
+                if hasattr(chunk, 'label'):
+                    entity_name = ' '.join(c[0] for c in chunk)
+                    entities['named_entities'].add((entity_name, chunk.label()))
+        except:
+            pass
+        
+        # Extract key phrases (noun phrases)
+        sentences = sent_tokenize(text)
+        for sent in sentences:
+            # Extract sentences with factual information
+            if any(re.search(self.patterns[p], sent) for p in ['date', 'money', 'percentage']):
+                entities['facts'].append(sent.strip())
+            
+            # Extract noun phrases
+            tokens = word_tokenize(sent)
+            pos_tags = nltk.pos_tag(tokens)
+            
+            noun_phrase = []
+            for word, pos in pos_tags:
+                if pos in ['NN', 'NNS', 'NNP', 'NNPS']:
+                    noun_phrase.append(word)
+                elif noun_phrase and len(noun_phrase) > 1:
+                    entities['key_phrases'].add(' '.join(noun_phrase))
+                    noun_phrase = []
+        
+        return entities
+    
+    def calculate_entropy(self, text: str) -> float:
+        """Calculate entropy of text based on word distribution"""
+        words = word_tokenize(text.lower())
+        # Remove stopwords
+        stopwords = set(nltk.corpus.stopwords.words('english'))
+        words = [w for w in words if w.isalnum() and w not in stopwords]
+        
+        if not words:
+            return 0.0
+        
+        # Calculate word frequencies
+        word_freq = defaultdict(int)
+        for word in words:
+            word_freq[word] += 1
+        
+        # Convert to probabilities
+        total_words = len(words)
+        probabilities = [count/total_words for count in word_freq.values()]
+        
+        # Calculate entropy
+        return entropy(probabilities)
+    
+    def semantic_similarity_transformer(self, text1: str, text2: str) -> float:
+        """Calculate semantic similarity using sentence transformers"""
+        embeddings = self.sentence_model.encode([text1, text2])
+        similarity = cosine_similarity([embeddings[0]], [embeddings[1]])[0][0]
+        return float(similarity)
+    
+    def semantic_similarity_tfidf(self, text1: str, text2: str) -> float:
+        """Calculate semantic similarity using TF-IDF"""
+        try:
+            tfidf_matrix = self.tfidf_vectorizer.fit_transform([text1, text2])
+            similarity = cosine_similarity(tfidf_matrix[0:1], tfidf_matrix[1:2])[0][0]
+            return float(similarity)
+        except:
+            return 0.0
+    
+    def check_entailment(self, premise: str, hypothesis: str) -> Dict[str, float]:
+        """Check entailment using NLI model"""
+        # Prepare input
+        input_text = f"{premise} [SEP] {hypothesis}"
+        
+        # Get predictions
+        results = self.nli_pipeline(input_text)
+        
+        # Parse results
+        entailment_scores = {
+            'entailment': 0.0,
+            'neutral': 0.0,
+            'contradiction': 0.0
+        }
+        
+        label_mapping = {
+            'ENTAILMENT': 'entailment',
+            'NEUTRAL': 'neutral',
+            'CONTRADICTION': 'contradiction'
+        }
+        
+        for result in results:
+            label = result['label'].upper()
+            if label in label_mapping:
+                entailment_scores[label_mapping[label]] = result['score']
+        
+        return entailment_scores
+    
+    def check_factual_consistency(self, entities1: Dict, entities2: Dict) -> Dict[str, float]:
+        """Check factual consistency between entity sets"""
+        consistency_results = {
+            'date_consistency': 1.0,
+            'money_consistency': 1.0,
+            'number_consistency': 1.0,
+            'percentage_consistency': 1.0,
+            'entity_consistency': 1.0,
+            'overall_consistency': 1.0
+        }
+        
+        # Check each entity type
+        for entity_type in ['dates', 'money', 'numbers', 'percentages']:
+            if entities1[entity_type] and entities2[entity_type]:
+                # Calculate Jaccard similarity
+                intersection = len(entities1[entity_type] & entities2[entity_type])
+                union = len(entities1[entity_type] | entities2[entity_type])
+                consistency_results[entity_type.rstrip('s') + '_consistency'] = intersection / union if union > 0 else 0
+        
+        # Check named entities
+        if entities1['named_entities'] and entities2['named_entities']:
+            entity_names1 = {e[0] for e in entities1['named_entities']}
+            entity_names2 = {e[0] for e in entities2['named_entities']}
+            intersection = len(entity_names1 & entity_names2)
+            union = len(entity_names1 | entity_names2)
+            consistency_results['entity_consistency'] = intersection / union if union > 0 else 1
+        
+        # Calculate overall consistency
+        consistency_values = [v for k, v in consistency_results.items() if k != 'overall_consistency']
+        consistency_results['overall_consistency'] = np.mean(consistency_values)
+        
+        return consistency_results
+    
+    def classify_hallucination(self, reference_text: str, candidate_text: str) -> Dict:
+        """Comprehensive hallucination classification"""
+        # Extract entities
+        ref_entities = self.extract_entities(reference_text)
+        cand_entities = self.extract_entities(candidate_text)
+        
+        # Calculate semantic similarities
+        transformer_sim = self.semantic_similarity_transformer(reference_text, candidate_text)
+        tfidf_sim = self.semantic_similarity_tfidf(reference_text, candidate_text)
+        combined_sim = (transformer_sim + tfidf_sim) / 2
+        
+        # Calculate entropy
+        ref_entropy = self.calculate_entropy(reference_text)
+        cand_entropy = self.calculate_entropy(candidate_text)
+        entropy_diff = abs(ref_entropy - cand_entropy)
+        
+        # Check entailment
+        entailment_scores = self.check_entailment(reference_text, candidate_text)
+        
+        # Check factual consistency
+        consistency_results = self.check_factual_consistency(ref_entities, cand_entities)
+        
+        # Calculate hallucination score with weighted components
+        hallucination_score = (
+            (1 - combined_sim) * 0.25 +                    # Semantic dissimilarity
+            (1 - consistency_results['overall_consistency']) * 0.35 +  # Factual inconsistency
+            entailment_scores['contradiction'] * 0.25 +     # Contradiction
+            min(entropy_diff / 2, 1.0) * 0.15             # Entropy difference
+        )
+        
+        # Additional penalty for specific factual errors
+        critical_inconsistencies = ['date_consistency', 'money_consistency']
+        for critical in critical_inconsistencies:
+            if consistency_results[critical] < 0.5:
+                hallucination_score = min(hallucination_score + 0.2, 1.0)
+        
+        is_hallucinated = hallucination_score > 0.5
+        
+        return {
+            'is_hallucinated': is_hallucinated,
+            'hallucination_score': hallucination_score,
+            'semantic_similarity': {
+                'transformer': transformer_sim,
+                'tfidf': tfidf_sim,
+                'combined': combined_sim
+            },
+            'entropy': {
+                'reference': ref_entropy,
+                'candidate': cand_entropy,
+                'difference': entropy_diff
+            },
+            'entailment_scores': entailment_scores,
+            'consistency_results': consistency_results,
+            'extracted_entities': {
+                'reference': ref_entities,
+                'candidate': cand_entities
+            }
+        }
+    
+    def build_consistency_graph(self, paragraphs: List[str], reference_idx: int = 0) -> Tuple[nx.DiGraph, np.ndarray]:
+        """Build directed graph with comprehensive edge attributes"""
+        G = nx.DiGraph()
+        n = len(paragraphs)
+        
+        # Add nodes with rich attributes
+        for i, para in enumerate(paragraphs):
+            entities = self.extract_entities(para)
+            entropy_val = self.calculate_entropy(para)
+            
+            G.add_node(i,
+                      text=para[:100] + "..." if len(para) > 100 else para,
+                      full_text=para,
+                      is_reference=(i == reference_idx),
+                      paragraph_length=len(para.split()),
+                      sentence_count=entities['sentence_count'],
+                      entropy=entropy_val,
+                      entity_count=len(entities['named_entities']) + 
+                                  len(entities['dates']) + 
+                                  len(entities['money']))
+        
+        # Calculate pairwise relationships
+        consistency_matrix = np.zeros((n, n))
+        
+        for i in range(n):
+            for j in range(n):
+                if i != j:
+                    result = self.classify_hallucination(paragraphs[i], paragraphs[j])
+                    consistency = 1 - result['hallucination_score']
+                    consistency_matrix[i][j] = consistency
+                    
+                    # Add edge with comprehensive attributes
+                    G.add_edge(i, j,
+                             weight=consistency,
+                             hallucination_score=result['hallucination_score'],
+                             semantic_sim=result['semantic_similarity']['combined'],
+                             transformer_sim=result['semantic_similarity']['transformer'],
+                             tfidf_sim=result['semantic_similarity']['tfidf'],
+                             entailment=result['entailment_scores']['entailment'],
+                             neutral=result['entailment_scores']['neutral'],
+                             contradiction=result['entailment_scores']['contradiction'],
+                             factual_consistency=result['consistency_results']['overall_consistency'],
+                             date_match=result['consistency_results']['date_consistency'],
+                             money_match=result['consistency_results']['money_consistency'],
+                             entropy_diff=result['entropy']['difference'])
+        
+        return G, consistency_matrix
+    
+    def calculate_comprehensive_graph_metrics(self, G: nx.DiGraph, reference_idx: int = 0) -> Dict:
+        """Calculate all graph properties and metrics"""
+        metrics = {}
+        
+        # Basic properties
+        metrics['num_nodes'] = G.number_of_nodes()
+        metrics['num_edges'] = G.number_of_edges()
+        metrics['density'] = nx.density(G)
+        
+        # Degree metrics
+        metrics['in_degree'] = dict(G.in_degree())
+        metrics['out_degree'] = dict(G.out_degree())
+        metrics['in_degree_centrality'] = nx.in_degree_centrality(G)
+        metrics['out_degree_centrality'] = nx.out_degree_centrality(G)
+        metrics['degree_centrality'] = nx.degree_centrality(G)
+        
+        # Advanced centrality measures
+        metrics['pagerank'] = nx.pagerank(G, weight='weight', max_iter=100)
+        metrics['betweenness_centrality'] = nx.betweenness_centrality(G, weight=lambda u,v,d: 1-d['weight'])
+        metrics['closeness_centrality'] = nx.closeness_centrality(G, distance=lambda u,v,d: 1-d['weight'])
+        metrics['eigenvector_centrality'] = nx.eigenvector_centrality(G, weight='weight', max_iter=100)
+        
+        # Clustering
+        undirected_G = G.to_undirected()
+        metrics['clustering_coefficient'] = nx.clustering(undirected_G, weight='weight')
+        metrics['average_clustering'] = nx.average_clustering(undirected_G, weight='weight')
+        metrics['transitivity'] = nx.transitivity(G)
+        
+        # Connected components
+        metrics['is_strongly_connected'] = nx.is_strongly_connected(G)
+        metrics['number_strongly_connected_components'] = nx.number_strongly_connected_components(G)
+        metrics['is_weakly_connected'] = nx.is_weakly_connected(G)
+        
+        # Community detection
+        try:
+            communities = community.louvain_communities(undirected_G, weight='weight', seed=42)
+            metrics['communities'] = [list(comm) for comm in communities]
+            metrics['modularity'] = community.modularity(undirected_G, communities, weight='weight')
+            metrics['num_communities'] = len(communities)
+        except:
+            metrics['communities'] = [[n] for n in G.nodes()]
+            metrics['modularity'] = 0
+            metrics['num_communities'] = G.number_of_nodes()
+        
+        # Path-based metrics
+        metrics['average_shortest_path_length'] = self._safe_average_shortest_path(G)
+        metrics['diameter'] = self._safe_diameter(G)
+        
+        # Information flow from reference
+        metrics['information_flow'] = self._calculate_information_flow(G, reference_idx)
+        
+        # Consistency metrics from reference
+        reference_consistency = []
+        for node in G.nodes():
+            if node != reference_idx and G.has_edge(reference_idx, node):
+                reference_consistency.append(G[reference_idx][node]['weight'])
+        
+        metrics['avg_consistency_from_reference'] = np.mean(reference_consistency) if reference_consistency else 0
+        metrics['min_consistency_from_reference'] = np.min(reference_consistency) if reference_consistency else 0
+        metrics['max_consistency_from_reference'] = np.max(reference_consistency) if reference_consistency else 0
+        
+        # Edge weight statistics
+        if G.number_of_edges() > 0:
+            edge_weights = [G[u][v]['weight'] for u, v in G.edges()]
+            metrics['average_edge_weight'] = np.mean(edge_weights)
+            metrics['std_edge_weight'] = np.std(edge_weights)
+            metrics['min_edge_weight'] = np.min(edge_weights)
+            metrics['max_edge_weight'] = np.max(edge_weights)
+            
+            # Semantic similarity statistics
+            semantic_sims = [G[u][v]['semantic_sim'] for u, v in G.edges()]
+            metrics['average_semantic_similarity'] = np.mean(semantic_sims)
+            
+            # Entailment statistics
+            contradictions = [G[u][v]['contradiction'] for u, v in G.edges()]
+            metrics['average_contradiction'] = np.mean(contradictions)
+        
+        # Identify hallucination patterns
+        metrics['hallucination_analysis'] = self._analyze_hallucination_patterns(G)
+        
+        # Final consistency score (comprehensive)
+        metrics['final_consistency_score'] = self._calculate_final_score(metrics)
+        
+        return metrics
+    
+    def _safe_average_shortest_path(self, G):
+        """Calculate average shortest path length safely"""
+        try:
+            if nx.is_strongly_connected(G):
+                return nx.average_shortest_path_length(G, weight=lambda u,v,d: 1-d['weight'])
+            else:
+                # Calculate for largest strongly connected component
+                largest_scc = max(nx.strongly_connected_components(G), key=len)
+                subgraph = G.subgraph(largest_scc)
+                if len(subgraph) > 1:
+                    return nx.average_shortest_path_length(subgraph, weight=lambda u,v,d: 1-d['weight'])
+        except:
+            pass
+        return 0
+    
+    def _safe_diameter(self, G):
+        """Calculate diameter safely"""
+        try:
+            if nx.is_strongly_connected(G):
+                return nx.diameter(G)
+            else:
+                largest_scc = max(nx.strongly_connected_components(G), key=len)
+                subgraph = G.subgraph(largest_scc)
+                if len(subgraph) > 1:
+                    return nx.diameter(subgraph)
+        except:
+            pass
+        return 0
+    
+    def _calculate_information_flow(self, G: nx.DiGraph, source: int) -> Dict:
+        """Analyze information propagation from source"""
+        flow_metrics = {
+            'reachable_nodes': set(),
+            'propagation_levels': defaultdict(list),
+            'avg_degradation_per_hop': 0,
+            'information_retention': {}
+        }
+        
+        # BFS to track propagation
+        visited = {source: 0}
+        queue = [(source, 0, 1.0)]  # node, level, accumulated_weight
+        
+        while queue:
+            node, level, acc_weight = queue.pop(0)
+            flow_metrics['propagation_levels'][level].append(node)
+            flow_metrics['information_retention'][node] = acc_weight
+            
+            for neighbor in G.successors(node):
+                if neighbor not in visited:
+                    visited[neighbor] = level + 1
+                    edge_weight = G[node][neighbor]['weight']
+                    queue.append((neighbor, level + 1, acc_weight * edge_weight))
+        
+        flow_metrics['reachable_nodes'] = set(visited.keys())
+        flow_metrics['reach_percentage'] = len(visited) / G.number_of_nodes()
+        flow_metrics['max_propagation_distance'] = max(visited.values()) if visited else 0
+        
+        # Calculate average degradation
+        if flow_metrics['max_propagation_distance'] > 0:
+            degradations = []
+            for node, ret in flow_metrics['information_retention'].items():
+                if node != source:
+                    level = visited[node]
+                    degradations.append(1 - ret**(1/level))
+            flow_metrics['avg_degradation_per_hop'] = np.mean(degradations) if degradations else 0
+        
+        return flow_metrics
+    
+    def _analyze_hallucination_patterns(self, G: nx.DiGraph) -> Dict:
+        """Identify and analyze hallucination patterns"""
+        patterns = {
+            'high_hallucination_nodes': [],
+            'contradiction_hubs': [],
+            'semantic_drift_chains': [],
+            'isolated_nodes': []
+        }
+        
+        for node in G.nodes():
+            # High hallucination nodes
+            in_hallucinations = [G[u][node]['hallucination_score'] 
+                               for u in G.predecessors(node)]
+            if in_hallucinations and np.mean(in_hallucinations) > 0.7:
+                patterns['high_hallucination_nodes'].append({
+                    'node': node,
+                    'avg_hallucination_score': np.mean(in_hallucinations)
+                })
+            
+            # Contradiction hubs
+            contradictions = [G[node][v]['contradiction'] 
+                            for v in G.successors(node)]
+            if contradictions and np.mean(contradictions) > 0.5:
+                patterns['contradiction_hubs'].append({
+                    'node': node,
+                    'avg_contradiction': np.mean(contradictions)
+                })
+            
+            # Isolated nodes
+            if G.in_degree(node) == 0 and G.out_degree(node) == 0:
+                patterns['isolated_nodes'].append(node)
+        
+        return patterns
+    
+    def _calculate_final_score(self, metrics: Dict) -> float:
+        """Calculate comprehensive final consistency score"""
+        components = []
+        weights = []
+        
+        # Reference consistency (most important)
+        if 'avg_consistency_from_reference' in metrics:
+            components.append(metrics['avg_consistency_from_reference'])
+            weights.append(0.3)
+        
+        # Overall edge consistency
+        if 'average_edge_weight' in metrics:
+            components.append(metrics['average_edge_weight'])
+            weights.append(0.2)
+        
+        # Semantic similarity
+        if 'average_semantic_similarity' in metrics:
+            components.append(metrics['average_semantic_similarity'])
+            weights.append(0.15)
+        
+        # Graph cohesion
+        if 'density' in metrics:
+            components.append(metrics['density'])
+            weights.append(0.1)
+        
+        if 'average_clustering' in metrics:
+            components.append(metrics['average_clustering'])
+            weights.append(0.1)
+        
+        # Contradiction penalty
+        if 'average_contradiction' in metrics:
+            components.append(1 - metrics['average_contradiction'])
+            weights.append(0.15)
+        
+        # Normalize weights and calculate
+        if components:
+            weights = np.array(weights) / np.sum(weights)
+            return float(np.dot(components, weights))
+        return 0.0
+    
+    def get_node_color(self, node_id: int, G: nx.DiGraph, metrics: Dict, 
+                      classifications: List[Dict]) -> str:
+        """Get color based on hallucination status and graph properties"""
+        # Reference node
+        if G.nodes[node_id].get('is_reference', False):
+            return self.colors['reference']
+        
+        # Check if hallucinated
+        if node_id > 0 and node_id <= len(classifications):
+            if classifications[node_id - 1]['is_hallucinated']:
+                return self.colors['hallucination']
+        
+        # Consistent node - use PageRank for green shade
+        pagerank = metrics['pagerank'][node_id]
+        all_pageranks = [pr for nid, pr in metrics['pagerank'].items() 
+                        if not G.nodes[nid].get('is_reference', False)]
+        
+        if all_pageranks:
+            min_pr = min(all_pageranks)
+            max_pr = max(all_pageranks)
+            if max_pr > min_pr:
+                normalized = (pagerank - min_pr) / (max_pr - min_pr)
+                # Interpolate between light and dark green
+                r = int(144 - 138 * normalized)  # 144 to 6
+                g = int(238 - 138 * normalized)  # 238 to 100
+                b = int(144 - 144 * normalized)  # 144 to 0
+                return f'rgb({r}, {g}, {b})'
+        
+        return self.colors['consistent_low']
+    
+    def create_comprehensive_visualization(self, G: nx.DiGraph, metrics: Dict,
+                                         classifications: List[Dict], 
+                                         consistency_matrix: np.ndarray,
+                                         save_path: str = "comprehensive_hallucination_analysis.html") -> go.Figure:
+        """Create comprehensive interactive visualization"""
+        
+        # Create large figure with multiple subplots
+        fig = make_subplots(
+            rows=3, cols=3,
+            subplot_titles=(
+                'Hallucination Detection Network', 'Consistency Heatmap', 'PageRank vs Hallucination',
+                'Entropy Analysis', 'Semantic Similarity Distribution', 'Graph Metrics Radar',
+                'Community Structure', 'Information Flow', 'Summary Statistics'
+            ),
+            specs=[
+                [{'type': 'scatter'}, {'type': 'heatmap'}, {'type': 'scatter'}],
+                [{'type': 'bar'}, {'type': 'histogram'}, {'type': 'scatterpolar'}],
+                [{'type': 'scatter'}, {'type': 'sunburst'}, {'type': 'table'}]
+            ],
+            row_heights=[0.35, 0.35, 0.3],
+            horizontal_spacing=0.08,
+            vertical_spacing=0.1
+        )
+        
+        # Layout for network
+        pos = nx.spring_layout(G, k=3, iterations=50, seed=42)
+        
+        # 1. Main Network Graph
+        # Draw edges
+        for edge in G.edges():
+            x0, y0 = pos[edge[0]]
+            x1, y1 = pos[edge[1]]
+            weight = G[edge[0]][edge[1]]['weight']
+            
+            # Color based on consistency
+            if weight < 0.3:
+                edge_color = 'rgba(255, 0, 0, 0.3)'
+            elif weight < 0.7:
+                edge_color = 'rgba(255, 165, 0, 0.3)'
+            else:
+                edge_color = 'rgba(0, 255, 0, 0.3)'
+            
+            edge_trace = go.Scatter(
+                x=[x0, x1, None],
+                y=[y0, y1, None],
+                mode='lines',
+                line=dict(width=weight * 5, color=edge_color),
+                hoverinfo='none',
+                showlegend=False
+            )
+            fig.add_trace(edge_trace, row=1, col=1)
+        
+        # Draw nodes
+        node_x = []
+        node_y = []
+        node_colors = []
+        node_sizes = []
+        hover_texts = []
+        
+        for node in G.nodes():
+            x, y = pos[node]
+            node_x.append(x)
+            node_y.append(y)
+            
+            # Color
+            color = self.get_node_color(node, G, metrics, classifications)
+            node_colors.append(color)
+            
+            # Size based on PageRank
+            node_sizes.append(20 + 80 * metrics['pagerank'][node])
+            
+            # Hover text
+            hover_text = f"<b>Paragraph {node}</b><br>"
+            if G.nodes[node].get('is_reference', False):
+                hover_text += "Status: REFERENCE<br>"
+            elif node > 0 and node <= len(classifications):
+                classification = classifications[node - 1]
+                status = "HALLUCINATED" if classification['is_hallucinated'] else "CONSISTENT"
+                hover_text += f"Status: {status}<br>"
+                hover_text += f"Hallucination Score: {classification['hallucination_score']:.3f}<br>"
+            
+            hover_text += f"PageRank: {metrics['pagerank'][node]:.3f}<br>"
+            hover_text += f"Betweenness: {metrics['betweenness_centrality'][node]:.3f}<br>"
+            hover_text += f"In-degree: {metrics['in_degree'][node]}<br>"
+            hover_text += f"Entropy: {G.nodes[node]['entropy']:.3f}"
+            
+            hover_texts.append(hover_text)
+        
+        node_trace = go.Scatter(
+            x=node_x,
+            y=node_y,
+            mode='markers+text',
+            text=[f"P{i}" for i in G.nodes()],
+            textposition="top center",
+            hovertext=hover_texts,
+            hoverinfo='text',
+            marker=dict(
+                size=node_sizes,
+                color=node_colors,
+                line=dict(width=2, color='black')
+            ),
+            showlegend=False
+        )
+        fig.add_trace(node_trace, row=1, col=1)
+        
+        # 2. Consistency Heatmap
+        heatmap_trace = go.Heatmap(
+            z=consistency_matrix,
+            x=[f"P{i}" for i in range(len(consistency_matrix))],
+            y=[f"P{i}" for i in range(len(consistency_matrix))],
+            colorscale='RdYlGn',
+            hovertemplate='From: %{y}<br>To: %{x}<br>Consistency: %{z:.3f}<extra></extra>'
+        )
+        fig.add_trace(heatmap_trace, row=1, col=2)
+        
+        # 3. PageRank vs Hallucination Score
+        pageranks = []
+        hallucination_scores = []
+        point_colors = []
+        labels = []
+        
+        for node in G.nodes():
+            if not G.nodes[node].get('is_reference', False) and node > 0:
+                pageranks.append(metrics['pagerank'][node])
+                hallucination_scores.append(classifications[node - 1]['hallucination_score'])
+                point_colors.append(self.get_node_color(node, G, metrics, classifications))
+                labels.append(f"P{node}")
+        
+        scatter_trace = go.Scatter(
+            x=pageranks,
+            y=hallucination_scores,
+            mode='markers+text',
+            text=labels,
+            textposition="top center",
+            marker=dict(size=12, color=point_colors, line=dict(width=1, color='black')),
+            hovertemplate='%{text}<br>PageRank: %{x:.3f}<br>Hallucination: %{y:.3f}<extra></extra>'
+        )
+        fig.add_trace(scatter_trace, row=1, col=3)
+        
+        # 4. Entropy Analysis
+        entropy_values = [G.nodes[node]['entropy'] for node in G.nodes()]
+        entropy_labels = [f"P{node}" for node in G.nodes()]
+        entropy_colors = [self.get_node_color(node, G, metrics, classifications) for node in G.nodes()]
+        
+        entropy_bar = go.Bar(
+            x=entropy_labels,
+            y=entropy_values,
+            marker_color=entropy_colors,
+            hovertemplate='%{x}<br>Entropy: %{y:.3f}<extra></extra>'
+        )
+        fig.add_trace(entropy_bar, row=2, col=1)
+        
+        # 5. Semantic Similarity Distribution
+        semantic_sims = [G[u][v]['semantic_sim'] for u, v in G.edges()]
+        
+        hist_trace = go.Histogram(
+            x=semantic_sims,
+            nbinsx=20,
+            marker_color='lightblue',
+            hovertemplate='Similarity: %{x:.3f}<br>Count: %{y}<extra></extra>'
+        )
+        fig.add_trace(hist_trace, row=2, col=2)
+        
+        # 6. Graph Metrics Radar Chart
+        # Select key metrics for radar
+        selected_node = 0  # You can make this interactive
+        radar_metrics = {
+            'PageRank': metrics['pagerank'][selected_node],
+            'Betweenness': metrics['betweenness_centrality'][selected_node],
+            'Closeness': metrics['closeness_centrality'][selected_node],
+            'In-Degree': metrics['in_degree_centrality'][selected_node],
+            'Out-Degree': metrics['out_degree_centrality'][selected_node],
+            'Clustering': metrics['clustering_coefficient'][selected_node]
+        }
+        
+        radar_trace = go.Scatterpolar(
+            r=list(radar_metrics.values()),
+            theta=list(radar_metrics.keys()),
+            fill='toself',
+            name=f'P{selected_node}'
+        )
+        fig.add_trace(radar_trace, row=2, col=3)
+        
+        # 7. Community Structure
+        community_colors = ['red', 'blue', 'green', 'orange', 'purple', 'brown']
+        for i, community in enumerate(metrics['communities']):
+            comm_x = [pos[node][0] for node in community]
+            comm_y = [pos[node][1] for node in community]
+            
+            comm_trace = go.Scatter(
+                x=comm_x,
+                y=comm_y,
+                mode='markers',
+                marker=dict(size=15, color=community_colors[i % len(community_colors)]),
+                name=f'Community {i+1}',
+                hovertemplate='Community %{text}<extra></extra>',
+                text=[f"{i+1}" for _ in community]
+            )
+            fig.add_trace(comm_trace, row=3, col=1)
+        
+        # 8. Information Flow Sunburst
+        # Prepare hierarchical data
+        labels = [f"P{0} (Ref)"]
+        parents = [""]
+        values = [1.0]
+        
+        info_flow = metrics['information_flow']
+        for level in range(1, info_flow['max_propagation_distance'] + 1):
+            for node in info_flow['propagation_levels'][level]:
+                labels.append(f"P{node}")
+                # Find parent from previous level
+                for prev_node in info_flow['propagation_levels'][level - 1]:
+                    if G.has_edge(prev_node, node):
+                        parents.append(f"P{prev_node}")
+                        values.append(G[prev_node][node]['weight'])
+                        break
+        
+        sunburst_trace = go.Sunburst(
+            labels=labels,
+            parents=parents,
+            values=values,
+            marker=dict(colorscale='RdYlGn')
+        )
+        fig.add_trace(sunburst_trace, row=3, col=2)
+        
+        # 9. Summary Statistics Table
+        summary_data = [
+            ["Final Consistency Score", f"{metrics['final_consistency_score']:.3f}"],
+            ["Average Consistency", f"{metrics['average_edge_weight']:.3f}"],
+            ["Average Semantic Similarity", f"{metrics['average_semantic_similarity']:.3f}"],
+            ["Average Contradiction", f"{metrics['average_contradiction']:.3f}"],
+            ["Graph Density", f"{metrics['density']:.3f}"],
+            ["Modularity", f"{metrics['modularity']:.3f}"],
+            ["Number of Communities", f"{metrics['num_communities']}"],
+            ["Hallucinated Paragraphs", f"{sum(1 for c in classifications if c['is_hallucinated'])}"],
+            ["Information Reach", f"{metrics['information_flow']['reach_percentage']:.1%}"]
+        ]
+        
+        table_trace = go.Table(
+            header=dict(
+                values=['<b>Metric</b>', '<b>Value</b>'],
+                font=dict(size=12, color='white'),
+                fill_color='darkblue'
+            ),
+            cells=dict(
+                values=[[row[0] for row in summary_data],
+                       [row[1] for row in summary_data]],
+                font=dict(size=11),
+                fill_color=['lightgray', 'white']
+            )
+        )
+        fig.add_trace(table_trace, row=3, col=3)
+        
+        # Update layout
+        fig.update_layout(
+            title={
+                'text': "Comprehensive Hallucination Analysis Dashboard",
+                'font': {'size': 20}
+            },
+            height=1400,
+            showlegend=False
+        )
+        
+        # Update axes
+        fig.update_xaxes(showgrid=False, zeroline=False, showticklabels=False, row=1, col=1)
+        fig.update_yaxes(showgrid=False, zeroline=False, showticklabels=False, row=1, col=1)
+        fig.update_xaxes(title="PageRank", row=1, col=3)
+        fig.update_yaxes(title="Hallucination Score", row=1, col=3)
+        fig.update_xaxes(title="Paragraph", row=2, col=1)
+        fig.update_yaxes(title="Entropy", row=2, col=1)
+        fig.update_xaxes(title="Semantic Similarity", row=2, col=2)
+        fig.update_yaxes(title="Frequency", row=2, col=2)
+        fig.update_xaxes(showgrid=False, zeroline=False, showticklabels=False, row=3, col=1)
+        fig.update_yaxes(showgrid=False, zeroline=False, showticklabels=False, row=3, col=1)
+        
+        # Save
+        fig.write_html(save_path)
+        return fig
+    
+    def generate_comprehensive_report(self, results: Dict) -> str:
+        """Generate detailed analysis report"""
+        report = []
+        report.append("=" * 80)
+        report.append("COMPREHENSIVE HALLUCINATION DETECTION REPORT")
+        report.append("=" * 80)
+        report.append("")
+        
+        # Executive Summary
+        summary = results['summary']
+        report.append("EXECUTIVE SUMMARY")
+        report.append("-" * 40)
+        report.append(f"Total Paragraphs: {summary['total_paragraphs']}")
+        report.append(f"Hallucinated: {summary['hallucinated_count']} ({summary['hallucinated_count']/summary['total_paragraphs']*100:.1f}%)")
+        report.append(f"Final Consistency Score: {summary['final_consistency_score']:.3f}")
+        report.append("")
+        
+        # Key Findings
+        metrics = results['graph_metrics']
+        report.append("KEY FINDINGS")
+        report.append("-" * 40)
+        
+        # Most authoritative paragraphs
+        pagerank_sorted = sorted(metrics['pagerank'].items(), key=lambda x: x[1], reverse=True)[:3]
+        report.append("Most Authoritative Paragraphs (by PageRank):")
+        for node, score in pagerank_sorted:
+            report.append(f"  - Paragraph {node}: {score:.3f}")
+        
+        # Hallucination patterns
+        if metrics['hallucination_analysis']['high_hallucination_nodes']:
+            report.append("\nHigh Hallucination Nodes:")
+            for item in metrics['hallucination_analysis']['high_hallucination_nodes']:
+                report.append(f"  - Paragraph {item['node']}: {item['avg_hallucination_score']:.3f}")
+        
+        report.append("")
+        
+        # Individual Analysis
+        report.append("INDIVIDUAL PARAGRAPH ANALYSIS")
+        report.append("-" * 40)
+        
+        for i, classification in enumerate(results['classifications']):
+            report.append(f"\nParagraph {i+1}:")
+            report.append(f"  Status: {'HALLUCINATED' if classification['is_hallucinated'] else 'CONSISTENT'}")
+            report.append(f"  Hallucination Score: {classification['hallucination_score']:.3f}")
+            report.append(f"  Semantic Similarity: {classification['semantic_similarity']['combined']:.3f}")
+            report.append(f"  Entropy Difference: {classification['entropy']['difference']:.3f}")
+            report.append(f"  Entailment - Contradiction: {classification['entailment_scores']['contradiction']:.3f}")
+            
+            # Key inconsistencies
+            consistency = classification['consistency_results']
+            inconsistent = [k for k, v in consistency.items() if v < 0.5 and k != 'overall_consistency']
+            if inconsistent:
+                report.append(f"  Key Inconsistencies: {', '.join(inconsistent)}")
+        
+        return "\n".join(report)
+    
+    def analyze_paragraphs(self, reference_paragraph: str, candidate_paragraphs: List[str],
+                          visualize: bool = True, save_report: bool = True) -> Dict:
+        """Main analysis function"""
+        print("Starting comprehensive hallucination analysis...")
+        
+        # Combine paragraphs
+        all_paragraphs = [reference_paragraph] + candidate_paragraphs
+        
+        # Build graph
+        print("Building consistency graph...")
+        G, consistency_matrix = self.build_consistency_graph(all_paragraphs, reference_idx=0)
+        
+        # Calculate metrics
+        print("Calculating graph metrics...")
+        graph_metrics = self.calculate_comprehensive_graph_metrics(G, reference_idx=0)
+        
+        # Classify each candidate
+        print("Classifying paragraphs...")
+        classifications = []
+        for i, candidate in enumerate(candidate_paragraphs, 1):
+            result = self.classify_hallucination(reference_paragraph, candidate)
+            result['paragraph_index'] = i
+            classifications.append(result)
+        
+        # Compile results
+        results = {
+            'graph': G,
+            'consistency_matrix': consistency_matrix,
+            'graph_metrics': graph_metrics,
+            'classifications': classifications,
+            'summary': {
+                'total_paragraphs': len(all_paragraphs),
+                'hallucinated_count': sum(1 for c in classifications if c['is_hallucinated']),
+                'average_consistency': graph_metrics['average_edge_weight'],
+                'final_consistency_score': graph_metrics['final_consistency_score']
+            }
+        }
+        
+        # Create visualization
+        if visualize:
+            print("Creating visualization...")
+            self.create_comprehensive_visualization(G, graph_metrics, classifications, consistency_matrix)
+            print("Visualization saved as 'comprehensive_hallucination_analysis.html'")
+        
+        # Generate report
+        if save_report:
+            report = self.generate_comprehensive_report(results)
+            with open('hallucination_analysis_report.txt', 'w') as f:
+                f.write(report)
+            print("Report saved as 'hallucination_analysis_report.txt'")
+            print("\n" + report)
+        
+        return results
+
+
+# Example usage
+if __name__ == "__main__":
+    # Initialize detector
+    detector = CompleteHallucinationDetector(use_gpu=False)
+    
+    # Example: Financial report scenario
+    reference = """The company reported revenue of $2.5 million in Q4 2023, with a 15% increase from the previous quarter. 
+    The CEO John Smith announced the expansion plans on January 15, 2024, targeting the Asian market. 
+    The company's profit margin improved to 22% due to cost optimization strategies. 
+    Employee count grew to 150 people, with 30 new hires in the engineering department."""
+    
+    candidates = [
+        # Consistent
+        """In Q4 2023, the company's revenue reached $2.5 million, marking a 15% growth compared to Q3. 
+        CEO John Smith revealed expansion strategies for Asia on January 15, 2024. 
+        Profit margins rose to 22% through effective cost management. 
+        The workforce expanded to 150 employees with significant engineering hires.""",
+        
+        # Partially hallucinated (wrong numbers)
+        """The firm generated $3.2 million in revenue during Q4 2023, showing 20% growth. 
+        CEO John Smith discussed expansion into Asian markets on January 20, 2024. 
+        The profit margin reached 25% after implementing cost controls. 
+        Total employees number 150 with focus on engineering growth.""",
+        
+        # Major hallucination
+        """Q4 2023 saw the company achieve $1.8 million in revenue, a 10% decline from Q3. 
+        John Smith, the CEO, announced cost-cutting measures and halted expansion on January 15, 2024. 
+        Profit margins dropped to 18% due to increased operational costs. 
+        The company reduced staff to 120 employees through layoffs.""",
+        
+        # Subtle hallucination (context change)
+        """The company's Q4 2023 revenue of $2.5 million represented steady performance with 15% growth. 
+        CEO John Smith announced on January 15, 2024 that expansion plans would focus on Europe instead. 
+        The 22% profit margin was achieved through workforce reduction rather than optimization. 
+        Employee count stands at 150 after restructuring.""",
+        
+        # Consistent with added details
+        """Financial results for Q4 2023 showed $2.5 million in revenue, up 15% from Q3. 
+        On January 15, 2024, CEO John Smith detailed the Asian market expansion strategy. 
+        Cost optimization initiatives successfully increased profit margins to 22%. 
+        The company now employs 150 people, including 30 recent engineering hires."""
+    ]
+    
+    # Analyze
+    results = detector.analyze_paragraphs(
+        reference_paragraph=reference,
+        candidate_paragraphs=candidates,
+        visualize=True,
+        save_report=True
+    )
+    
+    print("\nAnalysis complete! Check the generated files:")
+    print("- comprehensive_hallucination_analysis.html")
+    print("- hallucination_analysis_report.txt")
