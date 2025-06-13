@@ -1,0 +1,731 @@
+import numpy as np
+import networkx as nx
+import plotly.graph_objects as go
+from plotly.subplots import make_subplots
+from typing import Dict, List, Tuple
+import textwrap
+from sklearn.decomposition import PCA
+from sklearn.manifold import TSNE
+import warnings
+warnings.filterwarnings('ignore')
+
+class HallucinationGraph3DVisualizer:
+    """3D visualization system for hallucination detection graphs"""
+    
+    def __init__(self):
+        self.colors = {
+            'hallucination': '#FF0000',      # Red
+            'reference': '#0000FF',          # Blue
+            'consistent_high': '#006400',    # Dark green
+            'consistent_low': '#90EE90'      # Light green
+        }
+        
+    def get_node_color_rgb(self, node_id: int, G: nx.DiGraph, metrics: Dict, 
+                           classifications: List[Dict]) -> Tuple[int, int, int]:
+        """Get RGB color values for node"""
+        # Reference node
+        if G.nodes[node_id].get('is_reference', False):
+            return (0, 0, 255)  # Blue
+        
+        # Check if hallucinated
+        if node_id > 0 and node_id <= len(classifications):
+            if classifications[node_id - 1]['is_hallucinated']:
+                return (255, 0, 0)  # Red
+        
+        # Consistent node - use PageRank for green shade
+        pagerank = metrics['pagerank'][node_id]
+        all_pageranks = [pr for nid, pr in metrics['pagerank'].items() 
+                        if not G.nodes[nid].get('is_reference', False)]
+        
+        if all_pageranks:
+            min_pr = min(all_pageranks)
+            max_pr = max(all_pageranks)
+            if max_pr > min_pr:
+                normalized = (pagerank - min_pr) / (max_pr - min_pr)
+                # Interpolate between light and dark green
+                r = int(144 - 138 * normalized)  # 144 to 6
+                g = int(238 - 138 * normalized)  # 238 to 100
+                b = int(144 - 144 * normalized)  # 144 to 0
+                return (r, g, b)
+        
+        return (144, 238, 144)  # Light green default
+    
+    def create_3d_layout(self, G: nx.DiGraph, layout_type: str = 'spring') -> Dict:
+        """Create 3D layout for graph nodes"""
+        if layout_type == 'spring':
+            # Spring layout in 3D
+            pos = nx.spring_layout(G, dim=3, k=3, iterations=50, seed=42)
+        elif layout_type == 'spectral':
+            # Spectral layout using eigenvalues
+            pos_2d = nx.spectral_layout(G)
+            # Add z-dimension based on node properties
+            pos = {}
+            for node, (x, y) in pos_2d.items():
+                z = G.nodes[node].get('entropy', 0) * 0.5  # Use entropy for z
+                pos[node] = np.array([x, y, z])
+        elif layout_type == 'tsne':
+            # Use t-SNE for layout based on node features
+            features = []
+            nodes = list(G.nodes())
+            for node in nodes:
+                feat = [
+                    G.nodes[node].get('entropy', 0),
+                    G.nodes[node].get('paragraph_length', 0) / 100,
+                    G.nodes[node].get('entity_count', 0) / 10
+                ]
+                features.append(feat)
+            
+            if len(nodes) > 3:
+                tsne = TSNE(n_components=3, random_state=42)
+                coords = tsne.fit_transform(features)
+            else:
+                coords = np.random.randn(len(nodes), 3)
+            
+            pos = {node: coords[i] for i, node in enumerate(nodes)}
+        else:
+            # Hierarchical layout based on information flow
+            pos = self._hierarchical_3d_layout(G)
+        
+        return pos
+    
+    def _hierarchical_3d_layout(self, G: nx.DiGraph) -> Dict:
+        """Create hierarchical 3D layout based on graph structure"""
+        pos = {}
+        levels = {}
+        
+        # Find reference node
+        ref_node = None
+        for node in G.nodes():
+            if G.nodes[node].get('is_reference', False):
+                ref_node = node
+                break
+        
+        if ref_node is None:
+            ref_node = 0
+        
+        # BFS to assign levels
+        visited = {ref_node}
+        queue = [(ref_node, 0)]
+        levels[0] = [ref_node]
+        
+        while queue:
+            node, level = queue.pop(0)
+            for neighbor in G.successors(node):
+                if neighbor not in visited:
+                    visited.add(neighbor)
+                    queue.append((neighbor, level + 1))
+                    if level + 1 not in levels:
+                        levels[level + 1] = []
+                    levels[level + 1].append(neighbor)
+        
+        # Assign positions
+        for level, nodes in levels.items():
+            n_nodes = len(nodes)
+            for i, node in enumerate(nodes):
+                angle = 2 * np.pi * i / n_nodes if n_nodes > 1 else 0
+                radius = 2 + level * 0.5
+                x = radius * np.cos(angle)
+                y = radius * np.sin(angle)
+                z = -level * 2  # Stack levels vertically
+                pos[node] = np.array([x, y, z])
+        
+        # Add unvisited nodes
+        unvisited = set(G.nodes()) - visited
+        for i, node in enumerate(unvisited):
+            angle = 2 * np.pi * i / len(unvisited) if unvisited else 0
+            pos[node] = np.array([3 * np.cos(angle), 3 * np.sin(angle), -5])
+        
+        return pos
+    
+    def create_detailed_hover_text(self, node_id: int, G: nx.DiGraph, metrics: Dict,
+                                 classifications: List[Dict]) -> str:
+        """Create comprehensive hover text for nodes"""
+        node_data = G.nodes[node_id]
+        
+        # Start with node identifier and status
+        hover_text = f"<b>Paragraph {node_id}</b><br>"
+        hover_text += "━" * 30 + "<br>"
+        
+        # Status with color
+        if node_data.get('is_reference', False):
+            hover_text += "<b>Status:</b> <span style='color:blue'>REFERENCE (Ground Truth)</span><br>"
+        elif node_id > 0 and node_id <= len(classifications):
+            classification = classifications[node_id - 1]
+            if classification['is_hallucinated']:
+                hover_text += "<b>Status:</b> <span style='color:red'>HALLUCINATED</span><br>"
+            else:
+                hover_text += "<b>Status:</b> <span style='color:green'>CONSISTENT</span><br>"
+            
+            # Scores
+            hover_text += f"<b>Hallucination Score:</b> {classification['hallucination_score']:.3f}<br>"
+            hover_text += f"<b>Semantic Similarity:</b> {classification['semantic_similarity']['combined']:.3f}<br>"
+            hover_text += f"<b>Entropy Difference:</b> {classification['entropy']['difference']:.3f}<br>"
+            
+            # Entailment
+            hover_text += "<br><b>Entailment Scores:</b><br>"
+            for key, value in classification['entailment_scores'].items():
+                hover_text += f"  • {key.capitalize()}: {value:.3f}<br>"
+            
+            # Consistency
+            hover_text += "<br><b>Factual Consistency:</b><br>"
+            cons = classification['consistency_results']
+            for key, value in cons.items():
+                if key != 'overall_consistency':
+                    color = 'green' if value > 0.7 else ('orange' if value > 0.3 else 'red')
+                    hover_text += f"  • {key.replace('_', ' ').title()}: "
+                    hover_text += f"<span style='color:{color}'>{value:.3f}</span><br>"
+        
+        # Graph metrics
+        hover_text += "<br><b>Graph Metrics:</b><br>"
+        hover_text += f"  • PageRank: {metrics['pagerank'][node_id]:.3f}<br>"
+        hover_text += f"  • Betweenness: {metrics['betweenness_centrality'][node_id]:.3f}<br>"
+        hover_text += f"  • Closeness: {metrics['closeness_centrality'][node_id]:.3f}<br>"
+        hover_text += f"  • In-degree: {metrics['in_degree'][node_id]}<br>"
+        hover_text += f"  • Out-degree: {metrics['out_degree'][node_id]}<br>"
+        hover_text += f"  • Clustering: {metrics['clustering_coefficient'][node_id]:.3f}<br>"
+        
+        # Node properties
+        hover_text += "<br><b>Text Properties:</b><br>"
+        hover_text += f"  • Entropy: {node_data['entropy']:.3f}<br>"
+        hover_text += f"  • Word Count: {node_data['paragraph_length']}<br>"
+        hover_text += f"  • Entity Count: {node_data['entity_count']}<br>"
+        
+        # Community
+        if 'communities' in metrics:
+            for i, comm in enumerate(metrics['communities']):
+                if node_id in comm:
+                    hover_text += f"  • Community: {i+1}<br>"
+                    break
+        
+        # Full text (wrapped)
+        full_text = node_data.get('full_text', '')
+        wrapped_text = '<br>'.join(textwrap.wrap(full_text, width=60))
+        hover_text += f"<br><b>Text:</b><br>{wrapped_text}"
+        
+        return hover_text
+    
+    def create_3d_graph_visualization(self, G: nx.DiGraph, metrics: Dict,
+                                    classifications: List[Dict],
+                                    layout_type: str = 'spring',
+                                    save_path: str = "3d_hallucination_graph.html") -> go.Figure:
+        """Create main 3D visualization with multiple views"""
+        
+        # Create figure with subplots
+        fig = make_subplots(
+            rows=2, cols=2,
+            subplot_titles=(
+                f'3D Hallucination Network ({layout_type.capitalize()} Layout)',
+                'PageRank vs Hallucination Score vs Entropy',
+                'Consistency Flow Network',
+                'Metric Statistics'
+            ),
+            specs=[
+                [{'type': 'scatter3d', 'rowspan': 2}, {'type': 'scatter3d'}],
+                [None, {'type': 'bar'}]
+            ],
+            row_heights=[0.6, 0.4],
+            column_widths=[0.6, 0.4]
+        )
+        
+        # Get 3D layout
+        pos = self.create_3d_layout(G, layout_type)
+        
+        # 1. Main 3D Graph
+        # Draw edges with gradient colors
+        edge_traces = []
+        for edge in G.edges():
+            if edge[0] in pos and edge[1] in pos:
+                x0, y0, z0 = pos[edge[0]]
+                x1, y1, z1 = pos[edge[1]]
+                weight = G[edge[0]][edge[1]]['weight']
+                
+                # Create gradient effect with multiple points
+                n_points = 10
+                edge_x = []
+                edge_y = []
+                edge_z = []
+                
+                for i in range(n_points + 1):
+                    t = i / n_points
+                    edge_x.extend([x0 + t * (x1 - x0), None])
+                    edge_y.extend([y0 + t * (y1 - y0), None])
+                    edge_z.extend([z0 + t * (z1 - z0), None])
+                
+                # Color based on weight
+                if weight < 0.3:
+                    color = f'rgba(255, 0, 0, {weight})'
+                elif weight < 0.7:
+                    color = f'rgba(255, 165, 0, {weight})'
+                else:
+                    color = f'rgba(0, 255, 0, {weight})'
+                
+                edge_trace = go.Scatter3d(
+                    x=edge_x, y=edge_y, z=edge_z,
+                    mode='lines',
+                    line=dict(color=color, width=weight * 10),
+                    hoverinfo='text',
+                    hovertext=f'Consistency: {weight:.3f}',
+                    showlegend=False
+                )
+                edge_traces.append(edge_trace)
+        
+        # Add all edges to figure
+        for trace in edge_traces:
+            fig.add_trace(trace, row=1, col=1)
+        
+        # Draw nodes
+        node_x = []
+        node_y = []
+        node_z = []
+        node_colors = []
+        node_sizes = []
+        node_symbols = []
+        hover_texts = []
+        node_labels = []
+        
+        for node in G.nodes():
+            if node in pos:
+                x, y, z = pos[node]
+                node_x.append(x)
+                node_y.append(y)
+                node_z.append(z)
+                
+                # Color
+                r, g, b = self.get_node_color_rgb(node, G, metrics, classifications)
+                node_colors.append(f'rgb({r}, {g}, {b})')
+                
+                # Size based on PageRank
+                node_sizes.append(20 + 100 * metrics['pagerank'][node])
+                
+                # Symbol
+                if G.nodes[node].get('is_reference', False):
+                    node_symbols.append('square')
+                else:
+                    node_symbols.append('circle')
+                
+                # Hover text
+                hover_texts.append(self.create_detailed_hover_text(node, G, metrics, classifications))
+                
+                # Label
+                node_labels.append(f"P{node}")
+        
+        # Main node trace
+        node_trace = go.Scatter3d(
+            x=node_x, y=node_y, z=node_z,
+            mode='markers+text',
+            text=node_labels,
+            textposition="top center",
+            textfont=dict(size=10, color='black'),
+            hovertext=hover_texts,
+            hoverinfo='text',
+            marker=dict(
+                size=node_sizes,
+                color=node_colors,
+                symbol=node_symbols,
+                line=dict(color='black', width=2),
+                opacity=0.9
+            ),
+            showlegend=False
+        )
+        fig.add_trace(node_trace, row=1, col=1)
+        
+        # Add legend traces
+        legend_items = [
+            ('Reference', 'square', 'blue'),
+            ('Hallucinated', 'circle', 'red'),
+            ('Consistent (High PR)', 'circle', 'darkgreen'),
+            ('Consistent (Low PR)', 'circle', 'lightgreen')
+        ]
+        
+        for name, symbol, color in legend_items:
+            fig.add_trace(
+                go.Scatter3d(
+                    x=[None], y=[None], z=[None],
+                    mode='markers',
+                    marker=dict(size=10, color=color, symbol=symbol),
+                    showlegend=True,
+                    name=name
+                ),
+                row=1, col=1
+            )
+        
+        # 2. 3D Scatter: PageRank vs Hallucination vs Entropy
+        pr_values = []
+        hall_scores = []
+        entropy_values = []
+        scatter_colors = []
+        scatter_labels = []
+        
+        for node in G.nodes():
+            if not G.nodes[node].get('is_reference', False) and node > 0:
+                pr_values.append(metrics['pagerank'][node])
+                hall_scores.append(classifications[node - 1]['hallucination_score'])
+                entropy_values.append(G.nodes[node]['entropy'])
+                
+                r, g, b = self.get_node_color_rgb(node, G, metrics, classifications)
+                scatter_colors.append(f'rgb({r}, {g}, {b})')
+                scatter_labels.append(f"P{node}")
+        
+        scatter_trace = go.Scatter3d(
+            x=pr_values,
+            y=hall_scores,
+            z=entropy_values,
+            mode='markers+text',
+            text=scatter_labels,
+            textposition="top center",
+            marker=dict(
+                size=10,
+                color=scatter_colors,
+                line=dict(width=1, color='black')
+            ),
+            hovertemplate='%{text}<br>PageRank: %{x:.3f}<br>Hallucination: %{y:.3f}<br>Entropy: %{z:.3f}<extra></extra>',
+            showlegend=False
+        )
+        fig.add_trace(scatter_trace, row=1, col=2)
+        
+        # 3. Consistency Flow Network (Sankey-style in 3D)
+        # Create flow visualization
+        flow_x = []
+        flow_y = []
+        flow_z = []
+        flow_colors = []
+        
+        if 'information_flow' in metrics:
+            info_flow = metrics['information_flow']
+            for level, nodes in info_flow['propagation_levels'].items():
+                for node in nodes:
+                    if node in pos:
+                        x, y, z = pos[node]
+                        flow_x.append(x)
+                        flow_y.append(y)
+                        flow_z.append(z)
+                        
+                        # Color by information retention
+                        retention = info_flow['information_retention'].get(node, 0)
+                        flow_colors.append(retention)
+        
+        if flow_x:
+            flow_trace = go.Scatter3d(
+                x=flow_x, y=flow_y, z=flow_z,
+                mode='markers',
+                marker=dict(
+                    size=15,
+                    color=flow_colors,
+                    colorscale='RdYlGn',
+                    showscale=True,
+                    colorbar=dict(title="Info Retention", x=1.1)
+                ),
+                hovertemplate='Information Retention: %{marker.color:.3f}<extra></extra>',
+                showlegend=False
+            )
+            fig.add_trace(flow_trace, row=2, col=1)
+        
+        # 4. Metric Statistics Bar Chart
+        # Aggregate statistics by status
+        ref_metrics = []
+        hall_metrics = []
+        cons_metrics = []
+        
+        for node in G.nodes():
+            pr = metrics['pagerank'][node]
+            if G.nodes[node].get('is_reference', False):
+                ref_metrics.append(pr)
+            elif node > 0 and node <= len(classifications):
+                if classifications[node - 1]['is_hallucinated']:
+                    hall_metrics.append(pr)
+                else:
+                    cons_metrics.append(pr)
+        
+        categories = ['Reference', 'Hallucinated', 'Consistent']
+        avg_pageranks = [
+            np.mean(ref_metrics) if ref_metrics else 0,
+            np.mean(hall_metrics) if hall_metrics else 0,
+            np.mean(cons_metrics) if cons_metrics else 0
+        ]
+        
+        bar_trace = go.Bar(
+            x=categories,
+            y=avg_pageranks,
+            marker_color=['blue', 'red', 'green'],
+            text=[f'{v:.3f}' for v in avg_pageranks],
+            textposition='auto',
+            hovertemplate='%{x}<br>Avg PageRank: %{y:.3f}<extra></extra>'
+        )
+        fig.add_trace(bar_trace, row=2, col=2)
+        
+        # Update layout
+        fig.update_layout(
+            title={
+                'text': "3D Hallucination Detection Analysis<br><sub>Red: Hallucinated | Green: Consistent (shade by PageRank) | Blue: Reference</sub>",
+                'font': {'size': 20}
+            },
+            height=1000,
+            showlegend=True,
+            legend=dict(
+                x=0.7,
+                y=0.95,
+                bgcolor='rgba(255, 255, 255, 0.8)',
+                bordercolor='black',
+                borderwidth=1
+            ),
+            scene=dict(
+                xaxis=dict(showgrid=True, gridcolor='lightgray', title=''),
+                yaxis=dict(showgrid=True, gridcolor='lightgray', title=''),
+                zaxis=dict(showgrid=True, gridcolor='lightgray', title=''),
+                camera=dict(
+                    eye=dict(x=1.5, y=1.5, z=1.5),
+                    center=dict(x=0, y=0, z=0)
+                ),
+                aspectmode='manual',
+                aspectratio=dict(x=1, y=1, z=0.7)
+            ),
+            scene2=dict(
+                xaxis_title='PageRank',
+                yaxis_title='Hallucination Score',
+                zaxis_title='Entropy'
+            )
+        )
+        
+        # Update axes for bar chart
+        fig.update_xaxes(title="Category", row=2, col=2)
+        fig.update_yaxes(title="Average PageRank", row=2, col=2)
+        
+        # Save to HTML
+        fig.write_html(save_path)
+        
+        return fig
+    
+    def create_animated_3d_graph(self, G: nx.DiGraph, metrics: Dict,
+                               classifications: List[Dict],
+                               save_path: str = "animated_3d_hallucination_graph.html") -> go.Figure:
+        """Create animated 3D visualization showing information flow"""
+        
+        # Get layout
+        pos = self.create_3d_layout(G, 'hierarchical')
+        
+        # Create frames for animation
+        frames = []
+        
+        if 'information_flow' in metrics:
+            info_flow = metrics['information_flow']
+            max_level = info_flow['max_propagation_distance']
+            
+            for current_level in range(max_level + 1):
+                # Get active nodes up to current level
+                active_nodes = []
+                for level in range(current_level + 1):
+                    active_nodes.extend(info_flow['propagation_levels'].get(level, []))
+                
+                # Create node trace for this frame
+                node_x = []
+                node_y = []
+                node_z = []
+                node_colors = []
+                node_sizes = []
+                node_labels = []
+                
+                for node in G.nodes():
+                    if node in pos:
+                        x, y, z = pos[node]
+                        node_x.append(x)
+                        node_y.append(y)
+                        node_z.append(z)
+                        
+                        if node in active_nodes:
+                            r, g, b = self.get_node_color_rgb(node, G, metrics, classifications)
+                            node_colors.append(f'rgb({r}, {g}, {b})')
+                            node_sizes.append(20 + 100 * metrics['pagerank'][node])
+                        else:
+                            node_colors.append('lightgray')
+                            node_sizes.append(10)
+                        
+                        node_labels.append(f"P{node}")
+                
+                # Create edge traces for active nodes
+                edge_traces = []
+                for edge in G.edges():
+                    if edge[0] in active_nodes and edge[1] in active_nodes:
+                        x0, y0, z0 = pos[edge[0]]
+                        x1, y1, z1 = pos[edge[1]]
+                        weight = G[edge[0]][edge[1]]['weight']
+                        
+                        edge_trace = go.Scatter3d(
+                            x=[x0, x1, None],
+                            y=[y0, y1, None],
+                            z=[z0, z1, None],
+                            mode='lines',
+                            line=dict(
+                                color=f'rgba(0, 255, 0, {weight})' if weight > 0.5 else f'rgba(255, 0, 0, {weight})',
+                                width=weight * 10
+                            ),
+                            showlegend=False
+                        )
+                        edge_traces.append(edge_trace)
+                
+                # Node trace
+                node_trace = go.Scatter3d(
+                    x=node_x, y=node_y, z=node_z,
+                    mode='markers+text',
+                    text=node_labels,
+                    textposition="top center",
+                    marker=dict(
+                        size=node_sizes,
+                        color=node_colors,
+                        line=dict(width=2, color='black')
+                    ),
+                    showlegend=False
+                )
+                
+                frame_data = edge_traces + [node_trace]
+                frames.append(go.Frame(data=frame_data, name=str(current_level)))
+        
+        # Create initial figure
+        fig = go.Figure(
+            data=frames[0].data if frames else [],
+            frames=frames
+        )
+        
+        # Add play button and slider
+        fig.update_layout(
+            title="Animated Information Flow in 3D",
+            updatemenus=[{
+                'type': 'buttons',
+                'showactive': False,
+                'y': 0.9,
+                'x': 0.1,
+                'xanchor': 'left',
+                'yanchor': 'top',
+                'buttons': [
+                    {
+                        'label': 'Play',
+                        'method': 'animate',
+                        'args': [None, {
+                            'frame': {'duration': 1000, 'redraw': True},
+                            'fromcurrent': True,
+                            'mode': 'immediate'
+                        }]
+                    },
+                    {
+                        'label': 'Pause',
+                        'method': 'animate',
+                        'args': [[None], {
+                            'frame': {'duration': 0, 'redraw': False},
+                            'mode': 'immediate'
+                        }]
+                    }
+                ]
+            }],
+            sliders=[{
+                'steps': [
+                    {
+                        'args': [[str(level)], {
+                            'frame': {'duration': 0, 'redraw': True},
+                            'mode': 'immediate'
+                        }],
+                        'label': f'Level {level}',
+                        'method': 'animate'
+                    }
+                    for level in range(len(frames))
+                ],
+                'active': 0,
+                'y': 0,
+                'len': 0.9,
+                'x': 0.1,
+                'xanchor': 'left',
+                'y': 0,
+                'yanchor': 'top'
+            }],
+            scene=dict(
+                xaxis=dict(showgrid=False),
+                yaxis=dict(showgrid=False),
+                zaxis=dict(showgrid=False),
+                camera=dict(eye=dict(x=1.5, y=1.5, z=1.5))
+            ),
+            height=800
+        )
+        
+        fig.write_html(save_path)
+        return fig
+
+
+def create_3d_visualizations(results: Dict) -> Dict[str, str]:
+    """Create all 3D visualizations for hallucination detection"""
+    visualizer = HallucinationGraph3DVisualizer()
+    
+    G = results['graph']
+    metrics = results['graph_metrics']
+    classifications = results['classifications']
+    
+    print("Creating 3D visualizations...")
+    
+    # 1. Spring layout 3D graph
+    print("1. Creating spring layout 3D graph...")
+    visualizer.create_3d_graph_visualization(
+        G, metrics, classifications, 
+        layout_type='spring',
+        save_path='3d_spring_hallucination_graph.html'
+    )
+    
+    # 2. Hierarchical layout 3D graph
+    print("2. Creating hierarchical layout 3D graph...")
+    visualizer.create_3d_graph_visualization(
+        G, metrics, classifications,
+        layout_type='hierarchical',
+        save_path='3d_hierarchical_hallucination_graph.html'
+    )
+    
+    # 3. t-SNE layout 3D graph
+    print("3. Creating t-SNE layout 3D graph...")
+    visualizer.create_3d_graph_visualization(
+        G, metrics, classifications,
+        layout_type='tsne',
+        save_path='3d_tsne_hallucination_graph.html'
+    )
+    
+    # 4. Animated 3D graph
+    print("4. Creating animated 3D graph...")
+    visualizer.create_animated_3d_graph(
+        G, metrics, classifications,
+        save_path='animated_3d_hallucination_graph.html'
+    )
+    
+    print("\nAll 3D visualizations created!")
+    
+    return {
+        'spring': '3d_spring_hallucination_graph.html',
+        'hierarchical': '3d_hierarchical_hallucination_graph.html',
+        'tsne': '3d_tsne_hallucination_graph.html',
+        'animated': 'animated_3d_hallucination_graph.html'
+    }
+
+
+# Example usage with the complete detector
+if __name__ == "__main__":
+    # This example shows how to use with the CompleteHallucinationDetector
+    
+    # Sample results structure (you would get this from the detector)
+    sample_results = {
+        'graph': nx.DiGraph(),  # Your actual graph
+        'graph_metrics': {
+            'pagerank': {0: 0.4, 1: 0.3, 2: 0.2, 3: 0.1},
+            'betweenness_centrality': {0: 0.5, 1: 0.3, 2: 0.1, 3: 0.1},
+            'closeness_centrality': {0: 0.8, 1: 0.6, 2: 0.4, 3: 0.2},
+            'in_degree': {0: 3, 1: 2, 2: 1, 3: 0},
+            'out_degree': {0: 3, 1: 2, 2: 1, 3: 0},
+            'clustering_coefficient': {0: 0.8, 1: 0.6, 2: 0.4, 3: 0.2},
+            'communities': [[0, 1], [2, 3]],
+            'information_flow': {
+                'propagation_levels': {0: [0], 1: [1, 2], 2: [3]},
+                'max_propagation_distance': 2,
+                'information_retention': {0: 1.0, 1: 0.8, 2: 0.7, 3: 0.5}
+            }
+        },
+        'classifications': [
+            {'is_hallucinated': False, 'hallucination_score': 0.2},
+            {'is_hallucinated': True, 'hallucination_score': 0.8},
+            {'is_hallucinated': False, 'hallucination_score': 0.3}
+        ]
+    }
+    
+    print("Use with CompleteHallucinationDetector results:")
+    print("files = create_3d_visualizations(results)")
