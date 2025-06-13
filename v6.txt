@@ -1,0 +1,540 @@
+"""
+3D Interactive Hallucination Detection System
+============================================
+A complete system for detecting hallucinations with 3D interactive visualization.
+- Red nodes: Hallucinated
+- Blue nodes: Reference
+- Green nodes: Consistent (darker = higher PageRank)
+- Orange nodes: Isolated
+- Only shows consistent connections between nodes
+"""
+
+import numpy as np
+from typing import List, Dict, Tuple, Set
+import re
+import networkx as nx
+from sklearn.metrics.pairwise import cosine_similarity
+from sklearn.feature_extraction.text import TfidfVectorizer
+import nltk
+from nltk.tokenize import sent_tokenize, word_tokenize
+from collections import defaultdict
+import plotly.graph_objects as go
+import warnings
+from scipy.stats import entropy
+from sentence_transformers import SentenceTransformer
+from transformers import pipeline
+import torch
+import webbrowser
+import os
+
+warnings.filterwarnings('ignore')
+
+# Download required NLTK data
+nltk.download('punkt', quiet=True)
+nltk.download('stopwords', quiet=True)
+nltk.download('averaged_perceptron_tagger', quiet=True)
+nltk.download('maxent_ne_chunker', quiet=True)
+nltk.download('words', quiet=True)
+
+
+class HallucinationDetector3D:
+    """3D Interactive Hallucination Detection System"""
+    
+    def __init__(self, use_gpu=False):
+        """Initialize the detector with all models"""
+        self.device = 'cuda' if use_gpu and torch.cuda.is_available() else 'cpu'
+        print(f"Initializing 3D Hallucination Detector on {self.device}...")
+        
+        # Models
+        print("Loading models...")
+        self.sentence_model = SentenceTransformer('all-MiniLM-L6-v2')
+        self.sentence_model.to(self.device)
+        
+        self.nli_pipeline = pipeline(
+            "text-classification", 
+            model="cross-encoder/nli-deberta-v3-base",
+            device=0 if self.device == 'cuda' else -1
+        )
+        
+        self.tfidf_vectorizer = TfidfVectorizer(
+            max_features=1000,
+            ngram_range=(1, 3),
+            stop_words='english'
+        )
+        
+        # Patterns for entity extraction
+        self.patterns = {
+            'date': r'\b(?:\d{1,2}[-/]\d{1,2}[-/]\d{2,4}|\d{4}[-/]\d{1,2}[-/]\d{1,2}|(?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)[a-z]* \d{1,2},? \d{4})\b',
+            'money': r'\$[\d,]+(?:\.\d{2})?|\b\d+(?:,\d{3})*(?:\.\d{2})?\s*(?:dollars?|USD|cents?)\b',
+            'number': r'\b\d+(?:,\d{3})*(?:\.\d+)?%?\b',
+            'percentage': r'\b\d+(?:\.\d+)?%'
+        }
+        
+        # Thresholds for consistency
+        self.thresholds = {
+            'semantic': 0.7,
+            'entailment': 0.6,
+            'contradiction': 0.3,
+            'hallucination': 0.5,
+            'factual': 0.7
+        }
+        
+        print("Initialization complete!")
+    
+    def extract_entities(self, text: str) -> Dict:
+        """Extract entities from text"""
+        entities = {
+            'dates': set(re.findall(self.patterns['date'], text, re.IGNORECASE)),
+            'money': set(re.findall(self.patterns['money'], text, re.IGNORECASE)),
+            'numbers': set(re.findall(self.patterns['number'], text)),
+            'percentages': set(re.findall(self.patterns['percentage'], text)),
+            'facts': []
+        }
+        
+        # Extract factual sentences
+        sentences = sent_tokenize(text)
+        for sent in sentences:
+            if any(re.search(self.patterns[p], sent) for p in ['date', 'money', 'percentage']):
+                entities['facts'].append(sent.strip())
+        
+        return entities
+    
+    def calculate_entropy(self, text: str) -> float:
+        """Calculate text entropy"""
+        words = word_tokenize(text.lower())
+        stopwords = set(nltk.corpus.stopwords.words('english'))
+        words = [w for w in words if w.isalnum() and w not in stopwords]
+        
+        if not words:
+            return 0.0
+        
+        word_freq = defaultdict(int)
+        for word in words:
+            word_freq[word] += 1
+        
+        total = len(words)
+        probs = [count/total for count in word_freq.values()]
+        return entropy(probs)
+    
+    def semantic_similarity(self, text1: str, text2: str) -> float:
+        """Calculate semantic similarity"""
+        # Transformer similarity
+        embeddings = self.sentence_model.encode([text1, text2])
+        transformer_sim = cosine_similarity([embeddings[0]], [embeddings[1]])[0][0]
+        
+        # TF-IDF similarity
+        try:
+            tfidf_matrix = self.tfidf_vectorizer.fit_transform([text1, text2])
+            tfidf_sim = cosine_similarity(tfidf_matrix[0:1], tfidf_matrix[1:2])[0][0]
+        except:
+            tfidf_sim = 0.0
+        
+        return float((transformer_sim + tfidf_sim) / 2)
+    
+    def check_entailment(self, premise: str, hypothesis: str) -> Dict[str, float]:
+        """Check entailment between texts"""
+        results = self.nli_pipeline(f"{premise} [SEP] {hypothesis}")
+        
+        scores = {'entailment': 0.0, 'neutral': 0.0, 'contradiction': 0.0}
+        mapping = {'ENTAILMENT': 'entailment', 'NEUTRAL': 'neutral', 'CONTRADICTION': 'contradiction'}
+        
+        for result in results:
+            label = result['label'].upper()
+            if label in mapping:
+                scores[mapping[label]] = result['score']
+        
+        return scores
+    
+    def check_factual_consistency(self, entities1: Dict, entities2: Dict) -> float:
+        """Check consistency between entity sets"""
+        consistencies = []
+        
+        for key in ['dates', 'money', 'numbers', 'percentages']:
+            if entities1[key] and entities2[key]:
+                intersection = len(entities1[key] & entities2[key])
+                union = len(entities1[key] | entities2[key])
+                consistencies.append(intersection / union if union > 0 else 0)
+        
+        return np.mean(consistencies) if consistencies else 1.0
+    
+    def classify_hallucination(self, reference: str, candidate: str) -> Dict:
+        """Classify if candidate is hallucinated"""
+        # Extract entities
+        ref_entities = self.extract_entities(reference)
+        cand_entities = self.extract_entities(candidate)
+        
+        # Calculate metrics
+        semantic_sim = self.semantic_similarity(reference, candidate)
+        entailment_scores = self.check_entailment(reference, candidate)
+        factual_consistency = self.check_factual_consistency(ref_entities, cand_entities)
+        
+        # Calculate hallucination score
+        hallucination_score = (
+            (1 - semantic_sim) * 0.25 +
+            (1 - factual_consistency) * 0.35 +
+            entailment_scores['contradiction'] * 0.25 +
+            (1 - entailment_scores['entailment']) * 0.15
+        )
+        
+        # Extra penalty for date/money mismatches
+        if ref_entities['dates'] and cand_entities['dates']:
+            if not ref_entities['dates'] & cand_entities['dates']:
+                hallucination_score = min(hallucination_score + 0.2, 1.0)
+        
+        if ref_entities['money'] and cand_entities['money']:
+            if not ref_entities['money'] & cand_entities['money']:
+                hallucination_score = min(hallucination_score + 0.2, 1.0)
+        
+        return {
+            'is_hallucinated': hallucination_score > self.thresholds['hallucination'],
+            'hallucination_score': hallucination_score,
+            'semantic_similarity': semantic_sim,
+            'entailment_scores': entailment_scores,
+            'factual_consistency': factual_consistency
+        }
+    
+    def build_consistency_graph(self, paragraphs: List[str]) -> Tuple[nx.Graph, np.ndarray, List[Dict]]:
+        """Build graph with only consistent connections"""
+        n = len(paragraphs)
+        G = nx.Graph()
+        
+        # Add nodes
+        for i, text in enumerate(paragraphs):
+            G.add_node(i,
+                      text=text,
+                      is_reference=(i == 0),
+                      entropy=self.calculate_entropy(text),
+                      length=len(text.split()))
+        
+        # Track consistency matrix and classifications
+        consistency_matrix = np.zeros((n, n))
+        classifications = []
+        
+        # Classify each non-reference paragraph
+        for i in range(1, n):
+            classification = self.classify_hallucination(paragraphs[0], paragraphs[i])
+            classifications.append(classification)
+        
+        # Build edges only between consistent paragraphs
+        for i in range(n):
+            for j in range(i + 1, n):
+                result_ij = self.classify_hallucination(paragraphs[i], paragraphs[j])
+                result_ji = self.classify_hallucination(paragraphs[j], paragraphs[i])
+                
+                # Check if both directions pass consistency criteria
+                consistent_ij = (
+                    result_ij['semantic_similarity'] >= self.thresholds['semantic'] and
+                    result_ij['hallucination_score'] <= self.thresholds['hallucination'] and
+                    result_ij['entailment_scores']['entailment'] >= self.thresholds['entailment'] and
+                    result_ij['entailment_scores']['contradiction'] <= self.thresholds['contradiction'] and
+                    result_ij['factual_consistency'] >= self.thresholds['factual']
+                )
+                
+                consistent_ji = (
+                    result_ji['semantic_similarity'] >= self.thresholds['semantic'] and
+                    result_ji['hallucination_score'] <= self.thresholds['hallucination'] and
+                    result_ji['entailment_scores']['entailment'] >= self.thresholds['entailment'] and
+                    result_ji['entailment_scores']['contradiction'] <= self.thresholds['contradiction'] and
+                    result_ji['factual_consistency'] >= self.thresholds['factual']
+                )
+                
+                if consistent_ij and consistent_ji:
+                    weight = (result_ij['semantic_similarity'] + result_ji['semantic_similarity']) / 2
+                    G.add_edge(i, j, weight=weight)
+                    consistency_matrix[i][j] = weight
+                    consistency_matrix[j][i] = weight
+        
+        return G, consistency_matrix, classifications
+    
+    def calculate_metrics(self, G: nx.Graph) -> Dict:
+        """Calculate graph metrics"""
+        metrics = {
+            'pagerank': {},
+            'betweenness': nx.betweenness_centrality(G),
+            'clustering': nx.clustering(G),
+            'components': list(nx.connected_components(G)),
+            'isolated': list(nx.isolates(G))
+        }
+        
+        # Calculate PageRank per component
+        for component in metrics['components']:
+            if len(component) > 1:
+                subgraph = G.subgraph(component)
+                pr = nx.pagerank(subgraph, weight='weight')
+                metrics['pagerank'].update(pr)
+            else:
+                metrics['pagerank'][list(component)[0]] = 1.0 / G.number_of_nodes()
+        
+        # Isolated nodes get zero PageRank
+        for node in metrics['isolated']:
+            metrics['pagerank'][node] = 0.0
+        
+        return metrics
+    
+    def get_node_color(self, node: int, G: nx.Graph, metrics: Dict, classifications: List[Dict]) -> str:
+        """Get node color based on status"""
+        if G.nodes[node].get('is_reference', False):
+            return 'rgb(0, 0, 255)'  # Blue for reference
+        
+        if node in metrics['isolated']:
+            return 'rgb(255, 165, 0)'  # Orange for isolated
+        
+        if node > 0 and node <= len(classifications):
+            if classifications[node - 1]['is_hallucinated']:
+                return 'rgb(255, 0, 0)'  # Red for hallucinated
+        
+        # Green shade based on PageRank for consistent nodes
+        pr = metrics['pagerank'][node]
+        all_pr = [v for k, v in metrics['pagerank'].items() if not G.nodes[k].get('is_reference', False)]
+        
+        if all_pr:
+            min_pr, max_pr = min(all_pr), max(all_pr)
+            if max_pr > min_pr:
+                normalized = (pr - min_pr) / (max_pr - min_pr)
+                # Light green to dark green
+                r = int(144 - 138 * normalized)
+                g = int(238 - 100 * normalized)
+                b = int(144 - 144 * normalized)
+                return f'rgb({r}, {g}, {b})'
+        
+        return 'rgb(144, 238, 144)'  # Light green default
+    
+    def create_3d_visualization(self, G: nx.Graph, metrics: Dict, classifications: List[Dict],
+                               save_path: str = "hallucination_3d_graph.html") -> str:
+        """Create interactive 3D visualization"""
+        # Create 3D layout
+        pos_2d = nx.spring_layout(G, k=3, iterations=50, seed=42)
+        pos = {}
+        
+        # Position components at different Z levels
+        for comp_idx, component in enumerate(metrics['components']):
+            for node in component:
+                if node in pos_2d:
+                    x, y = pos_2d[node]
+                    z = comp_idx * 2  # Different height for each component
+                    pos[node] = [x * 5, y * 5, z]
+        
+        # Position isolated nodes in a circle below
+        isolated = metrics['isolated']
+        for idx, node in enumerate(isolated):
+            angle = 2 * np.pi * idx / len(isolated) if isolated else 0
+            radius = 6
+            pos[node] = [radius * np.cos(angle), radius * np.sin(angle), -3]
+        
+        # Create figure
+        fig = go.Figure()
+        
+        # Add edges
+        edge_trace = []
+        for edge in G.edges():
+            if edge[0] in pos and edge[1] in pos:
+                x0, y0, z0 = pos[edge[0]]
+                x1, y1, z1 = pos[edge[1]]
+                weight = G[edge[0]][edge[1]]['weight']
+                
+                edge_trace.append(go.Scatter3d(
+                    x=[x0, x1, None],
+                    y=[y0, y1, None],
+                    z=[z0, z1, None],
+                    mode='lines',
+                    line=dict(color=f'rgba(0, 255, 0, {weight})', width=weight * 10),
+                    hoverinfo='text',
+                    hovertext=f'Consistency: {weight:.3f}',
+                    showlegend=False
+                ))
+        
+        for trace in edge_trace:
+            fig.add_trace(trace)
+        
+        # Prepare node data
+        node_x, node_y, node_z = [], [], []
+        node_colors = []
+        node_sizes = []
+        node_text = []
+        hover_text = []
+        
+        for node in G.nodes():
+            if node in pos:
+                x, y, z = pos[node]
+                node_x.append(x)
+                node_y.append(y)
+                node_z.append(z)
+                
+                # Color
+                node_colors.append(self.get_node_color(node, G, metrics, classifications))
+                
+                # Size based on PageRank
+                node_sizes.append(30 + 100 * metrics['pagerank'][node])
+                
+                # Text
+                node_text.append(f"P{node}")
+                
+                # Hover text
+                hover = f"<b>Paragraph {node}</b><br>"
+                
+                if G.nodes[node].get('is_reference', False):
+                    hover += "<b>Status:</b> REFERENCE<br>"
+                elif node in metrics['isolated']:
+                    hover += "<b>Status:</b> ISOLATED<br>"
+                elif node > 0 and node <= len(classifications):
+                    if classifications[node - 1]['is_hallucinated']:
+                        hover += "<b>Status:</b> HALLUCINATED<br>"
+                    else:
+                        hover += "<b>Status:</b> CONSISTENT<br>"
+                    hover += f"<b>Hallucination Score:</b> {classifications[node - 1]['hallucination_score']:.3f}<br>"
+                    hover += f"<b>Semantic Similarity:</b> {classifications[node - 1]['semantic_similarity']:.3f}<br>"
+                
+                hover += f"<b>PageRank:</b> {metrics['pagerank'][node]:.3f}<br>"
+                hover += f"<b>Connections:</b> {G.degree(node)}<br>"
+                hover += f"<b>Entropy:</b> {G.nodes[node]['entropy']:.3f}<br>"
+                
+                # Add text preview
+                text_preview = G.nodes[node]['text'][:150] + "..." if len(G.nodes[node]['text']) > 150 else G.nodes[node]['text']
+                hover += f"<b>Text:</b> {text_preview}"
+                
+                hover_text.append(hover)
+        
+        # Add nodes
+        node_trace = go.Scatter3d(
+            x=node_x, y=node_y, z=node_z,
+            mode='markers+text',
+            text=node_text,
+            textposition='top center',
+            hovertext=hover_text,
+            hoverinfo='text',
+            marker=dict(
+                size=node_sizes,
+                color=node_colors,
+                line=dict(color='black', width=2),
+                opacity=0.9
+            ),
+            showlegend=False
+        )
+        fig.add_trace(node_trace)
+        
+        # Add legend
+        legend_items = [
+            ('Reference', 'rgb(0, 0, 255)'),
+            ('Hallucinated', 'rgb(255, 0, 0)'),
+            ('Consistent (High PR)', 'rgb(6, 138, 0)'),
+            ('Consistent (Low PR)', 'rgb(144, 238, 144)'),
+            ('Isolated', 'rgb(255, 165, 0)')
+        ]
+        
+        for name, color in legend_items:
+            fig.add_trace(go.Scatter3d(
+                x=[None], y=[None], z=[None],
+                mode='markers',
+                marker=dict(size=10, color=color),
+                name=name,
+                showlegend=True
+            ))
+        
+        # Update layout
+        fig.update_layout(
+            title=dict(
+                text='3D Interactive Hallucination Detection Graph<br>' +
+                     '<sub>Rotate: Click & Drag | Zoom: Scroll | Pan: Right Click & Drag</sub>',
+                font=dict(size=20)
+            ),
+            showlegend=True,
+            legend=dict(
+                x=0.02,
+                y=0.98,
+                bgcolor='rgba(255, 255, 255, 0.8)',
+                bordercolor='black',
+                borderwidth=1
+            ),
+            scene=dict(
+                xaxis=dict(showgrid=False, showticklabels=False, title=''),
+                yaxis=dict(showgrid=False, showticklabels=False, title=''),
+                zaxis=dict(showgrid=False, showticklabels=False, title='Component Level'),
+                camera=dict(
+                    eye=dict(x=1.5, y=1.5, z=1.0),
+                    center=dict(x=0, y=0, z=0)
+                ),
+                bgcolor='rgba(240, 240, 240, 0.9)'
+            ),
+            height=800,
+            hovermode='closest'
+        )
+        
+        # Save and return path
+        fig.write_html(save_path)
+        return save_path
+    
+    def analyze(self, reference: str, candidates: List[str], output_dir: str = ".") -> Dict:
+        """Complete analysis pipeline"""
+        print("\n" + "="*60)
+        print("3D HALLUCINATION DETECTION ANALYSIS")
+        print("="*60)
+        
+        # Combine paragraphs
+        all_paragraphs = [reference] + candidates
+        
+        # Build graph
+        print("\nBuilding consistency graph...")
+        G, consistency_matrix, classifications = self.build_consistency_graph(all_paragraphs)
+        
+        # Calculate metrics
+        print("Calculating metrics...")
+        metrics = self.calculate_metrics(G)
+        
+        # Create visualization
+        print("Creating 3D visualization...")
+        viz_path = os.path.join(output_dir, "hallucination_3d_interactive.html")
+        self.create_3d_visualization(G, metrics, classifications, viz_path)
+        
+        # Print summary
+        print("\nSUMMARY:")
+        print(f"Total paragraphs: {len(all_paragraphs)}")
+        print(f"Hallucinated: {sum(1 for c in classifications if c['is_hallucinated'])}")
+        print(f"Consistent connections: {G.number_of_edges()}")
+        print(f"Isolated paragraphs: {len(metrics['isolated'])}")
+        print(f"Components: {len(metrics['components'])}")
+        
+        print(f"\nVisualization saved to: {viz_path}")
+        print("Opening in browser...")
+        webbrowser.open(f'file://{os.path.abspath(viz_path)}')
+        
+        return {
+            'graph': G,
+            'metrics': metrics,
+            'classifications': classifications,
+            'visualization': viz_path
+        }
+
+
+# Example usage
+if __name__ == "__main__":
+    # Initialize detector
+    detector = HallucinationDetector3D(use_gpu=False)
+    
+    # Example data
+    reference = """The company reported revenue of $2.5 million in Q4 2023, with a 15% increase from the previous quarter. 
+    CEO John Smith announced expansion plans on January 15, 2024, targeting the Asian market."""
+    
+    candidates = [
+        # Consistent
+        """Q4 2023 revenue reached $2.5 million, showing 15% growth. 
+        John Smith revealed Asian expansion strategies on January 15, 2024.""",
+        
+        # Hallucinated (wrong numbers)
+        """The company earned $3.2 million in Q4 2023, a 20% increase. 
+        CEO John Smith discussed expansion on January 20, 2024.""",
+        
+        # Major hallucination
+        """Q4 2023 saw losses of $1.8 million, down 10%. 
+        John Smith announced layoffs on January 15, 2024.""",
+        
+        # Isolated but consistent numbers
+        """Revenue was $2.5 million in Q4 2023. 
+        The company plans European expansion.""",
+        
+        # Another consistent
+        """Financial results show $2.5 million revenue in Q4 2023, up 15%. 
+        Asian market expansion was announced by CEO John Smith on January 15, 2024."""
+    ]
+    
+    # Run analysis
+    results = detector.analyze(reference, candidates)
