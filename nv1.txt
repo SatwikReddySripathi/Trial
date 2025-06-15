@@ -1,1 +1,1290 @@
+"""
+Enhanced Hallucination Detection System with Integrated Metrics
+=============================================================
+Improved logic incorporating entailment, entropy, semantic similarity, and graph properties
+while maintaining the excellent visualization capabilities.
+"""
 
+import numpy as np
+from typing import List, Dict, Tuple, Set, Optional
+import re
+import networkx as nx
+from sklearn.metrics.pairwise import cosine_similarity
+from sklearn.feature_extraction.text import TfidfVectorizer
+import nltk
+from nltk.tokenize import sent_tokenize, word_tokenize
+from collections import defaultdict
+import warnings
+from scipy.stats import entropy
+from sentence_transformers import SentenceTransformer
+from transformers import pipeline
+import torch
+import webbrowser
+import os
+import json
+import textwrap
+from dataclasses import dataclass
+from enum import Enum
+
+warnings.filterwarnings('ignore')
+
+# Download required NLTK data
+nltk.download('punkt', quiet=True)
+nltk.download('stopwords', quiet=True)
+nltk.download('averaged_perceptron_tagger', quiet=True)
+nltk.download('maxent_ne_chunker', quiet=True)
+nltk.download('words', quiet=True)
+
+
+class HallucinationType(Enum):
+    """Types of hallucinations detected"""
+    NONE = "none"
+    FACTUAL_CONTRADICTION = "factual_contradiction"
+    SEMANTIC_DRIFT = "semantic_drift"
+    HIGH_ENTROPY_FABRICATION = "high_entropy_fabrication"
+    LOW_GRAPH_CENTRALITY = "low_graph_centrality"
+    ENTAILMENT_FAILURE = "entailment_failure"
+
+
+@dataclass
+class EnhancedClassification:
+    """Enhanced classification result with multiple metrics"""
+    paragraph_id: int
+    is_hallucinated: bool
+    hallucination_types: List[HallucinationType]
+    hallucination_score: float
+    semantic_similarity: float
+    entailment_score: float
+    contradiction_score: float
+    factual_consistency: float
+    entropy_score: float
+    entropy_divergence: float  # Divergence from reference entropy
+    graph_centrality: float  # Will be updated after graph construction
+    confidence: float
+    evidence: Dict[str, any]
+
+
+class EnhancedHallucinationDetector:
+    """Enhanced Hallucination Detection System with Integrated Metrics"""
+    
+    def __init__(self, use_gpu=False):
+        """Initialize the detector with all models"""
+        self.device = 'cuda' if use_gpu and torch.cuda.is_available() else 'cpu'
+        print(f"Initializing Enhanced Hallucination Detector on {self.device}...")
+        
+        # Models
+        print("Loading models...")
+        self.sentence_model = SentenceTransformer('all-MiniLM-L6-v2')
+        self.sentence_model.to(self.device)
+        
+        self.nli_pipeline = pipeline(
+            "text-classification", 
+            model="cross-encoder/nli-deberta-v3-base",
+            device=0 if self.device == 'cuda' else -1
+        )
+        
+        self.tfidf_vectorizer = TfidfVectorizer(
+            max_features=1000,
+            ngram_range=(1, 3),
+            stop_words='english'
+        )
+        
+        # Enhanced patterns for entity extraction
+        self.patterns = {
+            'date': r'\b(?:\d{1,2}[-/]\d{1,2}[-/]\d{2,4}|\d{4}[-/]\d{1,2}[-/]\d{1,2}|(?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)[a-z]* \d{1,2},? \d{4})\b',
+            'money': r'\$[\d,]+(?:\.\d{2})?(?:\s*(?:million|billion|thousand|M|B|K))?|\b\d+(?:,\d{3})*(?:\.\d{2})?\s*(?:dollars?|USD|cents?)\b',
+            'number': r'\b\d+(?:,\d{3})*(?:\.\d+)?%?\b',
+            'percentage': r'\b\d+(?:\.\d+)?%',
+            'time': r'\b\d{1,2}:\d{2}(?::\d{2})?\s*(?:AM|PM|am|pm)?\b',
+            'ordinal': r'\b\d+(?:st|nd|rd|th)\b'
+        }
+        
+        # Advanced thresholds with multiple criteria
+        self.thresholds = {
+            'semantic': 0.6,
+            'semantic_weak': 0.4,
+            'entailment': 0.5,
+            'contradiction': 0.4,
+            'hallucination_base': 0.6,
+            'factual': 0.6,
+            'entropy_divergence': 0.3,  # How much entropy can diverge
+            'graph_centrality': 0.2  # Minimum centrality for non-hallucinated
+        }
+        
+        print("Initialization complete!")
+    
+    def extract_entities(self, text: str) -> Dict:
+        """Enhanced entity extraction with normalization"""
+        entities = {
+            'dates': set(),
+            'money': set(),
+            'numbers': set(),
+            'percentages': set(),
+            'facts': [],
+            'normalized_entities': {}  # Map original to normalized form
+        }
+        
+        # Extract and normalize dates
+        date_matches = re.findall(self.patterns['date'], text, re.IGNORECASE)
+        for date in date_matches:
+            entities['dates'].add(date)
+            # Simple normalization - could be enhanced with dateutil
+            normalized = re.sub(r'[/-]', '-', date.lower())
+            entities['normalized_entities'][date] = normalized
+        
+        # Extract and normalize money
+        money_matches = re.findall(self.patterns['money'], text, re.IGNORECASE)
+        for money in money_matches:
+            entities['money'].add(money)
+            # Normalize to pure number
+            value = re.sub(r'[^\d.]', '', money)
+            if 'million' in money.lower() or 'M' in money:
+                value = str(float(value) * 1000000)
+            elif 'billion' in money.lower() or 'B' in money:
+                value = str(float(value) * 1000000000)
+            entities['normalized_entities'][money] = value
+        
+        # Extract numbers and percentages
+        entities['numbers'] = set(re.findall(self.patterns['number'], text))
+        entities['percentages'] = set(re.findall(self.patterns['percentage'], text))
+        
+        # Extract fact-bearing sentences
+        sentences = sent_tokenize(text)
+        for sent in sentences:
+            if any(re.search(self.patterns[p], sent) for p in self.patterns):
+                entities['facts'].append(sent.strip())
+        
+        return entities
+    
+    def calculate_entropy_metrics(self, text: str, reference_text: str = None) -> Dict[str, float]:
+        """Calculate entropy and related metrics"""
+        # Basic entropy
+        text_entropy = self.calculate_entropy(text)
+        
+        metrics = {
+            'entropy': text_entropy,
+            'normalized_entropy': 0.0,
+            'entropy_divergence': 0.0,
+            'lexical_diversity': 0.0
+        }
+        
+        # Lexical diversity (unique words / total words)
+        words = word_tokenize(text.lower())
+        words = [w for w in words if w.isalnum()]
+        if words:
+            metrics['lexical_diversity'] = len(set(words)) / len(words)
+        
+        # Normalized entropy (0-1 scale based on text length)
+        if words:
+            max_entropy = np.log2(len(words))  # Maximum possible entropy
+            if max_entropy > 0:
+                metrics['normalized_entropy'] = text_entropy / max_entropy
+        
+        # Entropy divergence from reference
+        if reference_text:
+            ref_entropy = self.calculate_entropy(reference_text)
+            if ref_entropy > 0:
+                metrics['entropy_divergence'] = abs(text_entropy - ref_entropy) / ref_entropy
+        
+        return metrics
+    
+    def calculate_entropy(self, text: str) -> float:
+        """Calculate text entropy with improvements"""
+        words = word_tokenize(text.lower())
+        stopwords = set(nltk.corpus.stopwords.words('english'))
+        words = [w for w in words if w.isalnum() and w not in stopwords]
+        
+        if not words:
+            return 0.0
+        
+        # Calculate word frequency distribution
+        word_freq = defaultdict(int)
+        for word in words:
+            word_freq[word] += 1
+        
+        # Calculate probabilities
+        total = len(words)
+        probs = np.array([count/total for count in word_freq.values()])
+        
+        # Calculate Shannon entropy
+        return float(-np.sum(probs * np.log2(probs + 1e-10)))
+    
+    def semantic_similarity(self, text1: str, text2: str) -> float:
+        """Enhanced semantic similarity calculation"""
+        if len(text1.split()) < 3 or len(text2.split()) < 3:
+            # Simple word overlap for very short texts
+            words1 = set(text1.lower().split())
+            words2 = set(text2.lower().split())
+            if not words1 or not words2:
+                return 0.0
+            return len(words1 & words2) / len(words1 | words2)
+        
+        # Multi-level similarity
+        try:
+            # 1. Sentence embedding similarity
+            embeddings = self.sentence_model.encode([text1, text2])
+            embedding_sim = cosine_similarity([embeddings[0]], [embeddings[1]])[0][0]
+            
+            # 2. TF-IDF similarity
+            tfidf_matrix = self.tfidf_vectorizer.fit_transform([text1, text2])
+            tfidf_sim = cosine_similarity(tfidf_matrix[0:1], tfidf_matrix[1:2])[0][0]
+            
+            # 3. Jaccard similarity on important words
+            words1 = set(word_tokenize(text1.lower()))
+            words2 = set(word_tokenize(text2.lower()))
+            stopwords = set(nltk.corpus.stopwords.words('english'))
+            words1 = {w for w in words1 if w.isalnum() and w not in stopwords}
+            words2 = {w for w in words2 if w.isalnum() and w not in stopwords}
+            
+            jaccard_sim = len(words1 & words2) / len(words1 | words2) if words1 | words2 else 0
+            
+            # Weighted combination
+            return float(0.5 * embedding_sim + 0.3 * tfidf_sim + 0.2 * jaccard_sim)
+            
+        except Exception as e:
+            print(f"Error in semantic similarity: {e}")
+            return 0.0
+    
+    def check_entailment(self, premise: str, hypothesis: str) -> Dict[str, float]:
+        """Enhanced entailment checking with confidence scores"""
+        try:
+            results = self.nli_pipeline(f"{premise} [SEP] {hypothesis}")
+            
+            scores = {'entailment': 0.0, 'neutral': 0.0, 'contradiction': 0.0}
+            mapping = {'ENTAILMENT': 'entailment', 'NEUTRAL': 'neutral', 'CONTRADICTION': 'contradiction'}
+            
+            for result in results:
+                label = result['label'].upper()
+                if label in mapping:
+                    scores[mapping[label]] = result['score']
+            
+            # Add composite scores
+            scores['consistency'] = scores['entailment'] + 0.5 * scores['neutral']
+            scores['conflict'] = scores['contradiction']
+            
+            return scores
+        except Exception as e:
+            print(f"Error in entailment checking: {e}")
+            return {'entailment': 0.5, 'neutral': 0.5, 'contradiction': 0.0, 'consistency': 0.75, 'conflict': 0.0}
+    
+    def check_factual_consistency(self, entities1: Dict, entities2: Dict) -> Dict[str, float]:
+        """Enhanced factual consistency checking"""
+        consistency_scores = {
+            'overall': 1.0,
+            'dates': 1.0,
+            'money': 1.0,
+            'numbers': 1.0,
+            'percentages': 1.0,
+            'facts': 1.0
+        }
+        
+        # Check each entity type with smart matching
+        for key in ['dates', 'money', 'numbers', 'percentages']:
+            if entities1[key] or entities2[key]:
+                if entities1[key] and entities2[key]:
+                    # Use normalized entities for comparison
+                    norm1 = {entities1['normalized_entities'].get(e, e) for e in entities1[key]}
+                    norm2 = {entities2['normalized_entities'].get(e, e) for e in entities2[key]}
+                    
+                    # Calculate overlap
+                    intersection = len(norm1 & norm2)
+                    union = len(norm1 | norm2)
+                    
+                    if union > 0:
+                        consistency_scores[key] = intersection / union
+                else:
+                    # One has entities, other doesn't - partial penalty
+                    consistency_scores[key] = 0.7
+        
+        # Calculate weighted overall consistency
+        weights = {
+            'dates': 1.2,
+            'money': 1.2,
+            'numbers': 1.0,
+            'percentages': 1.0,
+            'facts': 0.8
+        }
+        
+        weighted_sum = sum(consistency_scores[k] * weights.get(k, 1.0) for k in consistency_scores if k != 'overall')
+        total_weight = sum(weights.values())
+        
+        consistency_scores['overall'] = weighted_sum / total_weight
+        
+        return consistency_scores
+    
+    def classify_hallucination_enhanced(self, reference: str, candidate: str, 
+                                      ref_entropy: float = None) -> EnhancedClassification:
+        """Enhanced hallucination classification with multiple metrics"""
+        # Extract entities
+        ref_entities = self.extract_entities(reference)
+        cand_entities = self.extract_entities(candidate)
+        
+        # Calculate core metrics
+        semantic_sim = self.semantic_similarity(reference, candidate)
+        entailment_scores = self.check_entailment(reference, candidate)
+        factual_scores = self.check_factual_consistency(ref_entities, cand_entities)
+        
+        # Calculate entropy metrics
+        entropy_metrics = self.calculate_entropy_metrics(candidate, reference)
+        
+        # Initialize hallucination types list
+        hallucination_types = []
+        
+        # Multi-factor hallucination scoring
+        hallucination_components = {
+            'semantic_divergence': 0.0,
+            'factual_inconsistency': 0.0,
+            'entailment_failure': 0.0,
+            'entropy_anomaly': 0.0,
+            'contradiction': 0.0
+        }
+        
+        # 1. Semantic divergence component
+        if semantic_sim < 0.3:
+            # Very different content - might be unrelated
+            hallucination_components['semantic_divergence'] = 0.3
+        else:
+            # Inverse relationship - higher similarity means lower divergence
+            hallucination_components['semantic_divergence'] = (1 - semantic_sim) * 0.4
+            if semantic_sim < 0.5:
+                hallucination_types.append(HallucinationType.SEMANTIC_DRIFT)
+        
+        # 2. Factual inconsistency component
+        factual_consistency = factual_scores['overall']
+        if semantic_sim > 0.5:  # Only penalize if discussing similar topics
+            hallucination_components['factual_inconsistency'] = (1 - factual_consistency) * 0.5
+            if factual_consistency < 0.5:
+                hallucination_types.append(HallucinationType.FACTUAL_CONTRADICTION)
+        else:
+            hallucination_components['factual_inconsistency'] = (1 - factual_consistency) * 0.2
+        
+        # 3. Entailment failure component
+        if entailment_scores['entailment'] < 0.3 and semantic_sim > 0.5:
+            hallucination_components['entailment_failure'] = (1 - entailment_scores['consistency']) * 0.3
+            hallucination_types.append(HallucinationType.ENTAILMENT_FAILURE)
+        
+        # 4. Entropy anomaly component
+        if entropy_metrics['entropy_divergence'] > self.thresholds['entropy_divergence']:
+            hallucination_components['entropy_anomaly'] = min(entropy_metrics['entropy_divergence'] * 0.3, 0.3)
+            if entropy_metrics['normalized_entropy'] > 0.8:  # High entropy
+                hallucination_types.append(HallucinationType.HIGH_ENTROPY_FABRICATION)
+        
+        # 5. Contradiction component
+        hallucination_components['contradiction'] = entailment_scores['contradiction'] * 0.4
+        
+        # Calculate final hallucination score
+        hallucination_score = sum(hallucination_components.values())
+        hallucination_score = min(hallucination_score, 1.0)  # Cap at 1.0
+        
+        # Determine if hallucinated based on score and critical factors
+        is_hallucinated = (
+            hallucination_score > self.thresholds['hallucination_base'] or
+            entailment_scores['contradiction'] > 0.7 or
+            (semantic_sim > 0.7 and factual_consistency < 0.3)  # High similarity but different facts
+        )
+        
+        if is_hallucinated and not hallucination_types:
+            hallucination_types.append(HallucinationType.SEMANTIC_DRIFT)
+        elif not is_hallucinated:
+            hallucination_types = [HallucinationType.NONE]
+        
+        # Calculate confidence
+        confidence = max(
+            entailment_scores['entailment'],
+            entailment_scores['contradiction'],
+            abs(hallucination_score - 0.5) * 2  # More confident when far from threshold
+        )
+        
+        return EnhancedClassification(
+            paragraph_id=-1,  # Will be set later
+            is_hallucinated=is_hallucinated,
+            hallucination_types=hallucination_types,
+            hallucination_score=hallucination_score,
+            semantic_similarity=semantic_sim,
+            entailment_score=entailment_scores['entailment'],
+            contradiction_score=entailment_scores['contradiction'],
+            factual_consistency=factual_consistency,
+            entropy_score=entropy_metrics['entropy'],
+            entropy_divergence=entropy_metrics['entropy_divergence'],
+            graph_centrality=0.0,  # Will be updated after graph construction
+            confidence=confidence,
+            evidence={
+                'components': hallucination_components,
+                'entropy_metrics': entropy_metrics,
+                'factual_scores': factual_scores,
+                'entailment_scores': entailment_scores
+            }
+        )
+    
+    def build_enhanced_graph(self, paragraphs: List[str]) -> Tuple[nx.Graph, List[EnhancedClassification], Dict]:
+        """Build graph with enhanced metrics integration"""
+        n = len(paragraphs)
+        G = nx.Graph()
+        
+        # Calculate reference entropy
+        ref_entropy = self.calculate_entropy(paragraphs[0])
+        
+        # Add nodes with enhanced attributes
+        for i, text in enumerate(paragraphs):
+            entropy_metrics = self.calculate_entropy_metrics(text, paragraphs[0])
+            G.add_node(i,
+                      text=text,
+                      is_reference=(i == 0),
+                      entropy=entropy_metrics['entropy'],
+                      normalized_entropy=entropy_metrics['normalized_entropy'],
+                      entropy_divergence=entropy_metrics['entropy_divergence'],
+                      lexical_diversity=entropy_metrics['lexical_diversity'],
+                      length=len(text.split()))
+        
+        # Classify each paragraph against reference
+        classifications = []
+        for i in range(1, n):
+            classification = self.classify_hallucination_enhanced(
+                paragraphs[0], paragraphs[i], ref_entropy
+            )
+            classification.paragraph_id = i
+            classifications.append(classification)
+        
+        # Build edges with enhanced metrics
+        edge_details = {}
+        for i in range(n):
+            for j in range(i + 1, n):
+                # Calculate comprehensive consistency
+                consistency = self.calculate_pairwise_consistency(paragraphs[i], paragraphs[j])
+                
+                # Add edge if meets threshold
+                if consistency['consistency_score'] >= self.thresholds['semantic_weak']:
+                    # Determine edge properties
+                    edge_type = self._determine_edge_type(i, j, classifications, consistency)
+                    
+                    G.add_edge(i, j,
+                             weight=consistency['consistency_score'],
+                             semantic_similarity=consistency['semantic_similarity'],
+                             factual_consistency=consistency['factual_consistency'],
+                             entailment=consistency['entailment'],
+                             contradiction=consistency['contradiction'],
+                             edge_type=edge_type,
+                             is_strong=consistency['consistency_score'] >= self.thresholds['semantic'])
+                    
+                    edge_details[(i, j)] = consistency
+        
+        # Calculate graph-based metrics and update classifications
+        self._update_graph_metrics(G, classifications)
+        
+        return G, classifications, edge_details
+    
+    def _determine_edge_type(self, i: int, j: int, classifications: List[EnhancedClassification], 
+                            consistency: Dict) -> str:
+        """Determine the type of edge based on node properties"""
+        if i == 0:  # One node is reference
+            if j <= len(classifications) and classifications[j-1].is_hallucinated:
+                return 'reference_to_hallucinated'
+            else:
+                return 'reference_to_consistent'
+        
+        # Both are non-reference
+        if i > 0 and j > 0 and i <= len(classifications) and j <= len(classifications):
+            i_hall = classifications[i-1].is_hallucinated
+            j_hall = classifications[j-1].is_hallucinated
+            
+            if i_hall and j_hall:
+                return 'hallucinated_to_hallucinated'
+            elif i_hall or j_hall:
+                return 'mixed_connection'
+            else:
+                return 'consistent_to_consistent'
+        
+        return 'unknown'
+    
+    def _update_graph_metrics(self, G: nx.Graph, classifications: List[EnhancedClassification]):
+        """Update classifications with graph-based metrics"""
+        # Calculate centrality metrics
+        if G.number_of_edges() > 0:
+            pagerank = nx.pagerank(G, weight='weight')
+            betweenness = nx.betweenness_centrality(G, weight=lambda u,v,d: 1/d['weight'] if d['weight'] > 0 else 1)
+            closeness = nx.closeness_centrality(G, distance=lambda u,v,d: 1/d['weight'] if d['weight'] > 0 else 1)
+            clustering = nx.clustering(G, weight='weight')
+        else:
+            # Default values for graphs with no edges
+            pagerank = {n: 1/G.number_of_nodes() for n in G.nodes()}
+            betweenness = {n: 0 for n in G.nodes()}
+            closeness = {n: 0 for n in G.nodes()}
+            clustering = {n: 0 for n in G.nodes()}
+        
+        # Find isolated nodes
+        isolated = list(nx.isolates(G))
+        
+        # Update classifications with graph metrics
+        for classification in classifications:
+            node_id = classification.paragraph_id
+            
+            # Combine centrality metrics
+            graph_centrality = (
+                0.4 * pagerank.get(node_id, 0) * G.number_of_nodes() +  # Normalized PageRank
+                0.3 * betweenness.get(node_id, 0) +
+                0.2 * closeness.get(node_id, 0) +
+                0.1 * clustering.get(node_id, 0)
+            )
+            
+            classification.graph_centrality = graph_centrality
+            
+            # Update hallucination status based on graph metrics
+            if node_id in isolated:
+                classification.hallucination_types.append(HallucinationType.LOW_GRAPH_CENTRALITY)
+                classification.is_hallucinated = True
+                classification.hallucination_score = max(classification.hallucination_score, 0.7)
+            elif graph_centrality < self.thresholds['graph_centrality']:
+                if HallucinationType.LOW_GRAPH_CENTRALITY not in classification.hallucination_types:
+                    classification.hallucination_types.append(HallucinationType.LOW_GRAPH_CENTRALITY)
+                # Boost hallucination score for low centrality nodes
+                classification.hallucination_score = min(
+                    classification.hallucination_score + 0.2, 1.0
+                )
+    
+    def calculate_pairwise_consistency(self, text1: str, text2: str) -> Dict:
+        """Calculate consistency between any two texts with enhanced metrics"""
+        entities1 = self.extract_entities(text1)
+        entities2 = self.extract_entities(text2)
+        
+        semantic_sim = self.semantic_similarity(text1, text2)
+        entailment_scores = self.check_entailment(text1, text2)
+        entailment_reverse = self.check_entailment(text2, text1)
+        factual_scores = self.check_factual_consistency(entities1, entities2)
+        
+        # Bidirectional entailment
+        max_contradiction = max(entailment_scores['contradiction'], entailment_reverse['contradiction'])
+        avg_entailment = (entailment_scores['entailment'] + entailment_reverse['entailment']) / 2
+        
+        # Enhanced consistency score calculation
+        consistency_components = {
+            'semantic': semantic_sim * 0.4,
+            'factual': 0.0,
+            'entailment': 0.0,
+            'non_contradiction': (1 - max_contradiction) * 0.2
+        }
+        
+        # Factual consistency (weighted by semantic similarity)
+        if semantic_sim > 0.5:
+            consistency_components['factual'] = factual_scores['overall'] * 0.3
+        else:
+            consistency_components['factual'] = factual_scores['overall'] * 0.1
+        
+        # Entailment consistency
+        if avg_entailment > 0.5:
+            consistency_components['entailment'] = avg_entailment * 0.1
+        
+        consistency_score = sum(consistency_components.values())
+        
+        return {
+            'consistency_score': consistency_score,
+            'semantic_similarity': semantic_sim,
+            'factual_consistency': factual_scores['overall'],
+            'entailment': avg_entailment,
+            'contradiction': max_contradiction,
+            'components': consistency_components,
+            'factual_details': factual_scores
+        }
+    
+    def calculate_metrics(self, G: nx.Graph) -> Dict:
+        """Calculate comprehensive graph metrics"""
+        metrics = {
+            'pagerank': nx.pagerank(G, weight='weight') if G.number_of_edges() > 0 else {n: 1/G.number_of_nodes() for n in G.nodes()},
+            'betweenness': nx.betweenness_centrality(G, weight=lambda u,v,d: 1/d['weight'] if d['weight'] > 0 else 1),
+            'closeness': nx.closeness_centrality(G, distance=lambda u,v,d: 1/d['weight'] if d['weight'] > 0 else 1),
+            'clustering': nx.clustering(G, weight='weight'),
+            'degree': dict(G.degree()),
+            'weighted_degree': dict(G.degree(weight='weight')),
+            'components': list(nx.connected_components(G)),
+            'isolated': list(nx.isolates(G)),
+            'density': nx.density(G),
+            'average_clustering': nx.average_clustering(G, weight='weight')
+        }
+        
+        # Additional graph statistics
+        if G.number_of_edges() > 0:
+            metrics['average_shortest_path'] = nx.average_shortest_path_length(G, weight=lambda u,v,d: 1/d['weight'] if d['weight'] > 0 else 1)
+        else:
+            metrics['average_shortest_path'] = float('inf')
+        
+        return metrics
+    
+    def create_interactive_force_graph(self, G: nx.Graph, metrics: Dict, 
+                                     classifications: List[EnhancedClassification],
+                                     save_path: str = "enhanced_hallucination_graph.html") -> str:
+        """Create enhanced interactive force-directed graph"""
+        
+        # Prepare nodes data with enhanced metrics
+        nodes = []
+        for node in G.nodes():
+            node_data = G.nodes[node]
+            
+            # Determine color and status based on enhanced classification
+            if node_data.get('is_reference', False):
+                color = '#0066CC'
+                status = 'REFERENCE'
+                hallucination_types = []
+            elif node in metrics['isolated']:
+                color = '#808080'
+                status = 'ISOLATED'
+                hallucination_types = ['LOW_GRAPH_CENTRALITY']
+            elif node > 0 and node <= len(classifications):
+                classification = classifications[node - 1]
+                if classification.is_hallucinated:
+                    # Different shades of red based on hallucination type
+                    if HallucinationType.FACTUAL_CONTRADICTION in classification.hallucination_types:
+                        color = '#FF0000'  # Bright red for factual contradictions
+                    elif HallucinationType.HIGH_ENTROPY_FABRICATION in classification.hallucination_types:
+                        color = '#CC0000'  # Dark red for fabrications
+                    else:
+                        color = '#FF6666'  # Light red for other hallucinations
+                    status = 'HALLUCINATED'
+                else:
+                    # Green shade based on confidence and centrality
+                    confidence = classification.confidence
+                    centrality = classification.graph_centrality
+                    green_intensity = int(100 + 155 * min(confidence * centrality, 1.0))
+                    color = f'#{0:02x}{green_intensity:02x}{0:02x}'
+                    status = 'CONSISTENT'
+                hallucination_types = [ht.value for ht in classification.hallucination_types]
+            else:
+                color = '#808080'
+                status = 'UNKNOWN'
+                hallucination_types = []
+            
+            # Create enhanced node object
+            node_obj = {
+                'id': node,
+                'label': f'P{node}',
+                'color': color,
+                'status': status,
+                'size': 10 + 30 * metrics['pagerank'][node],
+                'pagerank': metrics['pagerank'][node],
+                'degree': metrics['degree'][node],
+                'betweenness': metrics['betweenness'][node],
+                'closeness': metrics['closeness'][node],
+                'clustering': metrics['clustering'][node],
+                'entropy': node_data['entropy'],
+                'entropy_divergence': node_data['entropy_divergence'],
+                'lexical_diversity': node_data['lexical_diversity'],
+                'text': node_data['text'][:200] + '...' if len(node_data['text']) > 200 else node_data['text'],
+                'hallucination_types': hallucination_types
+            }
+            
+            # Add classification details
+            if node > 0 and node <= len(classifications):
+                classification = classifications[node - 1]
+                node_obj.update({
+                    'hallucination_score': classification.hallucination_score,
+                    'semantic_similarity': classification.semantic_similarity,
+                    'entailment_score': classification.entailment_score,
+                    'contradiction_score': classification.contradiction_score,
+                    'factual_consistency': classification.factual_consistency,
+                    'graph_centrality': classification.graph_centrality,
+                    'confidence': classification.confidence
+                })
+            
+            nodes.append(node_obj)
+        
+        # Prepare edges data with enhanced properties
+        links = []
+        for u, v, data in G.edges(data=True):
+            # Enhanced edge coloring based on type
+            edge_color_map = {
+                'reference_to_hallucinated': '#FF6666',
+                'reference_to_consistent': '#66FF66',
+                'hallucinated_to_hallucinated': '#FFA500',
+                'mixed_connection': '#FFFF00',
+                'consistent_to_consistent': '#00FF00',
+                'unknown': '#CCCCCC'
+            }
+            
+            color = edge_color_map.get(data.get('edge_type', 'unknown'), '#CCCCCC')
+            
+            links.append({
+                'source': u,
+                'target': v,
+                'weight': data['weight'],
+                'semantic_similarity': data.get('semantic_similarity', 0),
+                'factual_consistency': data.get('factual_consistency', 0),
+                'entailment': data.get('entailment', 0),
+                'contradiction': data.get('contradiction', 0),
+                'color': color,
+                'width': 1 + data['weight'] * 5,
+                'edge_type': data.get('edge_type', 'unknown')
+            })
+        
+        # Create enhanced HTML with D3.js
+        html_content = f"""
+<!DOCTYPE html>
+<html>
+<head>
+    <title>Enhanced Hallucination Detection Graph</title>
+    <script src="https://d3js.org/d3.v7.min.js"></script>
+    <style>
+        body {{
+            font-family: Arial, sans-serif;
+            margin: 0;
+            padding: 20px;
+            background-color: #f5f5f5;
+        }}
+        #graph {{
+            background-color: white;
+            border: 1px solid #ddd;
+            border-radius: 8px;
+            box-shadow: 0 2px 4px rgba(0,0,0,0.1);
+        }}
+        .tooltip {{
+            position: absolute;
+            text-align: left;
+            padding: 12px;
+            font: 12px sans-serif;
+            background: rgba(0, 0, 0, 0.9);
+            color: white;
+            border-radius: 8px;
+            pointer-events: none;
+            opacity: 0;
+            transition: opacity 0.3s;
+            max-width: 500px;
+            line-height: 1.4;
+        }}
+        .metric-row {{
+            display: flex;
+            justify-content: space-between;
+            margin: 2px 0;
+        }}
+        .metric-label {{
+            font-weight: bold;
+            color: #66ccff;
+        }}
+        .metric-value {{
+            color: #ffffff;
+        }}
+        .hallucination-type {{
+            background: #ff6666;
+            padding: 2px 6px;
+            border-radius: 3px;
+            margin: 2px;
+            display: inline-block;
+            font-size: 11px;
+        }}
+        .legend {{
+            position: absolute;
+            top: 20px;
+            right: 20px;
+            background: rgba(255, 255, 255, 0.95);
+            padding: 15px;
+            border-radius: 8px;
+            border: 1px solid #ddd;
+            max-width: 250px;
+        }}
+        .legend-item {{
+            margin: 5px 0;
+            display: flex;
+            align-items: center;
+        }}
+        .legend-color {{
+            width: 20px;
+            height: 20px;
+            margin-right: 8px;
+            border: 1px solid #333;
+            border-radius: 3px;
+        }}
+        h1 {{
+            color: #333;
+            margin-bottom: 10px;
+        }}
+        .controls {{
+            margin-bottom: 20px;
+        }}
+        button {{
+            padding: 8px 16px;
+            margin-right: 10px;
+            border: none;
+            border-radius: 4px;
+            background-color: #4CAF50;
+            color: white;
+            cursor: pointer;
+            font-size: 14px;
+        }}
+        button:hover {{
+            background-color: #45a049;
+        }}
+        .graph-stats {{
+            position: absolute;
+            bottom: 20px;
+            left: 20px;
+            background: rgba(255, 255, 255, 0.95);
+            padding: 15px;
+            border-radius: 8px;
+            border: 1px solid #ddd;
+            font-size: 12px;
+        }}
+    </style>
+</head>
+<body>
+    <h1>Enhanced Hallucination Detection - Multi-Metric Analysis</h1>
+    <div class="controls">
+        <button onclick="resetSimulation()">Reset View</button>
+        <button onclick="toggleLabels()">Toggle Labels</button>
+        <button onclick="toggleMetrics()">Toggle Metrics</button>
+    </div>
+    <div id="graph"></div>
+    <div class="tooltip"></div>
+    <div class="legend">
+        <h3 style="margin-top: 0;">Node Types</h3>
+        <div class="legend-item">
+            <div class="legend-color" style="background-color: #0066CC;"></div>
+            <span>Reference</span>
+        </div>
+        <div class="legend-item">
+            <div class="legend-color" style="background-color: #FF0000;"></div>
+            <span>Factual Contradiction</span>
+        </div>
+        <div class="legend-item">
+            <div class="legend-color" style="background-color: #CC0000;"></div>
+            <span>High Entropy Fabrication</span>
+        </div>
+        <div class="legend-item">
+            <div class="legend-color" style="background-color: #FF6666;"></div>
+            <span>Other Hallucination</span>
+        </div>
+        <div class="legend-item">
+            <div class="legend-color" style="background-color: #00FF00;"></div>
+            <span>Highly Consistent</span>
+        </div>
+        <div class="legend-item">
+            <div class="legend-color" style="background-color: #808080;"></div>
+            <span>Isolated/Unknown</span>
+        </div>
+        <h3>Edge Types</h3>
+        <div class="legend-item">
+            <div class="legend-color" style="background-color: #66FF66;"></div>
+            <span>Reference → Consistent</span>
+        </div>
+        <div class="legend-item">
+            <div class="legend-color" style="background-color: #FF6666;"></div>
+            <span>Reference → Hallucinated</span>
+        </div>
+        <div class="legend-item">
+            <div class="legend-color" style="background-color: #FFA500;"></div>
+            <span>Between Hallucinated</span>
+        </div>
+        <div class="legend-item">
+            <div class="legend-color" style="background-color: #00FF00;"></div>
+            <span>Between Consistent</span>
+        </div>
+    </div>
+    <div class="graph-stats">
+        <h4 style="margin: 0 0 10px 0;">Graph Statistics</h4>
+        <div>Nodes: {G.number_of_nodes()}</div>
+        <div>Edges: {G.number_of_edges()}</div>
+        <div>Density: {metrics['density']:.3f}</div>
+        <div>Avg Clustering: {metrics['average_clustering']:.3f}</div>
+        <div>Components: {len(metrics['components'])}</div>
+        <div>Isolated: {len(metrics['isolated'])}</div>
+    </div>
+    
+    <script>
+        // Data
+        const nodes = {json.dumps(nodes)};
+        const links = {json.dumps(links)};
+        
+        // Dimensions
+        const width = window.innerWidth - 60;
+        const height = window.innerHeight - 200;
+        
+        // Create SVG
+        const svg = d3.select("#graph")
+            .append("svg")
+            .attr("width", width)
+            .attr("height", height);
+        
+        // Create zoom behavior
+        const zoom = d3.zoom()
+            .scaleExtent([0.1, 10])
+            .on("zoom", zoomed);
+        
+        svg.call(zoom);
+        
+        const g = svg.append("g");
+        
+        // Create tooltip
+        const tooltip = d3.select(".tooltip");
+        
+        // Create force simulation with enhanced forces
+        const simulation = d3.forceSimulation(nodes)
+            .force("link", d3.forceLink(links)
+                .id(d => d.id)
+                .distance(d => 100 / d.weight)  // Closer for stronger connections
+                .strength(d => d.weight))
+            .force("charge", d3.forceManyBody()
+                .strength(d => -300 - d.size * 5))  // Stronger repulsion for larger nodes
+            .force("center", d3.forceCenter(width / 2, height / 2))
+            .force("collision", d3.forceCollide()
+                .radius(d => d.size + 5));
+        
+        // Create links
+        const link = g.append("g")
+            .selectAll("line")
+            .data(links)
+            .enter().append("line")
+            .attr("stroke", d => d.color)
+            .attr("stroke-width", d => d.width)
+            .attr("stroke-opacity", 0.6);
+        
+        // Create nodes
+        const node = g.append("g")
+            .selectAll("circle")
+            .data(nodes)
+            .enter().append("circle")
+            .attr("r", d => d.size)
+            .attr("fill", d => d.color)
+            .attr("stroke", "#333")
+            .attr("stroke-width", 2)
+            .style("cursor", "pointer")
+            .call(drag(simulation));
+        
+        // Create labels
+        const labels = g.append("g")
+            .selectAll("text")
+            .data(nodes)
+            .enter().append("text")
+            .text(d => d.label)
+            .attr("font-size", 12)
+            .attr("dx", d => d.size + 5)
+            .attr("dy", 4)
+            .style("pointer-events", "none");
+        
+        // Enhanced tooltip
+        node.on("mouseover", function(event, d) {{
+            // Build detailed tooltip content
+            let html = `<strong>${{d.label}} - ${{d.status}}</strong><br/>`;
+            
+            // Hallucination types
+            if (d.hallucination_types && d.hallucination_types.length > 0 && d.hallucination_types[0] !== 'none') {{
+                html += `<div style="margin: 5px 0;">`;
+                d.hallucination_types.forEach(type => {{
+                    html += `<span class="hallucination-type">${{type}}</span>`;
+                }});
+                html += `</div>`;
+            }}
+            
+            // Metrics
+            html += `<div style="margin-top: 10px; border-top: 1px solid #666; padding-top: 8px;">`;
+            
+            // Graph metrics
+            html += `<div class="metric-row"><span class="metric-label">PageRank:</span><span class="metric-value">${{d.pagerank.toFixed(3)}}</span></div>`;
+            html += `<div class="metric-row"><span class="metric-label">Centrality:</span><span class="metric-value">${{(d.graph_centrality || 0).toFixed(3)}}</span></div>`;
+            html += `<div class="metric-row"><span class="metric-label">Connections:</span><span class="metric-value">${{d.degree}}</span></div>`;
+            
+            // Semantic metrics
+            if (d.hallucination_score !== undefined) {{
+                html += `<div style="margin-top: 8px; border-top: 1px solid #444; padding-top: 8px;">`;
+                html += `<div class="metric-row"><span class="metric-label">Hallucination Score:</span><span class="metric-value">${{d.hallucination_score.toFixed(3)}}</span></div>`;
+                html += `<div class="metric-row"><span class="metric-label">Semantic Similarity:</span><span class="metric-value">${{d.semantic_similarity.toFixed(3)}}</span></div>`;
+                html += `<div class="metric-row"><span class="metric-label">Factual Consistency:</span><span class="metric-value">${{d.factual_consistency.toFixed(3)}}</span></div>`;
+                html += `<div class="metric-row"><span class="metric-label">Entailment:</span><span class="metric-value">${{d.entailment_score.toFixed(3)}}</span></div>`;
+                html += `<div class="metric-row"><span class="metric-label">Contradiction:</span><span class="metric-value">${{d.contradiction_score.toFixed(3)}}</span></div>`;
+                html += `<div class="metric-row"><span class="metric-label">Confidence:</span><span class="metric-value">${{d.confidence.toFixed(3)}}</span></div>`;
+                html += `</div>`;
+            }}
+            
+            // Entropy metrics
+            html += `<div style="margin-top: 8px; border-top: 1px solid #444; padding-top: 8px;">`;
+            html += `<div class="metric-row"><span class="metric-label">Entropy:</span><span class="metric-value">${{d.entropy.toFixed(3)}}</span></div>`;
+            html += `<div class="metric-row"><span class="metric-label">Entropy Divergence:</span><span class="metric-value">${{d.entropy_divergence.toFixed(3)}}</span></div>`;
+            html += `<div class="metric-row"><span class="metric-label">Lexical Diversity:</span><span class="metric-value">${{d.lexical_diversity.toFixed(3)}}</span></div>`;
+            html += `</div>`;
+            
+            html += `</div>`;
+            
+            // Text preview
+            html += `<div style="margin-top: 10px; border-top: 1px solid #666; padding-top: 8px;">`;
+            html += `<strong>Text:</strong><br/>${{d.text}}`;
+            html += `</div>`;
+            
+            tooltip.html(html)
+                .style("left", (event.pageX + 10) + "px")
+                .style("top", (event.pageY - 10) + "px")
+                .style("opacity", 1);
+            
+            // Highlight node and connections
+            d3.select(this).attr("stroke-width", 4);
+            
+            // Highlight connected edges with edge info
+            link.style("stroke-opacity", function(l) {{
+                if (l.source.id === d.id || l.target.id === d.id) {{
+                    // Show edge metrics on hover
+                    return 1;
+                }}
+                return 0.2;
+            }});
+            
+            // Fade unconnected nodes
+            node.style("opacity", n => {{
+                if (n.id === d.id) return 1;
+                const connected = links.some(l => 
+                    (l.source.id === d.id && l.target.id === n.id) ||
+                    (l.target.id === d.id && l.source.id === n.id)
+                );
+                return connected ? 1 : 0.3;
+            }});
+        }})
+        .on("mouseout", function() {{
+            tooltip.style("opacity", 0);
+            d3.select(this).attr("stroke-width", 2);
+            link.style("stroke-opacity", 0.6);
+            node.style("opacity", 1);
+        }});
+        
+        // Edge hover for edge metrics
+        link.on("mouseover", function(event, d) {{
+            let html = `<strong>Edge: P${{d.source.id}} ↔ P${{d.target.id}}</strong><br/>`;
+            html += `<div class="metric-row"><span class="metric-label">Type:</span><span class="metric-value">${{d.edge_type}}</span></div>`;
+            html += `<div class="metric-row"><span class="metric-label">Weight:</span><span class="metric-value">${{d.weight.toFixed(3)}}</span></div>`;
+            html += `<div class="metric-row"><span class="metric-label">Semantic Sim:</span><span class="metric-value">${{d.semantic_similarity.toFixed(3)}}</span></div>`;
+            html += `<div class="metric-row"><span class="metric-label">Factual Consistency:</span><span class="metric-value">${{d.factual_consistency.toFixed(3)}}</span></div>`;
+            html += `<div class="metric-row"><span class="metric-label">Entailment:</span><span class="metric-value">${{d.entailment.toFixed(3)}}</span></div>`;
+            html += `<div class="metric-row"><span class="metric-label">Contradiction:</span><span class="metric-value">${{d.contradiction.toFixed(3)}}</span></div>`;
+            
+            tooltip.html(html)
+                .style("left", (event.pageX + 10) + "px")
+                .style("top", (event.pageY - 10) + "px")
+                .style("opacity", 1);
+                
+            d3.select(this).attr("stroke-width", d => d.width * 2);
+        }})
+        .on("mouseout", function(event, d) {{
+            tooltip.style("opacity", 0);
+            d3.select(this).attr("stroke-width", d => d.width);
+        }});
+        
+        // Update positions on tick
+        simulation.on("tick", () => {{
+            link
+                .attr("x1", d => d.source.x)
+                .attr("y1", d => d.source.y)
+                .attr("x2", d => d.target.x)
+                .attr("y2", d => d.target.y);
+            
+            node
+                .attr("cx", d => d.x)
+                .attr("cy", d => d.y);
+            
+            labels
+                .attr("x", d => d.x)
+                .attr("y", d => d.y);
+        }});
+        
+        // Drag functions
+        function drag(simulation) {{
+            function dragstarted(event, d) {{
+                if (!event.active) simulation.alphaTarget(0.3).restart();
+                d.fx = d.x;
+                d.fy = d.y;
+            }}
+            
+            function dragged(event, d) {{
+                d.fx = event.x;
+                d.fy = event.y;
+            }}
+            
+            function dragended(event, d) {{
+                if (!event.active) simulation.alphaTarget(0);
+                d.fx = null;
+                d.fy = null;
+            }}
+            
+            return d3.drag()
+                .on("start", dragstarted)
+                .on("drag", dragged)
+                .on("end", dragended);
+        }}
+        
+        // Zoom function
+        function zoomed(event) {{
+            g.attr("transform", event.transform);
+        }}
+        
+        // Control functions
+        function resetSimulation() {{
+            simulation.alpha(1).restart();
+            svg.transition().duration(750).call(
+                zoom.transform,
+                d3.zoomIdentity
+            );
+        }}
+        
+        let labelsVisible = true;
+        function toggleLabels() {{
+            labelsVisible = !labelsVisible;
+            labels.style("display", labelsVisible ? "block" : "none");
+        }}
+        
+        let showDetailedMetrics = true;
+        function toggleMetrics() {{
+            showDetailedMetrics = !showDetailedMetrics;
+            // This would require rebuilding tooltips with different detail levels
+            alert("Metric detail level: " + (showDetailedMetrics ? "Full" : "Simple"));
+        }}
+    </script>
+</body>
+</html>
+"""
+        
+        # Save HTML file
+        with open(save_path, 'w', encoding='utf-8') as f:
+            f.write(html_content)
+        
+        return save_path
+    
+    def analyze(self, reference: str, candidates: List[str], output_dir: str = ".") -> Dict:
+        """Complete enhanced analysis pipeline"""
+        print("\n" + "="*60)
+        print("ENHANCED HALLUCINATION DETECTION ANALYSIS")
+        print("="*60)
+        
+        # Combine paragraphs
+        all_paragraphs = [reference] + candidates
+        
+        # Build enhanced graph
+        print("\nBuilding enhanced consistency graph...")
+        G, classifications, edge_details = self.build_enhanced_graph(all_paragraphs)
+        
+        # Calculate comprehensive metrics
+        print("Calculating comprehensive graph metrics...")
+        metrics = self.calculate_metrics(G)
+        
+        # Create enhanced visualization
+        print("Creating enhanced interactive visualization...")
+        viz_path = os.path.join(output_dir, "enhanced_hallucination_graph.html")
+        self.create_interactive_force_graph(G, metrics, classifications, viz_path)
+        
+        # Print detailed summary
+        print("\n" + "-"*60)
+        print("ANALYSIS SUMMARY")
+        print("-"*60)
+        print(f"Total paragraphs: {len(all_paragraphs)}")
+        print(f"Hallucinated: {sum(1 for c in classifications if c.is_hallucinated)}")
+        print(f"Consistent: {sum(1 for c in classifications if not c.is_hallucinated)}")
+        print(f"Total connections: {G.number_of_edges()}")
+        print(f"Graph density: {metrics['density']:.3f}")
+        print(f"Average clustering: {metrics['average_clustering']:.3f}")
+        print(f"Isolated paragraphs: {len(metrics['isolated'])}")
+        
+        # Hallucination type breakdown
+        print("\nHallucination Types Detected:")
+        type_counts = defaultdict(int)
+        for c in classifications:
+            for ht in c.hallucination_types:
+                if ht != HallucinationType.NONE:
+                    type_counts[ht.value] += 1
+        
+        for htype, count in sorted(type_counts.items(), key=lambda x: x[1], reverse=True):
+            print(f"  {htype}: {count}")
+        
+        # Average metrics
+        print("\nAverage Metrics for Hallucinated vs Consistent:")
+        hall_metrics = [c for c in classifications if c.is_hallucinated]
+        cons_metrics = [c for c in classifications if not c.is_hallucinated]
+        
+        if hall_metrics:
+            print(f"  Hallucinated - Avg Score: {np.mean([c.hallucination_score for c in hall_metrics]):.3f}")
+            print(f"  Hallucinated - Avg Entropy Div: {np.mean([c.entropy_divergence for c in hall_metrics]):.3f}")
+            print(f"  Hallucinated - Avg Centrality: {np.mean([c.graph_centrality for c in hall_metrics]):.3f}")
+        
+        if cons_metrics:
+            print(f"  Consistent - Avg Score: {np.mean([c.hallucination_score for c in cons_metrics]):.3f}")
+            print(f"  Consistent - Avg Entropy Div: {np.mean([c.entropy_divergence for c in cons_metrics]):.3f}")
+            print(f"  Consistent - Avg Centrality: {np.mean([c.graph_centrality for c in cons_metrics]):.3f}")
+        
+        print(f"\nVisualization saved to: {viz_path}")
+        print("\nINTERACTION GUIDE:")
+        print("- Drag nodes to rearrange (physics simulation)")
+        print("- Hover over nodes for detailed metrics")
+        print("- Hover over edges for connection details")
+        print("- Zoom/pan for navigation")
+        print("- Use controls to toggle features")
+        
+        print("\nOpening in browser...")
+        webbrowser.open(f'file://{os.path.abspath(viz_path)}')
+        
+        return {
+            'graph': G,
+            'metrics': metrics,
+            'classifications': classifications,
+            'edge_details': edge_details,
+            'visualization': viz_path,
+            'summary': {
+                'total_paragraphs': len(all_paragraphs),
+                'hallucinated_count': sum(1 for c in classifications if c.is_hallucinated),
+                'type_breakdown': dict(type_counts),
+                'graph_density': metrics['density'],
+                'average_clustering': metrics['average_clustering']
+            }
+        }
+
+
+# Example usage with comprehensive test cases
+if __name__ == "__main__":
+    # Initialize enhanced detector
+    detector = EnhancedHallucinationDetector(use_gpu=False)
+    
+    # Comprehensive test data
+    reference = """The company reported revenue of $2.5 million in Q4 2023, with a 15% increase from the previous quarter. 
+    CEO John Smith announced expansion plans on January 15, 2024, targeting the Asian market. 
+    The profit margin improved to 22% due to cost optimization strategies. 
+    Employee satisfaction scores reached 85% in the annual survey."""
+    
+    candidates = [
+        # Highly consistent (should have high centrality, low entropy divergence)
+        """Q4 2023 revenue reached $2.5 million, marking 15% quarterly growth. 
+        John Smith revealed Asian market expansion on January 15, 2024. 
+        Profit margins rose to 22% through cost optimization. 
+        Employee satisfaction hit 85% in yearly survey.""",
+        
+        # Factual contradictions (should detect FACTUAL_CONTRADICTION)
+        """The company earned $3.2 million in Q4 2023, a 20% increase. 
+        CEO John Smith discussed expansion plans on January 20, 2024. 
+        Profit margins reached 25% after cost controls. 
+        Employee satisfaction was 75% in the survey.""",
+        
+        # High entropy fabrication (should detect HIGH_ENTROPY_FABRICATION)
+        """The company's Q4 2023 performance included multiple strategic initiatives across 
+        various departments with synergistic implementations of cutting-edge methodologies 
+        and paradigm-shifting approaches to market penetration strategies involving 
+        cross-functional team collaborations and innovative disruption techniques.""",
+        
+        # Semantic drift (should detect SEMANTIC_DRIFT)
+        """In Q4 2023, the technology sector showed strong performance overall. 
+        Many companies are looking at international expansion opportunities. 
+        Cost management remains a key focus for improving profitability. 
+        Employee engagement is critical for business success.""",
+        
+        # Entailment failure but plausible (should detect ENTAILMENT_FAILURE)
+        """The company's Q4 2023 results indicate they are preparing for an IPO. 
+        With strong revenue growth and Asian expansion, going public seems likely. 
+        The improved margins suggest readiness for public market scrutiny. 
+        High employee satisfaction supports a stable transition.""",
+        
+        # Mixed - some facts correct, some wrong
+        """Revenue was $2.5 million in Q4 2023 with strong growth. 
+        CEO John Smith announced European expansion on January 15, 2024. 
+        Profit margins reached 22% through operational efficiency. 
+        Customer retention improved to 95% during the quarter.""",
+        
+        # Additional consistent details (should NOT be hallucinated)
+        """In Q4 2023, revenue of $2.5 million represented 15% growth. 
+        The Asian market expansion announced by CEO John Smith on January 15, 2024 
+        builds on the company's strong performance. 22% profit margins and 85% 
+        employee satisfaction demonstrate operational excellence.""",
+        
+        # Completely unrelated (should have low centrality, possibly isolated)
+        """The weather forecast shows sunny skies for the next week. 
+        Temperature will reach 75 degrees Fahrenheit. 
+        No rain is expected until next month. 
+        Perfect conditions for outdoor activities."""
+    ]
+    
+    # Run enhanced analysis
+    results = detector.analyze(reference, candidates)
