@@ -1,0 +1,610 @@
+"""
+Core Hallucination Detection System for Multiple Paragraphs
+==========================================================
+Analyzes a list of paragraphs where the first is the reference (ground truth)
+and detects hallucinations in all subsequent paragraphs.
+"""
+
+import numpy as np
+from typing import List, Dict, Tuple, Set, Any, Optional
+import re
+from collections import defaultdict, Counter
+from dataclasses import dataclass
+from enum import Enum
+import math
+from scipy.stats import entropy as scipy_entropy
+
+
+class HallucinationType(Enum):
+    """Types of hallucinations detected"""
+    FACTUAL_ERROR = "Factual Error"          # Wrong facts (dates, numbers, names)
+    CONTRADICTION = "Contradiction"           # Logical contradictions
+    OMISSION = "Omission"                    # Missing critical information
+    FABRICATION = "Fabrication"              # Made-up information
+    MISLEADING = "Misleading"                # Misleading context
+    CONSISTENT = "Consistent"                # No hallucination
+
+
+@dataclass
+class HallucinationResult:
+    """Result of hallucination detection for a single paragraph"""
+    paragraph_id: int
+    is_hallucinated: bool
+    hallucination_type: HallucinationType
+    hallucination_score: float  # 0-1, higher means more hallucinated
+    confidence: float
+    reasons: List[str]
+    semantic_similarity: float
+    factual_consistency: float
+    entailment_score: float
+    contradiction_score: float
+
+
+class ComprehensiveHallucinationDetector:
+    """Detects hallucinations in multiple paragraphs against a reference"""
+    
+    def __init__(self):
+        """Initialize detector with patterns and thresholds"""
+        # Entity extraction patterns
+        self.patterns = {
+            'date': r'\b(?:\d{1,2}[-/]\d{1,2}[-/]\d{2,4}|\d{4}[-/]\d{1,2}[-/]\d{1,2}|(?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)[a-z]* \d{1,2},? \d{4})\b',
+            'money': r'\$[\d,]+(?:\.\d{2})?(?:\s*(?:million|billion|trillion|M|B|T))?\b|\b\d+(?:,\d{3})*(?:\.\d{2})?\s*(?:dollars?|USD)\b',
+            'percentage': r'\b\d+(?:\.\d+)?%',
+            'number': r'\b\d+(?:,\d{3})*(?:\.\d+)?\b',
+            'time': r'\b\d{1,2}:\d{2}(?::\d{2})?\s*(?:AM|PM|am|pm)?\b',
+            'person': r'\b[A-Z][a-z]+ [A-Z][a-z]+(?:\s+[A-Z][a-z]+)?\b',
+            'organization': r'\b(?:[A-Z][a-z]+(?:\s+(?:Inc|Corp|LLC|Ltd|Company|Co|Group|Bank|University|Institute|Foundation|Association|Organization))\.?|[A-Z]{2,})\b'
+        }
+        
+        # Detection thresholds
+        self.thresholds = {
+            'semantic_high': 0.8,
+            'semantic_medium': 0.6,
+            'semantic_low': 0.3,
+            'factual_strict': 0.9,
+            'factual_moderate': 0.7,
+            'factual_loose': 0.5,
+            'entailment_high': 0.7,
+            'contradiction_high': 0.6
+        }
+    
+    def analyze_paragraphs(self, paragraphs: List[str]) -> Dict[str, Any]:
+        """
+        Main entry point: Analyze list of paragraphs.
+        First paragraph is reference, rest are candidates.
+        """
+        if len(paragraphs) < 2:
+            raise ValueError("Need at least 2 paragraphs (1 reference + 1 candidate)")
+        
+        reference = paragraphs[0]
+        candidates = paragraphs[1:]
+        
+        # Extract comprehensive information from reference
+        ref_info = self._extract_comprehensive_info(reference)
+        
+        # Analyze each candidate
+        results = []
+        for i, candidate in enumerate(candidates):
+            result = self._analyze_single_paragraph(reference, candidate, ref_info, i + 1)
+            results.append(result)
+        
+        # Calculate overall statistics
+        stats = self._calculate_statistics(results)
+        
+        return {
+            'reference': reference,
+            'results': results,
+            'statistics': stats,
+            'summary': self._generate_summary(results, stats)
+        }
+    
+    def _analyze_single_paragraph(self, reference: str, candidate: str, 
+                                 ref_info: Dict, paragraph_id: int) -> HallucinationResult:
+        """Analyze a single candidate paragraph against reference"""
+        # Extract candidate information
+        cand_info = self._extract_comprehensive_info(candidate)
+        
+        # Calculate core metrics
+        semantic_sim = self.calculate_semantic_coherence(reference, candidate)
+        factual_cons = self.calculate_factual_consistency(ref_info, cand_info)
+        entailment_scores = self.calculate_entailment(reference, candidate)
+        
+        # Determine hallucination
+        is_hallucinated = False
+        hallucination_type = HallucinationType.CONSISTENT
+        confidence = 0.0
+        reasons = []
+        
+        # Decision logic based on multiple factors
+        
+        # Case 1: High semantic similarity but factual errors
+        if semantic_sim > self.thresholds['semantic_medium']:
+            if factual_cons['overall'] < self.thresholds['factual_moderate']:
+                is_hallucinated = True
+                
+                # Determine specific type
+                if factual_cons['contradictions']:
+                    hallucination_type = HallucinationType.FACTUAL_ERROR
+                    confidence = 0.9
+                    reasons.extend(factual_cons['contradictions'][:3])
+                elif factual_cons['missing_critical'] > 0.3:
+                    hallucination_type = HallucinationType.OMISSION
+                    confidence = 0.8
+                    reasons.extend(factual_cons['missing_facts'][:3])
+            
+            elif entailment_scores['contradiction'] > self.thresholds['contradiction_high']:
+                is_hallucinated = True
+                hallucination_type = HallucinationType.CONTRADICTION
+                confidence = 0.85
+                reasons.append(f"High contradiction score: {entailment_scores['contradiction']:.2f}")
+        
+        # Case 2: Medium similarity with significant differences
+        elif semantic_sim > self.thresholds['semantic_low']:
+            if factual_cons['contradictions'] or entailment_scores['contradiction'] > 0.5:
+                is_hallucinated = True
+                hallucination_type = HallucinationType.MISLEADING
+                confidence = 0.75
+                reasons.append("Misleading representation of facts")
+                reasons.extend(factual_cons['contradictions'][:2])
+        
+        # Case 3: Low similarity but same entities with different facts
+        else:
+            common_entities = set(ref_info['entities'].keys()) & set(cand_info['entities'].keys())
+            if common_entities and factual_cons['entity_consistency'] < 0.5:
+                is_hallucinated = True
+                hallucination_type = HallucinationType.FABRICATION
+                confidence = 0.7
+                reasons.append("Different facts about same entities")
+                reasons.append(f"Entities affected: {', '.join(list(common_entities)[:3])}")
+        
+        # Calculate final hallucination score
+        hallucination_score = self._calculate_hallucination_score(
+            semantic_sim, factual_cons['overall'], entailment_scores, is_hallucinated
+        )
+        
+        return HallucinationResult(
+            paragraph_id=paragraph_id,
+            is_hallucinated=is_hallucinated,
+            hallucination_type=hallucination_type,
+            hallucination_score=hallucination_score,
+            confidence=confidence,
+            reasons=reasons,
+            semantic_similarity=semantic_sim,
+            factual_consistency=factual_cons['overall'],
+            entailment_score=entailment_scores['entailment'],
+            contradiction_score=entailment_scores['contradiction']
+        )
+    
+    def _extract_comprehensive_info(self, text: str) -> Dict[str, Any]:
+        """Extract all relevant information from text"""
+        info = {
+            'text': text,
+            'entities': {},
+            'facts': [],
+            'numbers': {},
+            'dates': set(),
+            'key_sentences': [],
+            'word_freq': Counter(),
+            'entropy': self.calculate_entropy(text)
+        }
+        
+        # Extract entities by type
+        for entity_type, pattern in self.patterns.items():
+            matches = re.findall(pattern, text, re.IGNORECASE if entity_type != 'person' else 0)
+            if matches:
+                if entity_type in ['money', 'percentage', 'number']:
+                    # Normalize numeric values
+                    for match in matches:
+                        normalized = self._normalize_value(match, entity_type)
+                        if normalized is not None:
+                            info['numbers'][match] = normalized
+                elif entity_type == 'date':
+                    info['dates'].update(matches)
+                else:
+                    for match in matches:
+                        info['entities'][match.lower()] = entity_type
+        
+        # Extract key sentences (containing entities or important patterns)
+        sentences = re.split(r'[.!?]+', text)
+        for sent in sentences:
+            if any(re.search(self.patterns[p], sent) for p in self.patterns):
+                info['key_sentences'].append(sent.strip())
+        
+        # Word frequency for semantic analysis
+        words = re.findall(r'\b\w+\b', text.lower())
+        info['word_freq'] = Counter(words)
+        
+        # Extract simple facts (subject-verb-object patterns)
+        info['facts'] = self._extract_facts(text)
+        
+        return info
+    
+    def calculate_entropy(self, text: str) -> float:
+        """
+        Calculate Shannon entropy of text.
+        Measures information diversity and randomness.
+        """
+        if not text:
+            return 0.0
+        
+        # Word-level entropy
+        words = re.findall(r'\b\w+\b', text.lower())
+        if not words:
+            return 0.0
+        
+        word_counts = Counter(words)
+        total_words = sum(word_counts.values())
+        
+        # Calculate probabilities
+        probs = [count / total_words for count in word_counts.values()]
+        
+        # Shannon entropy
+        word_entropy = -sum(p * math.log2(p) for p in probs if p > 0)
+        
+        # Normalize by maximum possible entropy
+        max_entropy = math.log2(len(word_counts))
+        normalized_entropy = word_entropy / max_entropy if max_entropy > 0 else 0.0
+        
+        return normalized_entropy
+    
+    def calculate_semantic_coherence(self, text1: str, text2: str) -> float:
+        """
+        Calculate semantic similarity between two texts.
+        Returns score between 0 and 1.
+        """
+        # Tokenize
+        words1 = re.findall(r'\b\w+\b', text1.lower())
+        words2 = re.findall(r'\b\w+\b', text2.lower())
+        
+        if not words1 or not words2:
+            return 0.0
+        
+        # Method 1: Jaccard similarity
+        set1, set2 = set(words1), set(words2)
+        jaccard = len(set1 & set2) / len(set1 | set2) if set1 | set2 else 0.0
+        
+        # Method 2: Cosine similarity using word frequencies
+        all_words = list(set1 | set2)
+        freq1 = Counter(words1)
+        freq2 = Counter(words2)
+        
+        vec1 = [freq1.get(w, 0) for w in all_words]
+        vec2 = [freq2.get(w, 0) for w in all_words]
+        
+        dot_product = sum(a * b for a, b in zip(vec1, vec2))
+        norm1 = math.sqrt(sum(a * a for a in vec1))
+        norm2 = math.sqrt(sum(b * b for b in vec2))
+        
+        cosine = dot_product / (norm1 * norm2) if norm1 * norm2 > 0 else 0.0
+        
+        # Method 3: N-gram overlap (bigrams)
+        bigrams1 = set(zip(words1[:-1], words1[1:]))
+        bigrams2 = set(zip(words2[:-1], words2[1:]))
+        
+        bigram_overlap = len(bigrams1 & bigrams2) / max(len(bigrams1 | bigrams2), 1)
+        
+        # Combine methods
+        semantic_score = (jaccard * 0.3 + cosine * 0.5 + bigram_overlap * 0.2)
+        
+        return semantic_score
+    
+    def calculate_factual_consistency(self, ref_info: Dict, cand_info: Dict) -> Dict[str, Any]:
+        """
+        Calculate factual consistency between reference and candidate.
+        Returns detailed consistency analysis.
+        """
+        results = {
+            'overall': 1.0,
+            'entity_consistency': 1.0,
+            'number_consistency': 1.0,
+            'date_consistency': 1.0,
+            'contradictions': [],
+            'missing_facts': [],
+            'missing_critical': 0.0
+        }
+        
+        # Check entity consistency
+        ref_entities = set(ref_info['entities'].keys())
+        cand_entities = set(cand_info['entities'].keys())
+        
+        if ref_entities:
+            common = ref_entities & cand_entities
+            results['entity_consistency'] = len(common) / len(ref_entities)
+            
+            missing = ref_entities - cand_entities
+            if missing:
+                results['missing_facts'].append(f"Missing entities: {', '.join(list(missing)[:3])}")
+        
+        # Check numeric consistency
+        if ref_info['numbers']:
+            matches = 0
+            total = 0
+            
+            for ref_text, ref_val in ref_info['numbers'].items():
+                total += 1
+                found = False
+                
+                # Look for same or similar values
+                for cand_text, cand_val in cand_info['numbers'].items():
+                    if isinstance(ref_val, (int, float)) and isinstance(cand_val, (int, float)):
+                        if abs(ref_val - cand_val) / max(abs(ref_val), abs(cand_val), 1) < 0.01:
+                            matches += 1
+                            found = True
+                            break
+                        elif abs(ref_val - cand_val) / max(abs(ref_val), abs(cand_val), 1) < 0.1:
+                            # Close but not exact
+                            results['contradictions'].append(
+                                f"Number mismatch: {ref_text} vs {cand_text}"
+                            )
+                
+                if not found:
+                    results['missing_facts'].append(f"Missing number: {ref_text}")
+            
+            results['number_consistency'] = matches / total if total > 0 else 1.0
+        
+        # Check date consistency
+        if ref_info['dates']:
+            common_dates = ref_info['dates'] & cand_info['dates']
+            results['date_consistency'] = len(common_dates) / len(ref_info['dates'])
+            
+            missing_dates = ref_info['dates'] - cand_info['dates']
+            if missing_dates:
+                results['missing_facts'].append(f"Missing dates: {', '.join(list(missing_dates)[:3])}")
+        
+        # Calculate missing critical information
+        critical_items = len(ref_info['entities']) + len(ref_info['numbers']) + len(ref_info['dates'])
+        if critical_items > 0:
+            found_items = (
+                len(ref_entities & cand_entities) + 
+                results['number_consistency'] * len(ref_info['numbers']) +
+                len(ref_info['dates'] & cand_info['dates'])
+            )
+            results['missing_critical'] = 1 - (found_items / critical_items)
+        
+        # Calculate overall consistency
+        scores = [
+            results['entity_consistency'],
+            results['number_consistency'],
+            results['date_consistency']
+        ]
+        weights = [0.3, 0.4, 0.3]  # Numbers are most important
+        
+        results['overall'] = sum(s * w for s, w in zip(scores, weights))
+        
+        # Penalize for missing critical information
+        results['overall'] *= (1 - results['missing_critical'] * 0.5)
+        
+        return results
+    
+    def calculate_entailment(self, premise: str, hypothesis: str) -> Dict[str, float]:
+        """
+        Calculate entailment scores between premise and hypothesis.
+        This is a simplified version - in practice, use a proper NLI model.
+        """
+        # Simplified entailment based on overlap and contradiction detection
+        
+        # Extract key claims
+        premise_words = set(re.findall(r'\b\w+\b', premise.lower()))
+        hypothesis_words = set(re.findall(r'\b\w+\b', hypothesis.lower()))
+        
+        # Look for contradiction indicators
+        negation_words = {'not', 'no', 'never', 'neither', 'nor', 'none', 'nothing'}
+        antonym_pairs = [
+            ('increase', 'decrease'), ('rise', 'fall'), ('gain', 'loss'),
+            ('up', 'down'), ('positive', 'negative'), ('growth', 'decline')
+        ]
+        
+        # Check for explicit contradictions
+        contradiction_score = 0.0
+        
+        # Negation in hypothesis but not premise
+        if (hypothesis_words & negation_words) and not (premise_words & negation_words):
+            contradiction_score += 0.3
+        
+        # Antonym pairs
+        for word1, word2 in antonym_pairs:
+            if (word1 in premise_words and word2 in hypothesis_words) or \
+               (word2 in premise_words and word1 in hypothesis_words):
+                contradiction_score += 0.4
+                break
+        
+        # Entailment based on coverage
+        overlap = len(premise_words & hypothesis_words) / len(premise_words) if premise_words else 0.0
+        
+        # If high overlap and no contradictions, likely entailment
+        if overlap > 0.7 and contradiction_score < 0.2:
+            entailment_score = overlap
+        else:
+            entailment_score = overlap * (1 - contradiction_score)
+        
+        # Neutral is what's left
+        neutral_score = 1 - entailment_score - contradiction_score
+        
+        return {
+            'entailment': max(0, min(1, entailment_score)),
+            'neutral': max(0, min(1, neutral_score)),
+            'contradiction': max(0, min(1, contradiction_score))
+        }
+    
+    def _normalize_value(self, text: str, value_type: str) -> Optional[float]:
+        """Normalize different value types to numbers"""
+        try:
+            if value_type == 'money':
+                # Extract number
+                num_match = re.search(r'([\d,]+(?:\.\d+)?)', text)
+                if num_match:
+                    value = float(num_match.group(1).replace(',', ''))
+                    
+                    # Apply multipliers
+                    if any(x in text.lower() for x in ['million', 'm']):
+                        value *= 1_000_000
+                    elif any(x in text.lower() for x in ['billion', 'b']):
+                        value *= 1_000_000_000
+                    elif any(x in text.lower() for x in ['trillion', 't']):
+                        value *= 1_000_000_000_000
+                    
+                    return value
+            
+            elif value_type == 'percentage':
+                num_match = re.search(r'(\d+(?:\.\d+)?)', text)
+                if num_match:
+                    return float(num_match.group(1))
+            
+            elif value_type == 'number':
+                return float(text.replace(',', ''))
+        
+        except:
+            pass
+        
+        return None
+    
+    def _extract_facts(self, text: str) -> List[str]:
+        """Extract simple facts from text"""
+        facts = []
+        sentences = re.split(r'[.!?]+', text)
+        
+        # Simple patterns for fact extraction
+        fact_patterns = [
+            r'(\w+(?:\s+\w+)*)\s+(reported|announced|reached|achieved|increased|decreased)\s+(.+)',
+            r'(\w+(?:\s+\w+)*)\s+(is|was|are|were)\s+(.+)',
+            r'(\w+(?:\s+\w+)*)\s+(has|have|had)\s+(.+)'
+        ]
+        
+        for sent in sentences:
+            for pattern in fact_patterns:
+                match = re.search(pattern, sent.strip(), re.IGNORECASE)
+                if match:
+                    fact = f"{match.group(1)} {match.group(2)} {match.group(3)}"
+                    facts.append(fact)
+                    break
+        
+        return facts
+    
+    def _calculate_hallucination_score(self, semantic: float, factual: float,
+                                     entailment: Dict, is_hallucinated: bool) -> float:
+        """Calculate final hallucination score"""
+        # Components (inverted because high consistency = low hallucination)
+        semantic_component = 1 - semantic
+        factual_component = 1 - factual
+        contradiction_component = entailment['contradiction']
+        
+        # Dynamic weighting
+        if semantic > 0.7:
+            weights = [0.2, 0.5, 0.3]  # Factual accuracy most important
+        else:
+            weights = [0.4, 0.3, 0.3]  # Semantic difference matters more
+        
+        score = sum(c * w for c, w in zip(
+            [semantic_component, factual_component, contradiction_component],
+            weights
+        ))
+        
+        # Ensure consistency with boolean
+        if is_hallucinated and score < 0.5:
+            score = 0.5 + score * 0.5
+        elif not is_hallucinated and score > 0.5:
+            score = score * 0.5
+        
+        return score
+    
+    def _calculate_statistics(self, results: List[HallucinationResult]) -> Dict:
+        """Calculate statistics across all results"""
+        total = len(results)
+        hallucinated = sum(1 for r in results if r.is_hallucinated)
+        
+        type_counts = Counter(r.hallucination_type for r in results if r.is_hallucinated)
+        
+        return {
+            'total_paragraphs': total,
+            'hallucinated_count': hallucinated,
+            'consistent_count': total - hallucinated,
+            'hallucination_rate': hallucinated / total if total > 0 else 0,
+            'type_distribution': dict(type_counts),
+            'avg_hallucination_score': np.mean([r.hallucination_score for r in results]),
+            'avg_semantic_similarity': np.mean([r.semantic_similarity for r in results]),
+            'avg_factual_consistency': np.mean([r.factual_consistency for r in results])
+        }
+    
+    def _generate_summary(self, results: List[HallucinationResult], stats: Dict) -> str:
+        """Generate human-readable summary"""
+        summary_lines = [
+            f"Analyzed {stats['total_paragraphs']} paragraphs:",
+            f"- Hallucinated: {stats['hallucinated_count']} ({stats['hallucination_rate']:.1%})",
+            f"- Consistent: {stats['consistent_count']} ({1-stats['hallucination_rate']:.1%})",
+            ""
+        ]
+        
+        if stats['type_distribution']:
+            summary_lines.append("Hallucination types found:")
+            for htype, count in stats['type_distribution'].items():
+                summary_lines.append(f"- {htype.value}: {count}")
+        
+        summary_lines.extend([
+            "",
+            f"Average scores:",
+            f"- Hallucination: {stats['avg_hallucination_score']:.3f}",
+            f"- Semantic similarity: {stats['avg_semantic_similarity']:.3f}",
+            f"- Factual consistency: {stats['avg_factual_consistency']:.3f}"
+        ])
+        
+        return "\n".join(summary_lines)
+
+
+# Example usage
+if __name__ == "__main__":
+    detector = ComprehensiveHallucinationDetector()
+    
+    # Test with multiple paragraphs
+    paragraphs = [
+        # Reference (ground truth)
+        """The company reported revenue of $2.5 million in Q4 2023, with a 15% increase from the previous quarter. 
+        CEO John Smith announced expansion plans on January 15, 2024, targeting the Asian market. 
+        The profit margin improved to 22% due to cost optimization strategies implemented in September.""",
+        
+        # Candidate 1: Should be CONSISTENT
+        """Q4 2023 revenue was $2.5 million, up 15% from Q3. John Smith announced Asian expansion 
+        on January 15, 2024. Profit margins reached 22% through cost optimization.""",
+        
+        # Candidate 2: Should be FACTUAL_ERROR
+        """The company earned $3.2 million in Q4 2023, showing 20% growth. CEO John Smith revealed 
+        expansion plans on January 20, 2024. Margins improved to 25%.""",
+        
+        # Candidate 3: Should be CONTRADICTION
+        """Revenue reached $2.5 million in Q4 2023. However, this represented a 15% decline from Q3. 
+        John Smith announced Asian expansion on January 15, 2024.""",
+        
+        # Candidate 4: Should be OMISSION
+        """The company performed well in Q4 2023. Management is optimistic about future growth 
+        in international markets. Operational efficiency has improved.""",
+        
+        # Candidate 5: Should be FABRICATION
+        """In Q4 2023, the company struggled with declining revenue of $2.5 million. 
+        CEO John Smith announced cost-cutting measures on January 15, 2024, abandoning expansion plans."""
+    ]
+    
+    # Analyze
+    print("COMPREHENSIVE HALLUCINATION DETECTION")
+    print("=" * 80)
+    
+    results = detector.analyze_paragraphs(paragraphs)
+    
+    print(f"\nReference: {results['reference'][:100]}...\n")
+    print(results['summary'])
+    
+    print("\n" + "-" * 80)
+    print("DETAILED RESULTS:")
+    print("-" * 80)
+    
+    for result in results['results']:
+        print(f"\nParagraph {result.paragraph_id}:")
+        print(f"Status: {'HALLUCINATED' if result.is_hallucinated else 'CONSISTENT'}")
+        print(f"Type: {result.hallucination_type.value}")
+        print(f"Hallucination Score: {result.hallucination_score:.3f}")
+        print(f"Confidence: {result.confidence:.1%}")
+        print(f"Semantic Similarity: {result.semantic_similarity:.3f}")
+        print(f"Factual Consistency: {result.factual_consistency:.3f}")
+        
+        if result.reasons:
+            print("Reasons:")
+            for reason in result.reasons:
+                print(f"  - {reason}")
