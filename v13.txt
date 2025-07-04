@@ -1,0 +1,715 @@
+"""
+Working Hallucination Detection System with File Support
+=======================================================
+Complete implementation that handles file reading and JSON serialization properly.
+"""
+
+import numpy as np
+from typing import List, Dict, Tuple, Set, Optional, Union, Any
+import re
+import networkx as nx
+from sklearn.metrics.pairwise import cosine_similarity
+from sklearn.feature_extraction.text import TfidfVectorizer
+import nltk
+from nltk.tokenize import sent_tokenize, word_tokenize
+from collections import defaultdict
+import warnings
+from scipy.stats import entropy
+import webbrowser
+import os
+import json
+from dataclasses import dataclass, field, asdict
+from enum import Enum
+import traceback
+
+warnings.filterwarnings('ignore')
+
+# Download required NLTK data
+for resource in ['punkt', 'stopwords', 'averaged_perceptron_tagger', 'maxent_ne_chunker', 'words']:
+    try:
+        nltk.data.find(f'tokenizers/{resource}')
+    except LookupError:
+        print(f"Downloading {resource}...")
+        nltk.download(resource, quiet=True)
+
+
+def convert_to_serializable(obj: Any) -> Any:
+    """Convert numpy types to Python native types for JSON serialization"""
+    if isinstance(obj, np.integer):
+        return int(obj)
+    elif isinstance(obj, np.floating):
+        return float(obj)
+    elif isinstance(obj, np.ndarray):
+        return obj.tolist()
+    elif isinstance(obj, (np.bool_, bool)):
+        return bool(obj)
+    elif isinstance(obj, dict):
+        return {k: convert_to_serializable(v) for k, v in obj.items()}
+    elif isinstance(obj, list):
+        return [convert_to_serializable(item) for item in obj]
+    else:
+        return obj
+
+
+class HallucinationDetector:
+    """Simplified but robust hallucination detection system"""
+    
+    def __init__(self):
+        """Initialize the detector"""
+        print("Initializing Hallucination Detector...")
+        
+        # TF-IDF vectorizer for semantic similarity
+        self.tfidf_vectorizer = TfidfVectorizer(
+            max_features=1000,
+            ngram_range=(1, 3),
+            stop_words='english'
+        )
+        
+        # Patterns for entity extraction
+        self.patterns = {
+            'money': re.compile(r'\$[\d,]+\.?\d*\s*(?:million|billion|thousand|M|B|K)?', re.I),
+            'percentage': re.compile(r'\b\d+\.?\d*\s*(?:%|percent)', re.I),
+            'date': re.compile(r'\b(?:Q[1-4]\s*\d{4}|(?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)[a-z]*\.?\s*\d{1,2},?\s*\d{4}|\d{1,2}[-/]\d{1,2}[-/]\d{2,4})\b', re.I),
+            'number': re.compile(r'\b\d+(?:,\d{3})*(?:\.\d+)?\b')
+        }
+        
+        self.stopwords = set(nltk.corpus.stopwords.words('english'))
+        
+        print("Initialization complete!")
+    
+    def extract_entities(self, text: str) -> Dict[str, List[str]]:
+        """Extract entities from text"""
+        entities = {
+            'money': [],
+            'percentage': [],
+            'date': [],
+            'number': []
+        }
+        
+        for entity_type, pattern in self.patterns.items():
+            matches = pattern.findall(text)
+            entities[entity_type] = list(set(matches))  # Remove duplicates
+        
+        return entities
+    
+    def normalize_value(self, value: str, entity_type: str) -> Union[str, float]:
+        """Normalize values for comparison"""
+        try:
+            if entity_type == 'money':
+                # Remove $ and commas
+                clean = re.sub(r'[$,]', '', value)
+                # Extract number
+                num_match = re.search(r'[\d.]+', clean)
+                if num_match:
+                    num = float(num_match.group())
+                    # Apply multipliers
+                    if 'million' in value.lower() or 'M' in value:
+                        num *= 1_000_000
+                    elif 'billion' in value.lower() or 'B' in value:
+                        num *= 1_000_000_000
+                    elif 'thousand' in value.lower() or 'K' in value:
+                        num *= 1_000
+                    return num
+            
+            elif entity_type == 'percentage':
+                num_match = re.search(r'[\d.]+', value)
+                if num_match:
+                    return float(num_match.group())
+            
+            elif entity_type == 'date':
+                # Simple normalization
+                return value.lower().replace(',', '').replace('.', '')
+            
+            elif entity_type == 'number':
+                return float(value.replace(',', ''))
+        
+        except:
+            pass
+        
+        return value
+    
+    def calculate_semantic_similarity(self, text1: str, text2: str) -> float:
+        """Calculate semantic similarity between texts"""
+        if not text1 or not text2:
+            return 0.0
+        
+        try:
+            # For short texts, use word overlap
+            if len(text1.split()) < 5 or len(text2.split()) < 5:
+                words1 = set(text1.lower().split()) - self.stopwords
+                words2 = set(text2.lower().split()) - self.stopwords
+                if not words1 or not words2:
+                    return 0.0
+                return len(words1 & words2) / len(words1 | words2)
+            
+            # For longer texts, use TF-IDF
+            tfidf_matrix = self.tfidf_vectorizer.fit_transform([text1, text2])
+            similarity = cosine_similarity(tfidf_matrix[0:1], tfidf_matrix[1:2])[0][0]
+            return float(similarity)
+        
+        except:
+            return 0.0
+    
+    def calculate_entropy(self, text: str) -> float:
+        """Calculate text entropy"""
+        words = word_tokenize(text.lower())
+        words = [w for w in words if w.isalnum() and w not in self.stopwords]
+        
+        if not words:
+            return 0.0
+        
+        # Word frequency
+        word_freq = defaultdict(int)
+        for word in words:
+            word_freq[word] += 1
+        
+        # Calculate probabilities
+        total = len(words)
+        probs = [count/total for count in word_freq.values()]
+        
+        # Shannon entropy
+        return float(-sum(p * np.log2(p + 1e-10) for p in probs))
+    
+    def compare_entities(self, entities1: Dict, entities2: Dict) -> Dict[str, float]:
+        """Compare entities between two texts"""
+        comparison = {
+            'factual_consistency': 1.0,
+            'contradictions': 0,
+            'matches': 0,
+            'total_entities': 0
+        }
+        
+        for entity_type in entities1:
+            if entities1[entity_type] or entities2[entity_type]:
+                # Normalize values
+                norm1 = set()
+                norm2 = set()
+                
+                for val in entities1[entity_type]:
+                    norm1.add(str(self.normalize_value(val, entity_type)))
+                
+                for val in entities2[entity_type]:
+                    norm2.add(str(self.normalize_value(val, entity_type)))
+                
+                # Count matches and total
+                matches = len(norm1 & norm2)
+                total = len(norm1 | norm2)
+                
+                comparison['matches'] += matches
+                comparison['total_entities'] += total
+                
+                # Check for contradictions (different values for same type)
+                if norm1 and norm2 and not (norm1 & norm2):
+                    comparison['contradictions'] += 1
+        
+        # Calculate consistency
+        if comparison['total_entities'] > 0:
+            comparison['factual_consistency'] = comparison['matches'] / comparison['total_entities']
+        
+        return comparison
+    
+    def analyze_paragraph(self, reference: str, candidate: str, paragraph_id: int) -> Dict[str, Any]:
+        """Analyze a single paragraph for hallucination"""
+        # Extract entities
+        ref_entities = self.extract_entities(reference)
+        cand_entities = self.extract_entities(candidate)
+        
+        # Compare entities
+        entity_comparison = self.compare_entities(ref_entities, cand_entities)
+        
+        # Calculate metrics
+        semantic_sim = self.calculate_semantic_similarity(reference, candidate)
+        ref_entropy = self.calculate_entropy(reference)
+        cand_entropy = self.calculate_entropy(candidate)
+        entropy_diff = abs(cand_entropy - ref_entropy) / (ref_entropy + 1e-10)
+        
+        # Determine hallucination
+        hallucination_score = 0.0
+        
+        # Factor 1: Semantic divergence
+        if semantic_sim < 0.3:
+            hallucination_score += 0.3
+        else:
+            hallucination_score += (1 - semantic_sim) * 0.3
+        
+        # Factor 2: Factual inconsistency
+        if entity_comparison['contradictions'] > 0:
+            hallucination_score += 0.5
+        else:
+            hallucination_score += (1 - entity_comparison['factual_consistency']) * 0.3
+        
+        # Factor 3: Entropy divergence
+        if entropy_diff > 0.5:
+            hallucination_score += 0.2
+        
+        # Determine if hallucinated
+        is_hallucinated = hallucination_score > 0.5
+        
+        # Determine severity
+        if hallucination_score > 0.7:
+            severity = 'severe'
+        elif hallucination_score > 0.5:
+            severity = 'moderate'
+        elif hallucination_score > 0.3:
+            severity = 'minor'
+        else:
+            severity = 'none'
+        
+        return {
+            'paragraph_id': paragraph_id,
+            'is_hallucinated': bool(is_hallucinated),  # Ensure native bool
+            'hallucination_score': float(hallucination_score),
+            'severity': severity,
+            'semantic_similarity': float(semantic_sim),
+            'factual_consistency': float(entity_comparison['factual_consistency']),
+            'contradictions': int(entity_comparison['contradictions']),
+            'entropy': float(cand_entropy),
+            'entropy_divergence': float(entropy_diff)
+        }
+    
+    def build_graph(self, paragraphs: List[str], analyses: List[Dict]) -> nx.Graph:
+        """Build graph from paragraphs and analyses"""
+        G = nx.Graph()
+        
+        # Add nodes
+        for i, (para, analysis) in enumerate(zip(paragraphs, analyses)):
+            if i == 0:  # Reference
+                G.add_node(i,
+                          text=para[:200] + '...' if len(para) > 200 else para,
+                          is_reference=True,
+                          is_hallucinated=False,
+                          severity='reference')
+            else:
+                G.add_node(i,
+                          text=para[:200] + '...' if len(para) > 200 else para,
+                          is_reference=False,
+                          is_hallucinated=analysis['is_hallucinated'],
+                          severity=analysis['severity'],
+                          hallucination_score=analysis['hallucination_score'],
+                          semantic_similarity=analysis['semantic_similarity'])
+        
+        # Add edges based on semantic similarity
+        for i in range(len(paragraphs)):
+            for j in range(i + 1, len(paragraphs)):
+                similarity = self.calculate_semantic_similarity(paragraphs[i], paragraphs[j])
+                if similarity > 0.3:  # Only connect if somewhat similar
+                    G.add_edge(i, j, weight=float(similarity))
+        
+        return G
+    
+    def create_visualization(self, G: nx.Graph, analyses: List[Dict], 
+                           save_path: str = "hallucination_detection.html") -> str:
+        """Create interactive visualization"""
+        # Calculate layout
+        pos = nx.spring_layout(G, k=2, iterations=50)
+        
+        # Prepare nodes data
+        nodes = []
+        for node in G.nodes():
+            node_data = G.nodes[node]
+            
+            # Determine color
+            if node_data.get('is_reference'):
+                color = '#0066CC'
+            elif node_data.get('severity') == 'severe':
+                color = '#CC0000'
+            elif node_data.get('severity') == 'moderate':
+                color = '#FF6666'
+            elif node_data.get('severity') == 'minor':
+                color = '#FFAA00'
+            else:
+                color = '#00CC00'
+            
+            # Convert position to serializable format
+            x, y = pos[node]
+            
+            nodes.append({
+                'id': int(node),
+                'label': f'P{node}',
+                'x': float(x * 500 + 400),
+                'y': float(y * 300 + 300),
+                'color': color,
+                'size': 20,
+                'text': node_data.get('text', ''),
+                'is_reference': bool(node_data.get('is_reference', False)),
+                'is_hallucinated': bool(node_data.get('is_hallucinated', False)),
+                'severity': node_data.get('severity', 'unknown'),
+                'hallucination_score': float(node_data.get('hallucination_score', 0)),
+                'semantic_similarity': float(node_data.get('semantic_similarity', 0))
+            })
+        
+        # Prepare edges data
+        links = []
+        for u, v, data in G.edges(data=True):
+            links.append({
+                'source': int(u),
+                'target': int(v),
+                'weight': float(data.get('weight', 0))
+            })
+        
+        # Convert to JSON-serializable format
+        nodes_json = json.dumps(convert_to_serializable(nodes))
+        links_json = json.dumps(convert_to_serializable(links))
+        
+        # Create HTML
+        html_content = f"""
+<!DOCTYPE html>
+<html>
+<head>
+    <title>Hallucination Detection Visualization</title>
+    <script src="https://d3js.org/d3.v7.min.js"></script>
+    <style>
+        body {{
+            font-family: Arial, sans-serif;
+            margin: 0;
+            padding: 20px;
+            background-color: #f5f5f5;
+        }}
+        #graph {{
+            background-color: white;
+            border: 1px solid #ddd;
+            border-radius: 8px;
+            box-shadow: 0 2px 4px rgba(0,0,0,0.1);
+            margin: 20px 0;
+        }}
+        .tooltip {{
+            position: absolute;
+            text-align: left;
+            padding: 12px;
+            font: 12px sans-serif;
+            background: rgba(0, 0, 0, 0.9);
+            color: white;
+            border-radius: 8px;
+            pointer-events: none;
+            opacity: 0;
+            transition: opacity 0.3s;
+            max-width: 400px;
+        }}
+        .legend {{
+            background: white;
+            padding: 15px;
+            border-radius: 8px;
+            border: 1px solid #ddd;
+            margin-bottom: 20px;
+        }}
+        .legend-item {{
+            display: inline-block;
+            margin-right: 20px;
+        }}
+        .legend-color {{
+            display: inline-block;
+            width: 20px;
+            height: 20px;
+            margin-right: 5px;
+            vertical-align: middle;
+            border: 1px solid #333;
+        }}
+        h1 {{
+            color: #333;
+        }}
+        .stats {{
+            background: white;
+            padding: 15px;
+            border-radius: 8px;
+            border: 1px solid #ddd;
+            margin-bottom: 20px;
+        }}
+    </style>
+</head>
+<body>
+    <h1>Hallucination Detection Results</h1>
+    
+    <div class="stats">
+        <h3>Summary Statistics</h3>
+        <p>Total paragraphs analyzed: {len(analyses)}</p>
+        <p>Hallucinated: {sum(1 for a in analyses if a['is_hallucinated'])}</p>
+        <p>Severe: {sum(1 for a in analyses if a['severity'] == 'severe')}</p>
+        <p>Moderate: {sum(1 for a in analyses if a['severity'] == 'moderate')}</p>
+        <p>Minor: {sum(1 for a in analyses if a['severity'] == 'minor')}</p>
+    </div>
+    
+    <div class="legend">
+        <div class="legend-item">
+            <span class="legend-color" style="background-color: #0066CC;"></span>
+            Reference
+        </div>
+        <div class="legend-item">
+            <span class="legend-color" style="background-color: #CC0000;"></span>
+            Severe
+        </div>
+        <div class="legend-item">
+            <span class="legend-color" style="background-color: #FF6666;"></span>
+            Moderate
+        </div>
+        <div class="legend-item">
+            <span class="legend-color" style="background-color: #FFAA00;"></span>
+            Minor
+        </div>
+        <div class="legend-item">
+            <span class="legend-color" style="background-color: #00CC00;"></span>
+            None
+        </div>
+    </div>
+    
+    <div id="graph"></div>
+    <div class="tooltip"></div>
+    
+    <script>
+        const nodes = {nodes_json};
+        const links = {links_json};
+        
+        const width = 800;
+        const height = 600;
+        
+        const svg = d3.select("#graph")
+            .append("svg")
+            .attr("width", width)
+            .attr("height", height);
+        
+        const g = svg.append("g");
+        
+        // Add zoom
+        const zoom = d3.zoom()
+            .scaleExtent([0.1, 10])
+            .on("zoom", (event) => {{
+                g.attr("transform", event.transform);
+            }});
+        
+        svg.call(zoom);
+        
+        // Create force simulation
+        const simulation = d3.forceSimulation(nodes)
+            .force("link", d3.forceLink(links).id(d => d.id).distance(100))
+            .force("charge", d3.forceManyBody().strength(-300))
+            .force("center", d3.forceCenter(width / 2, height / 2));
+        
+        // Draw links
+        const link = g.append("g")
+            .selectAll("line")
+            .data(links)
+            .enter().append("line")
+            .attr("stroke", "#999")
+            .attr("stroke-opacity", 0.6)
+            .attr("stroke-width", d => Math.sqrt(d.weight * 10));
+        
+        // Draw nodes
+        const node = g.append("g")
+            .selectAll("circle")
+            .data(nodes)
+            .enter().append("circle")
+            .attr("r", d => d.size)
+            .attr("fill", d => d.color)
+            .attr("stroke", "#333")
+            .attr("stroke-width", 2)
+            .style("cursor", "pointer")
+            .call(d3.drag()
+                .on("start", dragstarted)
+                .on("drag", dragged)
+                .on("end", dragended));
+        
+        // Add labels
+        const label = g.append("g")
+            .selectAll("text")
+            .data(nodes)
+            .enter().append("text")
+            .text(d => d.label)
+            .attr("font-size", 12)
+            .attr("dx", 25)
+            .attr("dy", 5);
+        
+        // Tooltip
+        const tooltip = d3.select(".tooltip");
+        
+        node.on("mouseover", function(event, d) {{
+            let html = `<strong>${{d.label}}</strong><br/>`;
+            html += `Type: ${{d.is_reference ? 'Reference' : 'Candidate'}}<br/>`;
+            if (!d.is_reference) {{
+                html += `Hallucinated: ${{d.is_hallucinated ? 'Yes' : 'No'}}<br/>`;
+                html += `Severity: ${{d.severity}}<br/>`;
+                html += `Score: ${{(d.hallucination_score * 100).toFixed(1)}}%<br/>`;
+                html += `Similarity: ${{(d.semantic_similarity * 100).toFixed(1)}}%<br/>`;
+            }}
+            html += `<br/>Text: ${{d.text}}`;
+            
+            tooltip.html(html)
+                .style("left", (event.pageX + 10) + "px")
+                .style("top", (event.pageY - 10) + "px")
+                .style("opacity", 1);
+        }})
+        .on("mouseout", function() {{
+            tooltip.style("opacity", 0);
+        }});
+        
+        // Update positions
+        simulation.on("tick", () => {{
+            link
+                .attr("x1", d => d.source.x)
+                .attr("y1", d => d.source.y)
+                .attr("x2", d => d.target.x)
+                .attr("y2", d => d.target.y);
+            
+            node
+                .attr("cx", d => d.x)
+                .attr("cy", d => d.y);
+            
+            label
+                .attr("x", d => d.x)
+                .attr("y", d => d.y);
+        }});
+        
+        function dragstarted(event, d) {{
+            if (!event.active) simulation.alphaTarget(0.3).restart();
+            d.fx = d.x;
+            d.fy = d.y;
+        }}
+        
+        function dragged(event, d) {{
+            d.fx = event.x;
+            d.fy = event.y;
+        }}
+        
+        function dragended(event, d) {{
+            if (!event.active) simulation.alphaTarget(0);
+            d.fx = null;
+            d.fy = null;
+        }}
+    </script>
+</body>
+</html>
+"""
+        
+        # Save file
+        with open(save_path, 'w', encoding='utf-8') as f:
+            f.write(html_content)
+        
+        return save_path
+    
+    def analyze_from_file(self, reference: str, file_path: str, output_dir: str = ".") -> Dict[str, Any]:
+        """Analyze candidates from a file"""
+        print(f"\nReading candidates from: {file_path}")
+        
+        try:
+            # Read file
+            with open(file_path, 'r', encoding='utf-8') as f:
+                content = f.read()
+            
+            # Split into paragraphs (customize this based on your file format)
+            # Option 1: Split by double newlines
+            candidates = [p.strip() for p in content.split('\n\n') if p.strip()]
+            
+            # Option 2: If each line is a paragraph
+            # candidates = [line.strip() for line in content.split('\n') if line.strip()]
+            
+            print(f"Found {len(candidates)} candidate paragraphs")
+            
+            # Analyze
+            return self.analyze_batch(reference, candidates, output_dir)
+            
+        except Exception as e:
+            print(f"Error reading file: {e}")
+            traceback.print_exc()
+            return {}
+    
+    def analyze_batch(self, reference: str, candidates: List[str], output_dir: str = ".") -> Dict[str, Any]:
+        """Analyze multiple candidates"""
+        print("\n" + "="*60)
+        print("HALLUCINATION DETECTION ANALYSIS")
+        print("="*60)
+        
+        # Prepare all paragraphs
+        all_paragraphs = [reference] + candidates
+        analyses = []
+        
+        # Analyze each candidate
+        print("\nAnalyzing candidates...")
+        for i, candidate in enumerate(candidates):
+            print(f"  Analyzing paragraph {i+1}...")
+            analysis = self.analyze_paragraph(reference, candidate, i+1)
+            analyses.append(analysis)
+            print(f"    Severity: {analysis['severity']}")
+            print(f"    Score: {analysis['hallucination_score']:.2f}")
+        
+        # Build graph
+        print("\nBuilding graph...")
+        G = self.build_graph(all_paragraphs, [{}] + analyses)  # Add empty dict for reference
+        
+        # Create visualization
+        print("Creating visualization...")
+        viz_path = os.path.join(output_dir, "hallucination_detection.html")
+        viz_path = self.create_visualization(G, analyses, viz_path)
+        
+        # Summary
+        print("\n" + "-"*60)
+        print("SUMMARY")
+        print("-"*60)
+        print(f"Total candidates: {len(candidates)}")
+        print(f"Hallucinated: {sum(1 for a in analyses if a['is_hallucinated'])}")
+        
+        severity_counts = defaultdict(int)
+        for a in analyses:
+            severity_counts[a['severity']] += 1
+        
+        for severity in ['none', 'minor', 'moderate', 'severe']:
+            print(f"  {severity.capitalize()}: {severity_counts[severity]}")
+        
+        print(f"\nVisualization saved to: {viz_path}")
+        print("Opening in browser...")
+        
+        try:
+            webbrowser.open(f'file://{os.path.abspath(viz_path)}')
+        except:
+            print("Could not open browser automatically")
+        
+        return {
+            'analyses': analyses,
+            'graph': G,
+            'visualization': viz_path,
+            'summary': dict(severity_counts)
+        }
+
+
+# Main execution
+if __name__ == "__main__":
+    # Initialize detector
+    detector = HallucinationDetector()
+    
+    # Example 1: Direct usage with test data
+    print("Example 1: Direct usage")
+    reference = """The company reported revenue of $2.5 million in Q4 2023, with a 15% increase from the previous quarter. 
+    CEO John Smith announced expansion plans on January 15, 2024, targeting the Asian market. 
+    The profit margin improved to 22% due to cost optimization strategies."""
+    
+    candidates = [
+        """Q4 2023 revenue reached $2.5 million, marking 15% quarterly growth. 
+        John Smith revealed Asian market expansion on January 15, 2024. 
+        Profit margins rose to 22% through cost optimization.""",
+        
+        """The company earned $3.2 million in Q4 2023, a 20% increase. 
+        CEO John Smith discussed expansion plans on January 20, 2024. 
+        Profit margins reached 25% after cost controls."""
+    ]
+    
+    results = detector.analyze_batch(reference, candidates)
+    
+    # Example 2: Reading from file
+    print("\n\nExample 2: Reading from file")
+    
+    # Create a sample file
+    sample_file = "candidates.txt"
+    with open(sample_file, 'w', encoding='utf-8') as f:
+        f.write("""Q4 2023 revenue reached $2.5 million, marking 15% quarterly growth. 
+John Smith revealed Asian market expansion on January 15, 2024. 
+Profit margins rose to 22% through cost optimization.
+
+The company earned $3.2 million in Q4 2023, a 20% increase. 
+CEO John Smith discussed expansion plans on January 20, 2024. 
+Profit margins reached 25% after cost controls.
+
+In Q4 2023, revenue was $2.5 million. The company also reported 
+strong customer retention rates. John Smith's January 15 announcement 
+emphasized the Asian market opportunity.""")
+    
+    # Analyze from file
+    file_results = detector.analyze_from_file(reference, sample_file)
+    
+    print("\n\nAnalysis complete!")
