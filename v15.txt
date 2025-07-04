@@ -1,0 +1,1129 @@
+"""
+Hallucination Detection System with Semantic Grouping
+====================================================
+Groups semantically similar passages together and identifies hallucinations within groups.
+"""
+
+import numpy as np
+from typing import List, Dict, Tuple, Any, Optional, Set
+import re
+import networkx as nx
+from sklearn.metrics.pairwise import cosine_similarity
+from sklearn.feature_extraction.text import TfidfVectorizer
+from sklearn.cluster import DBSCAN
+import nltk
+from nltk.tokenize import sent_tokenize, word_tokenize
+from nltk.corpus import stopwords
+from collections import Counter, defaultdict
+import warnings
+from scipy.stats import entropy as scipy_entropy
+import webbrowser
+import os
+import json
+import colorsys
+
+warnings.filterwarnings('ignore')
+
+# Download required NLTK data
+for resource in ['punkt', 'stopwords', 'averaged_perceptron_tagger', 'wordnet']:
+    try:
+        nltk.data.find(f'tokenizers/{resource}')
+    except LookupError:
+        print(f"Downloading {resource}...")
+        nltk.download(resource, quiet=True)
+
+
+class SemanticGroupingHallucinationDetector:
+    """Hallucination detection with semantic grouping of passages"""
+    
+    def __init__(self):
+        print("Initializing Semantic Grouping Hallucination Detector...")
+        
+        # Text processing
+        self.tfidf = TfidfVectorizer(
+            max_features=1000,
+            ngram_range=(1, 3),
+            stop_words='english'
+        )
+        self.stopwords = set(stopwords.words('english'))
+        
+        # Entity extraction patterns
+        self.entity_patterns = {
+            'money': re.compile(r'\$[\d,]+\.?\d*\s*(?:million|billion|thousand|M|B|K)?', re.I),
+            'percentage': re.compile(r'\d+\.?\d*\s*(?:%|percent)', re.I),
+            'date': re.compile(r'(?:Q[1-4]\s*\d{4}|(?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)[a-z]*\.?\s*\d{1,2},?\s*\d{4}|\d{1,2}[-/]\d{1,2}[-/]\d{2,4})', re.I),
+            'quantity': re.compile(r'\d+\s*(?:employees?|customers?|users?|units?|items?)', re.I)
+        }
+        
+        # Thresholds
+        self.min_semantic_similarity = 0.3  # Minimum similarity for connections
+        self.group_similarity_threshold = 0.5  # Minimum similarity for same group
+        self.hallucination_threshold = 0.6
+        
+        print("Initialization complete!")
+    
+    def extract_entities(self, text: str) -> Dict[str, List[Tuple[str, Any]]]:
+        """Extract and normalize entities from text"""
+        entities = {}
+        
+        for entity_type, pattern in self.entity_patterns.items():
+            matches = []
+            for match in pattern.finditer(text):
+                raw_value = match.group()
+                normalized = self._normalize_entity(raw_value, entity_type)
+                matches.append((raw_value, normalized))
+            entities[entity_type] = matches
+        
+        return entities
+    
+    def _normalize_entity(self, value: str, entity_type: str) -> Any:
+        """Normalize entity values for comparison"""
+        if entity_type == 'money':
+            clean = re.sub(r'[$,]', '', value)
+            try:
+                num = float(re.search(r'[\d.]+', clean).group())
+                if any(x in value.lower() for x in ['million', 'm']):
+                    num *= 1_000_000
+                elif any(x in value.lower() for x in ['billion', 'b']):
+                    num *= 1_000_000_000
+                elif any(x in value.lower() for x in ['thousand', 'k']):
+                    num *= 1_000
+                return num
+            except:
+                return 0
+        
+        elif entity_type == 'percentage':
+            try:
+                return float(re.search(r'[\d.]+', value).group())
+            except:
+                return 0
+        
+        elif entity_type == 'date':
+            return re.sub(r'[,.]', '', value.lower())
+        
+        elif entity_type == 'quantity':
+            try:
+                return int(re.search(r'\d+', value).group())
+            except:
+                return 0
+        
+        return value
+    
+    def calculate_semantic_similarity(self, text1: str, text2: str) -> float:
+        """Calculate semantic similarity between texts"""
+        if not text1 or not text2:
+            return 0.0
+        
+        words1 = set(word_tokenize(text1.lower())) - self.stopwords
+        words2 = set(word_tokenize(text2.lower())) - self.stopwords
+        
+        if len(words1) < 5 or len(words2) < 5:
+            if not words1 or not words2:
+                return 0.0
+            return len(words1 & words2) / len(words1 | words2)
+        
+        try:
+            tfidf_matrix = self.tfidf.fit_transform([text1, text2])
+            cosine_sim = cosine_similarity(tfidf_matrix[0:1], tfidf_matrix[1:2])[0][0]
+            word_overlap = len(words1 & words2) / max(len(words1), len(words2))
+            return 0.7 * cosine_sim + 0.3 * word_overlap
+        except:
+            return 0.0
+    
+    def calculate_entailment(self, premise: str, hypothesis: str) -> Dict[str, float]:
+        """Calculate entailment scores"""
+        similarity = self.calculate_semantic_similarity(premise, hypothesis)
+        
+        negations = {'not', 'no', 'never', 'neither', 'none', 'nobody', 'nothing', 'nowhere', "n't"}
+        premise_words = set(word_tokenize(premise.lower()))
+        hypothesis_words = set(word_tokenize(hypothesis.lower()))
+        
+        premise_negations = bool(premise_words & negations)
+        hypothesis_negations = bool(hypothesis_words & negations)
+        
+        contradiction_score = 0.0
+        if premise_negations != hypothesis_negations and similarity > 0.5:
+            contradiction_score = 0.7
+        
+        premise_entities = self.extract_entities(premise)
+        hypothesis_entities = self.extract_entities(hypothesis)
+        
+        for entity_type in premise_entities:
+            if premise_entities[entity_type] and hypothesis_entities[entity_type]:
+                premise_values = {v[1] for v in premise_entities[entity_type]}
+                hypothesis_values = {v[1] for v in hypothesis_entities[entity_type]}
+                
+                if premise_values and hypothesis_values and not (premise_values & hypothesis_values):
+                    contradiction_score = max(contradiction_score, 0.6)
+        
+        if similarity > 0.8 and contradiction_score < 0.3:
+            entailment_score = similarity
+        else:
+            entailment_score = similarity * (1 - contradiction_score)
+        
+        neutral_score = 1.0 - entailment_score - contradiction_score
+        
+        return {
+            'entailment': max(0, min(1, entailment_score)),
+            'contradiction': max(0, min(1, contradiction_score)),
+            'neutral': max(0, min(1, neutral_score))
+        }
+    
+    def calculate_factual_consistency(self, ref_entities: Dict, cand_entities: Dict) -> Dict[str, float]:
+        """Calculate factual consistency between entity sets"""
+        results = {
+            'overall': 1.0,
+            'by_type': {},
+            'contradictions': 0,
+            'matches': 0,
+            'total': 0
+        }
+        
+        for entity_type in ref_entities:
+            ref_values = {v[1] for v in ref_entities.get(entity_type, [])}
+            cand_values = {v[1] for v in cand_entities.get(entity_type, [])}
+            
+            if ref_values or cand_values:
+                matches = len(ref_values & cand_values)
+                total = len(ref_values | cand_values)
+                
+                if total > 0:
+                    consistency = matches / total
+                    results['by_type'][entity_type] = consistency
+                    results['matches'] += matches
+                    results['total'] += total
+                    
+                    if ref_values and cand_values and not (ref_values & cand_values):
+                        results['contradictions'] += 1
+        
+        if results['total'] > 0:
+            results['overall'] = results['matches'] / results['total']
+        
+        return results
+    
+    def calculate_entropy(self, text: str) -> float:
+        """Calculate normalized entropy of text"""
+        words = [w.lower() for w in word_tokenize(text) if w.isalnum() and w not in self.stopwords]
+        
+        if not words:
+            return 0.0
+        
+        word_counts = Counter(words)
+        total_words = len(words)
+        probs = [count/total_words for count in word_counts.values()]
+        entropy = -sum(p * np.log2(p) for p in probs if p > 0)
+        max_entropy = np.log2(len(word_counts))
+        normalized_entropy = entropy / max_entropy if max_entropy > 0 else 0
+        
+        return normalized_entropy
+    
+    def create_similarity_matrix(self, passages: List[str]) -> np.ndarray:
+        """Create pairwise similarity matrix for all passages"""
+        n = len(passages)
+        similarity_matrix = np.zeros((n, n))
+        
+        for i in range(n):
+            for j in range(i, n):
+                if i == j:
+                    similarity_matrix[i, j] = 1.0
+                else:
+                    sim = self.calculate_semantic_similarity(passages[i], passages[j])
+                    similarity_matrix[i, j] = sim
+                    similarity_matrix[j, i] = sim
+        
+        return similarity_matrix
+    
+    def group_passages(self, passages: List[str]) -> Dict[int, List[int]]:
+        """Group passages based on semantic similarity using clustering"""
+        if len(passages) < 2:
+            return {0: [0]}
+        
+        # Create similarity matrix
+        similarity_matrix = self.create_similarity_matrix(passages)
+        
+        # Convert similarity to distance for DBSCAN
+        distance_matrix = 1 - similarity_matrix
+        
+        # Use DBSCAN clustering
+        clustering = DBSCAN(
+            eps=1 - self.group_similarity_threshold,  # Distance threshold
+            min_samples=1,
+            metric='precomputed'
+        ).fit(distance_matrix)
+        
+        # Organize into groups
+        groups = defaultdict(list)
+        for idx, label in enumerate(clustering.labels_):
+            if label == -1:  # Noise points get their own group
+                groups[len(groups)] = [idx]
+            else:
+                groups[label].append(idx)
+        
+        return dict(groups)
+    
+    def analyze_within_group(self, passages: List[str], indices: List[int]) -> Dict[int, Dict]:
+        """Analyze passages within a semantic group for consistency"""
+        group_analyses = {}
+        
+        # Find the most representative passage (centroid)
+        if len(indices) == 1:
+            centroid_idx = indices[0]
+        else:
+            # Calculate average similarity to all other passages in group
+            avg_similarities = []
+            for i in indices:
+                sim_sum = sum(self.calculate_semantic_similarity(passages[i], passages[j]) 
+                             for j in indices if i != j)
+                avg_similarities.append(sim_sum / (len(indices) - 1))
+            
+            centroid_idx = indices[np.argmax(avg_similarities)]
+        
+        # Use centroid as reference for the group
+        reference_text = passages[centroid_idx]
+        
+        # Analyze each passage in the group
+        for idx in indices:
+            if idx == centroid_idx:
+                # The centroid is considered the reference
+                group_analyses[idx] = {
+                    'is_hallucinated': False,
+                    'hallucination_score': 0.0,
+                    'severity': 'reference',
+                    'role': 'group_reference',
+                    'group_consistency': 1.0
+                }
+            else:
+                # Analyze against the group reference
+                analysis = self.analyze_passage_pair(reference_text, passages[idx])
+                analysis['role'] = 'group_member'
+                group_analyses[idx] = analysis
+        
+        return group_analyses
+    
+    def analyze_passage_pair(self, reference: str, candidate: str) -> Dict[str, Any]:
+        """Analyze a candidate passage against a reference"""
+        # Extract entities
+        ref_entities = self.extract_entities(reference)
+        cand_entities = self.extract_entities(candidate)
+        
+        # Calculate metrics
+        semantic_sim = self.calculate_semantic_similarity(reference, candidate)
+        entailment_scores = self.calculate_entailment(reference, candidate)
+        factual_consistency = self.calculate_factual_consistency(ref_entities, cand_entities)
+        
+        # Entropy
+        ref_entropy = self.calculate_entropy(reference)
+        cand_entropy = self.calculate_entropy(candidate)
+        entropy_divergence = abs(cand_entropy - ref_entropy) / (ref_entropy + 0.001)
+        
+        # Overall consistency
+        consistency_components = {
+            'semantic': semantic_sim,
+            'factual': factual_consistency['overall'],
+            'entailment': entailment_scores['entailment'],
+            'non_contradiction': 1.0 - entailment_scores['contradiction']
+        }
+        
+        weights = {'semantic': 0.3, 'factual': 0.3, 'entailment': 0.2, 'non_contradiction': 0.2}
+        overall_consistency = sum(consistency_components[k] * weights[k] for k in consistency_components)
+        
+        # Hallucination score
+        hallucination_score = 0.0
+        
+        if semantic_sim < 0.2:
+            hallucination_score += 0.3
+        else:
+            hallucination_score += (1 - semantic_sim) * 0.25
+        
+        if factual_consistency['contradictions'] > 0:
+            hallucination_score += 0.4
+        else:
+            hallucination_score += (1 - factual_consistency['overall']) * 0.2
+        
+        hallucination_score += entailment_scores['contradiction'] * 0.3
+        
+        if entropy_divergence > 0.5:
+            hallucination_score += min(entropy_divergence * 0.2, 0.2)
+        
+        # Determine severity
+        is_hallucinated = hallucination_score > self.hallucination_threshold
+        
+        if hallucination_score > 0.8:
+            severity = 'severe'
+        elif hallucination_score > 0.6:
+            severity = 'moderate'
+        elif hallucination_score > 0.4:
+            severity = 'minor'
+        else:
+            severity = 'none'
+        
+        return {
+            'is_hallucinated': is_hallucinated,
+            'hallucination_score': hallucination_score,
+            'severity': severity,
+            'group_consistency': overall_consistency,
+            'metrics': {
+                'semantic_similarity': semantic_sim,
+                'entailment': entailment_scores['entailment'],
+                'contradiction': entailment_scores['contradiction'],
+                'factual_consistency': factual_consistency['overall'],
+                'entropy': cand_entropy,
+                'entropy_divergence': entropy_divergence
+            }
+        }
+    
+    def build_grouped_graph(self, passages: List[str], groups: Dict[int, List[int]], 
+                           analyses: Dict[int, Dict]) -> nx.Graph:
+        """Build graph with semantic grouping"""
+        G = nx.Graph()
+        
+        # Assign colors to groups
+        group_colors = {}
+        for i, group_id in enumerate(groups.keys()):
+            # Use HSL to generate distinct colors
+            hue = i / len(groups)
+            rgb = colorsys.hls_to_rgb(hue, 0.6, 0.8)
+            group_colors[group_id] = '#{:02x}{:02x}{:02x}'.format(
+                int(rgb[0] * 255), int(rgb[1] * 255), int(rgb[2] * 255)
+            )
+        
+        # Add nodes
+        for group_id, indices in groups.items():
+            for idx in indices:
+                analysis = analyses.get(idx, {})
+                
+                # Determine node color based on hallucination status
+                if analysis.get('role') == 'group_reference':
+                    node_color = group_colors[group_id]
+                    border_color = '#000000'
+                    border_width = 4
+                elif analysis.get('is_hallucinated', False):
+                    # Hallucinated nodes get red tint
+                    severity = analysis.get('severity', 'none')
+                    if severity == 'severe':
+                        node_color = '#CC0000'
+                    elif severity == 'moderate':
+                        node_color = '#FF6666'
+                    elif severity == 'minor':
+                        node_color = '#FFAA00'
+                    else:
+                        node_color = group_colors[group_id]
+                    border_color = '#FF0000'
+                    border_width = 3
+                else:
+                    # Consistent nodes get group color
+                    node_color = group_colors[group_id]
+                    border_color = '#00CC00'
+                    border_width = 2
+                
+                G.add_node(idx,
+                          text=passages[idx][:200] + '...' if len(passages[idx]) > 200 else passages[idx],
+                          group=group_id,
+                          group_color=group_colors[group_id],
+                          node_color=node_color,
+                          border_color=border_color,
+                          border_width=border_width,
+                          is_hallucinated=analysis.get('is_hallucinated', False),
+                          severity=analysis.get('severity', 'unknown'),
+                          role=analysis.get('role', 'member'),
+                          hallucination_score=analysis.get('hallucination_score', 0),
+                          group_consistency=analysis.get('group_consistency', 0),
+                          metrics=analysis.get('metrics', {}))
+        
+        # Add edges within groups
+        for group_id, indices in groups.items():
+            for i in range(len(indices)):
+                for j in range(i + 1, len(indices)):
+                    idx1, idx2 = indices[i], indices[j]
+                    similarity = self.calculate_semantic_similarity(passages[idx1], passages[idx2])
+                    if similarity >= self.min_semantic_similarity:
+                        G.add_edge(idx1, idx2,
+                                  weight=similarity,
+                                  edge_type='within_group',
+                                  group=group_id)
+        
+        # Add edges between groups (weaker connections)
+        group_representatives = {}
+        for group_id, indices in groups.items():
+            # Find group representative (highest consistency or reference)
+            rep_idx = indices[0]
+            for idx in indices:
+                if analyses[idx].get('role') == 'group_reference':
+                    rep_idx = idx
+                    break
+            group_representatives[group_id] = rep_idx
+        
+        # Connect group representatives if similar enough
+        for g1, rep1 in group_representatives.items():
+            for g2, rep2 in group_representatives.items():
+                if g1 < g2:
+                    similarity = self.calculate_semantic_similarity(passages[rep1], passages[rep2])
+                    if similarity >= self.min_semantic_similarity:
+                        G.add_edge(rep1, rep2,
+                                  weight=similarity,
+                                  edge_type='between_groups',
+                                  group1=g1,
+                                  group2=g2)
+        
+        return G
+    
+    def create_visualization(self, G: nx.Graph, groups: Dict[int, List[int]], 
+                           output_path: str = "grouped_hallucination_analysis.html") -> str:
+        """Create visualization with semantic grouping"""
+        # Use force-directed layout with group clustering
+        pos = nx.spring_layout(G, k=3, iterations=50, seed=42)
+        
+        # Adjust positions to cluster groups
+        for group_id, indices in groups.items():
+            if len(indices) > 1:
+                # Calculate group center
+                group_pos = np.array([pos[idx] for idx in indices])
+                center = np.mean(group_pos, axis=0)
+                
+                # Move group nodes closer to center
+                for idx in indices:
+                    pos[idx] = 0.7 * pos[idx] + 0.3 * center
+        
+        # Prepare data
+        nodes_data = []
+        for node in G.nodes():
+            x, y = pos[node]
+            node_attrs = G.nodes[node]
+            
+            nodes_data.append({
+                'id': node,
+                'x': float(x * 500 + 600),
+                'y': float(y * 400 + 400),
+                'group': node_attrs['group'],
+                'color': node_attrs['node_color'],
+                'borderColor': node_attrs['border_color'],
+                'borderWidth': node_attrs['border_width'],
+                'size': 30 if node_attrs['role'] == 'group_reference' else 25,
+                'text': node_attrs['text'],
+                'is_hallucinated': node_attrs['is_hallucinated'],
+                'severity': node_attrs['severity'],
+                'role': node_attrs['role'],
+                'hallucination_score': node_attrs['hallucination_score'],
+                'group_consistency': node_attrs['group_consistency'],
+                'metrics': node_attrs['metrics']
+            })
+        
+        edges_data = []
+        for u, v, data in G.edges(data=True):
+            edges_data.append({
+                'source': u,
+                'target': v,
+                'weight': data['weight'],
+                'type': data['edge_type'],
+                'strokeDasharray': '5,5' if data['edge_type'] == 'between_groups' else 'none'
+            })
+        
+        # Group statistics
+        group_stats = {}
+        for group_id, indices in groups.items():
+            hallucinated_count = sum(1 for idx in indices if G.nodes[idx]['is_hallucinated'])
+            group_stats[group_id] = {
+                'size': len(indices),
+                'hallucinated': hallucinated_count,
+                'consistent': len(indices) - hallucinated_count
+            }
+        
+        html_content = f"""
+<!DOCTYPE html>
+<html>
+<head>
+    <title>Semantic Grouping - Hallucination Analysis</title>
+    <script src="https://d3js.org/d3.v7.min.js"></script>
+    <style>
+        body {{
+            font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+            margin: 0;
+            padding: 20px;
+            background: #f5f5f5;
+        }}
+        .container {{
+            max-width: 1600px;
+            margin: 0 auto;
+        }}
+        h1 {{
+            text-align: center;
+            color: #333;
+            margin-bottom: 10px;
+        }}
+        .subtitle {{
+            text-align: center;
+            color: #666;
+            margin-bottom: 30px;
+        }}
+        .main-grid {{
+            display: grid;
+            grid-template-columns: 300px 1fr;
+            gap: 20px;
+            margin-bottom: 30px;
+        }}
+        .sidebar {{
+            background: white;
+            padding: 20px;
+            border-radius: 8px;
+            box-shadow: 0 2px 4px rgba(0,0,0,0.1);
+            max-height: 800px;
+            overflow-y: auto;
+        }}
+        .group-card {{
+            margin-bottom: 15px;
+            padding: 15px;
+            border-radius: 6px;
+            border: 2px solid #ddd;
+        }}
+        .group-header {{
+            font-weight: bold;
+            margin-bottom: 10px;
+            display: flex;
+            align-items: center;
+            gap: 10px;
+        }}
+        .group-color-indicator {{
+            width: 20px;
+            height: 20px;
+            border-radius: 50%;
+            border: 2px solid #333;
+        }}
+        .group-stats {{
+            font-size: 13px;
+            color: #666;
+            display: grid;
+            gap: 5px;
+        }}
+        #graph-container {{
+            background: white;
+            border-radius: 8px;
+            box-shadow: 0 2px 4px rgba(0,0,0,0.1);
+            padding: 20px;
+        }}
+        .controls {{
+            text-align: center;
+            margin-bottom: 20px;
+        }}
+        button {{
+            background: #0066CC;
+            color: white;
+            border: none;
+            padding: 10px 20px;
+            border-radius: 5px;
+            margin: 0 5px;
+            cursor: pointer;
+            font-size: 14px;
+        }}
+        button:hover {{
+            background: #0052A3;
+        }}
+        .tooltip {{
+            position: absolute;
+            padding: 15px;
+            background: rgba(0, 0, 0, 0.95);
+            color: white;
+            border-radius: 8px;
+            pointer-events: none;
+            opacity: 0;
+            font-size: 13px;
+            line-height: 1.6;
+            max-width: 400px;
+            transition: opacity 0.3s;
+        }}
+        .legend {{
+            background: white;
+            padding: 20px;
+            border-radius: 8px;
+            box-shadow: 0 2px 4px rgba(0,0,0,0.1);
+            margin-bottom: 20px;
+        }}
+        .legend-item {{
+            display: inline-block;
+            margin-right: 20px;
+            margin-bottom: 10px;
+        }}
+        .node-symbol {{
+            display: inline-block;
+            width: 20px;
+            height: 20px;
+            border-radius: 50%;
+            margin-right: 8px;
+            vertical-align: middle;
+        }}
+        .metric-bar {{
+            display: inline-block;
+            width: 100px;
+            height: 8px;
+            background: #e0e0e0;
+            border-radius: 4px;
+            margin-left: 10px;
+            vertical-align: middle;
+        }}
+        .metric-fill {{
+            display: inline-block;
+            height: 100%;
+            background: #0066CC;
+            border-radius: 4px;
+        }}
+        .summary-grid {{
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(150px, 1fr));
+            gap: 15px;
+            margin-bottom: 20px;
+        }}
+        .summary-card {{
+            background: white;
+            padding: 20px;
+            border-radius: 8px;
+            box-shadow: 0 2px 4px rgba(0,0,0,0.1);
+            text-align: center;
+        }}
+        .summary-value {{
+            font-size: 32px;
+            font-weight: bold;
+            color: #0066CC;
+        }}
+        .summary-label {{
+            color: #666;
+            font-size: 14px;
+            margin-top: 5px;
+        }}
+    </style>
+</head>
+<body>
+    <div class="container">
+        <h1>Hallucination Detection with Semantic Grouping</h1>
+        <p class="subtitle">Passages are automatically grouped by semantic similarity. Hallucinations are marked within each group.</p>
+        
+        <div class="summary-grid">
+            <div class="summary-card">
+                <div class="summary-value">{len(nodes_data)}</div>
+                <div class="summary-label">Total Passages</div>
+            </div>
+            <div class="summary-card">
+                <div class="summary-value">{len(groups)}</div>
+                <div class="summary-label">Semantic Groups</div>
+            </div>
+            <div class="summary-card">
+                <div class="summary-value">{sum(1 for n in nodes_data if n['is_hallucinated'])}</div>
+                <div class="summary-label">Hallucinations</div>
+            </div>
+            <div class="summary-card">
+                <div class="summary-value">{G.number_of_edges()}</div>
+                <div class="summary-label">Connections</div>
+            </div>
+        </div>
+        
+        <div class="legend">
+            <div class="legend-item">
+                <span class="node-symbol" style="background: #666; border: 4px solid #000;"></span>
+                Group Reference (Centroid)
+            </div>
+            <div class="legend-item">
+                <span class="node-symbol" style="background: #666; border: 2px solid #00CC00;"></span>
+                Consistent with Group
+            </div>
+            <div class="legend-item">
+                <span class="node-symbol" style="background: #FF6666; border: 3px solid #FF0000;"></span>
+                Hallucinated
+            </div>
+            <div class="legend-item">
+                <span style="display: inline-block; width: 30px; height: 2px; background: #999; vertical-align: middle;"></span>
+                Within Group
+            </div>
+            <div class="legend-item">
+                <span style="display: inline-block; width: 30px; height: 2px; background: #999; border-top: 2px dashed #999; vertical-align: middle;"></span>
+                Between Groups
+            </div>
+        </div>
+        
+        <div class="main-grid">
+            <div class="sidebar">
+                <h3 style="margin-top: 0;">Semantic Groups</h3>
+                {self._generate_group_cards_html(groups, group_stats, {g: G.nodes[indices[0]]['group_color'] for g, indices in groups.items()})}
+            </div>
+            
+            <div id="graph-container">
+                <div class="controls">
+                    <button onclick="resetView()">Reset View</button>
+                    <button onclick="toggleLabels()">Toggle Labels</button>
+                    <button onclick="highlightHallucinations()">Highlight Hallucinations</button>
+                </div>
+                <svg id="graph" width="1200" height="800"></svg>
+            </div>
+        </div>
+        
+        <div class="tooltip"></div>
+    </div>
+    
+    <script>
+        const nodes = {json.dumps(nodes_data)};
+        const links = {json.dumps(edges_data)};
+        const groups = {json.dumps(groups)};
+        
+        const width = 1200;
+        const height = 800;
+        
+        const svg = d3.select("#graph");
+        const g = svg.append("g");
+        
+        // Zoom behavior
+        const zoom = d3.zoom()
+            .scaleExtent([0.1, 10])
+            .on("zoom", (event) => {{
+                g.attr("transform", event.transform);
+            }});
+        
+        svg.call(zoom);
+        
+        // Force simulation
+        const simulation = d3.forceSimulation(nodes)
+            .force("link", d3.forceLink(links).id(d => d.id).distance(150))
+            .force("charge", d3.forceManyBody().strength(-400))
+            .force("center", d3.forceCenter(width / 2, height / 2))
+            .force("collision", d3.forceCollide().radius(d => d.size + 10));
+        
+        // Group backgrounds
+        const groupBackgrounds = g.append("g").attr("class", "group-backgrounds");
+        
+        // Draw links
+        const link = g.append("g")
+            .selectAll("line")
+            .data(links)
+            .enter().append("line")
+            .attr("stroke", "#999")
+            .attr("stroke-opacity", 0.6)
+            .attr("stroke-width", d => 1 + d.weight * 4)
+            .attr("stroke-dasharray", d => d.strokeDasharray);
+        
+        // Draw nodes
+        const node = g.append("g")
+            .selectAll("circle")
+            .data(nodes)
+            .enter().append("circle")
+            .attr("r", d => d.size)
+            .attr("fill", d => d.color)
+            .attr("stroke", d => d.borderColor)
+            .attr("stroke-width", d => d.borderWidth)
+            .style("cursor", "pointer")
+            .call(d3.drag()
+                .on("start", dragstarted)
+                .on("drag", dragged)
+                .on("end", dragended));
+        
+        // Draw labels
+        const label = g.append("g")
+            .selectAll("text")
+            .data(nodes)
+            .enter().append("text")
+            .text((d, i) => `P${{i + 1}}`)
+            .attr("text-anchor", "middle")
+            .attr("dy", -35)
+            .style("font-weight", d => d.role === 'group_reference' ? "bold" : "normal")
+            .style("font-size", "14px");
+        
+        // Tooltip
+        const tooltip = d3.select(".tooltip");
+        
+        node.on("mouseover", function(event, d) {{
+            let html = `<strong>Passage ${{d.id + 1}} - Group ${{d.group + 1}}</strong><br>`;
+            html += `Role: ${{d.role.replace('_', ' ').toUpperCase()}}<br>`;
+            html += `Status: ${{d.is_hallucinated ? 'HALLUCINATED' : 'CONSISTENT'}}<br>`;
+            
+            if (d.severity !== 'reference') {{
+                html += `Severity: ${{d.severity.toUpperCase()}}<br>`;
+                html += `Hallucination Score: ${{(d.hallucination_score * 100).toFixed(1)}}%<br>`;
+                html += `Group Consistency: ${{(d.group_consistency * 100).toFixed(1)}}%<br><br>`;
+                
+                html += `<strong>Metrics:</strong><br>`;
+                if (d.metrics) {{
+                    Object.entries(d.metrics).forEach(([key, value]) => {{
+                        if (typeof value === 'number') {{
+                            html += `${{key.replace('_', ' ')}}: `;
+                            html += `<span class="metric-bar"><span class="metric-fill" style="width: ${{value * 100}}%"></span></span>`;
+                            html += ` ${{(value * 100).toFixed(1)}}%<br>`;
+                        }}
+                    }});
+                }}
+            }}
+            
+            html += `<br><strong>Text:</strong><br>${{d.text}}`;
+            
+            tooltip.html(html)
+                .style("left", (event.pageX + 10) + "px")
+                .style("top", (event.pageY - 10) + "px")
+                .style("opacity", 1);
+            
+            // Highlight group members
+            const groupMembers = new Set(groups[d.group]);
+            node.style("opacity", n => groupMembers.has(n.id) ? 1 : 0.3);
+            link.style("opacity", l => 
+                (groupMembers.has(l.source.id) && groupMembers.has(l.target.id)) ? 0.8 : 0.1
+            );
+        }})
+        .on("mouseout", function() {{
+            tooltip.style("opacity", 0);
+            node.style("opacity", 1);
+            link.style("opacity", 0.6);
+        }});
+        
+        // Update group backgrounds on tick
+        function updateGroupBackgrounds() {{
+            const groupData = Object.entries(groups).map(([groupId, members]) => {{
+                const positions = members.map(id => {{
+                    const node = nodes.find(n => n.id === id);
+                    return node ? [node.x, node.y] : null;
+                }}).filter(p => p !== null);
+                
+                if (positions.length === 0) return null;
+                
+                const xs = positions.map(p => p[0]);
+                const ys = positions.map(p => p[1]);
+                const padding = 50;
+                
+                return {{
+                    id: groupId,
+                    x: Math.min(...xs) - padding,
+                    y: Math.min(...ys) - padding,
+                    width: Math.max(...xs) - Math.min(...xs) + 2 * padding,
+                    height: Math.max(...ys) - Math.min(...ys) + 2 * padding,
+                    color: nodes.find(n => groups[groupId].includes(n.id))?.color || '#999'
+                }};
+            }}).filter(d => d !== null);
+            
+            const rects = groupBackgrounds.selectAll("rect")
+                .data(groupData, d => d.id);
+            
+            rects.enter()
+                .append("rect")
+                .attr("rx", 20)
+                .attr("ry", 20)
+                .attr("fill", d => d.color)
+                .attr("fill-opacity", 0.1)
+                .attr("stroke", d => d.color)
+                .attr("stroke-opacity", 0.3)
+                .attr("stroke-width", 2)
+                .merge(rects)
+                .attr("x", d => d.x)
+                .attr("y", d => d.y)
+                .attr("width", d => d.width)
+                .attr("height", d => d.height);
+            
+            rects.exit().remove();
+        }}
+        
+        // Simulation tick
+        simulation.on("tick", () => {{
+            updateGroupBackgrounds();
+            
+            link
+                .attr("x1", d => d.source.x)
+                .attr("y1", d => d.source.y)
+                .attr("x2", d => d.target.x)
+                .attr("y2", d => d.target.y);
+            
+            node
+                .attr("cx", d => d.x)
+                .attr("cy", d => d.y);
+            
+            label
+                .attr("x", d => d.x)
+                .attr("y", d => d.y);
+        }});
+        
+        // Drag functions
+        function dragstarted(event, d) {{
+            if (!event.active) simulation.alphaTarget(0.3).restart();
+            d.fx = d.x;
+            d.fy = d.y;
+        }}
+        
+        function dragged(event, d) {{
+            d.fx = event.x;
+            d.fy = event.y;
+        }}
+        
+        function dragended(event, d) {{
+            if (!event.active) simulation.alphaTarget(0);
+            d.fx = null;
+            d.fy = null;
+        }}
+        
+        // Control functions
+        function resetView() {{
+            svg.transition().duration(750).call(
+                zoom.transform,
+                d3.zoomIdentity
+            );
+            simulation.alpha(1).restart();
+        }}
+        
+        let labelsVisible = true;
+        function toggleLabels() {{
+            labelsVisible = !labelsVisible;
+            label.style("display", labelsVisible ? "block" : "none");
+        }}
+        
+        function highlightHallucinations() {{
+            node.style("opacity", d => d.is_hallucinated ? 1 : 0.3);
+            link.style("opacity", 0.1);
+        }}
+        
+        // Group card interactions
+        function highlightGroup(groupId) {{
+            const groupMembers = new Set(groups[groupId]);
+            node.style("opacity", n => groupMembers.has(n.id) ? 1 : 0.3);
+            link.style("opacity", l => 
+                (groupMembers.has(l.source.id) && groupMembers.has(l.target.id)) ? 0.8 : 0.1
+            );
+        }}
+        
+        function resetHighlight() {{
+            node.style("opacity", 1);
+            link.style("opacity", 0.6);
+        }}
+    </script>
+</body>
+</html>
+"""
+        
+        with open(output_path, 'w', encoding='utf-8') as f:
+            f.write(html_content)
+        
+        return output_path
+    
+    def _generate_group_cards_html(self, groups: Dict[int, List[int]], 
+                                  group_stats: Dict[int, Dict],
+                                  group_colors: Dict[int, str]) -> str:
+        """Generate HTML for group cards in sidebar"""
+        html = ""
+        for group_id in sorted(groups.keys()):
+            stats = group_stats[group_id]
+            color = group_colors[group_id]
+            
+            html += f"""
+            <div class="group-card" onmouseover="highlightGroup({group_id})" onmouseout="resetHighlight()">
+                <div class="group-header">
+                    <div class="group-color-indicator" style="background: {color};"></div>
+                    <span>Group {group_id + 1}</span>
+                </div>
+                <div class="group-stats">
+                    <div>Total passages: {stats['size']}</div>
+                    <div>Consistent: {stats['consistent']}</div>
+                    <div>Hallucinated: {stats['hallucinated']}</div>
+                </div>
+            </div>
+            """
+        
+        return html
+    
+    def analyze(self, passages: List[str], output_dir: str = ".") -> Dict[str, Any]:
+        """Analyze multiple passages with semantic grouping"""
+        print("\n" + "="*70)
+        print("HALLUCINATION DETECTION WITH SEMANTIC GROUPING")
+        print("="*70)
+        
+        # Group passages by semantic similarity
+        print("\nGrouping passages by semantic similarity...")
+        groups = self.group_passages(passages)
+        print(f"Found {len(groups)} semantic groups")
+        
+        # Analyze within each group
+        all_analyses = {}
+        for group_id, indices in groups.items():
+            print(f"\nAnalyzing Group {group_id + 1} ({len(indices)} passages)...")
+            group_analyses = self.analyze_within_group(passages, indices)
+            all_analyses.update(group_analyses)
+            
+            # Print group summary
+            hallucinated = sum(1 for a in group_analyses.values() if a['is_hallucinated'])
+            print(f"  - Hallucinated: {hallucinated}/{len(indices)}")
+            print(f"  - Group reference: Passage {indices[0] + 1}")
+        
+        # Build graph
+        print("\nBuilding grouped visualization...")
+        G = self.build_grouped_graph(passages, groups, all_analyses)
+        
+        # Create visualization
+        viz_path = os.path.join(output_dir, "grouped_hallucination_analysis.html")
+        self.create_visualization(G, groups, viz_path)
+        
+        # Overall statistics
+        total_hallucinated = sum(1 for a in all_analyses.values() if a['is_hallucinated'])
+        avg_consistency = sum(a.get('group_consistency', 0) for a in all_analyses.values()) / len(all_analyses)
+        
+        print("\n" + "-"*70)
+        print("SUMMARY")
+        print("-"*70)
+        print(f"Total passages: {len(passages)}")
+        print(f"Semantic groups: {len(groups)}")
+        print(f"Hallucinated passages: {total_hallucinated}")
+        print(f"Average consistency: {avg_consistency:.2%}")
+        
+        print(f"\nVisualization saved to: {viz_path}")
+        print("Opening in browser...")
+        
+        try:
+            webbrowser.open(f'file://{os.path.abspath(viz_path)}')
+        except:
+            print("Please open the HTML file manually")
+        
+        return {
+            'groups': groups,
+            'analyses': all_analyses,
+            'graph': G,
+            'visualization_path': viz_path,
+            'statistics': {
+                'total_passages': len(passages),
+                'num_groups': len(groups),
+                'hallucinated': total_hallucinated,
+                'avg_consistency': avg_consistency
+            }
+        }
+
+
+if __name__ == "__main__":
+    # Example with multiple consistent passages
+    detector = SemanticGroupingHallucinationDetector()
+    
+    # Multiple passages that should form semantic groups
+    passages = [
+        # Group 1: Financial performance
+        """The company reported revenue of $2.5 million in Q4 2023, with a 15% increase from the previous quarter. 
+        The profit margin improved to 22% due to cost optimization strategies.""",
+        
+        """Q4 2023 revenue reached $2.5 million, marking 15% quarterly growth. 
+        Profit margins rose to 22% through cost optimization.""",
+        
+        """The company earned $3.2 million in Q4 2023, showing 20% growth. 
+        Profit margins reached 25% after implementing cost controls.""",  # Hallucination
+        
+        # Group 2: Expansion plans
+        """CEO John Smith announced expansion plans on January 15, 2024, targeting the Asian market. 
+        The company plans to open offices in Tokyo and Singapore.""",
+        
+        """John Smith revealed Asian market expansion on January 15, 2024. 
+        New offices will be established in Tokyo and Singapore.""",
+        
+        """The CEO announced European expansion on January 20, 2024. 
+        Plans include offices in London and Berlin.""",  # Different facts
+        
+        # Group 3: Employee matters
+        """Employee satisfaction scores reached 85% in the annual survey. 
+        The company has 500 employees across all departments.""",
+        
+        """Annual survey shows 85% employee satisfaction. 
+        Total workforce stands at 500 employees.""",
+        
+        """Employee satisfaction dropped to 65% this year. 
+        The company now has 450 employees after layoffs.""",  # Contradictions
+        
+        # Group 4: Unrelated content
+        """The weather forecast shows sunny skies for the next week. 
+        Temperature will reach 75 degrees Fahrenheit.""",
+        
+        """Weather conditions remain favorable with sunshine expected. 
+        Temperatures around 75°F predicted for the week."""
+    ]
+    
+    results = detector.analyze(passages)
