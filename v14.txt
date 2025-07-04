@@ -441,20 +441,24 @@ class ComprehensiveHallucinationDetector:
         
         # Add candidate nodes
         for analysis in analyses:
-            # Get analysis dict but remove fields we're setting explicitly
-            analysis_dict = analysis.to_dict()
-            # Remove fields that we're setting explicitly to avoid duplicates
-            fields_to_remove = ['text', 'is_hallucinated', 'severity', 'paragraph_id']
-            for field in fields_to_remove:
-                analysis_dict.pop(field, None)
+            # Calculate consistency
+            consistency = sum(analysis.consistency_breakdown.values()) / len(analysis.consistency_breakdown)
             
+            # Add node with explicit attributes
             G.add_node(analysis.paragraph_id,
                       text=analysis.text[:200] + '...' if len(analysis.text) > 200 else analysis.text,
                       is_reference=False,
                       is_hallucinated=analysis.is_hallucinated,
                       severity=analysis.severity,
-                      consistency=sum(analysis.consistency_breakdown.values()) / len(analysis.consistency_breakdown),
-                      **analysis_dict)
+                      consistency=consistency,
+                      hallucination_score=analysis.hallucination_score,
+                      semantic_similarity=analysis.semantic_similarity,
+                      entailment_score=analysis.entailment_score,
+                      contradiction_score=analysis.contradiction_score,
+                      factual_consistency=analysis.factual_consistency,
+                      entropy=analysis.entropy,
+                      entropy_divergence=analysis.entropy_divergence,
+                      entity_overlap=analysis.entity_overlap)
         
         # Add edges only between semantically coherent paragraphs
         all_texts = [reference] + [a.text for a in analyses]
