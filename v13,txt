@@ -1,0 +1,1313 @@
+"""
+Local Fool-Proof Hallucination Detection System
+==============================================
+Advanced hallucination detection without requiring external API tokens.
+Uses only locally available models and sophisticated rule-based analysis.
+"""
+
+import numpy as np
+from typing import List, Dict, Tuple, Set, Optional, Union
+import re
+import networkx as nx
+from sklearn.metrics.pairwise import cosine_similarity
+from sklearn.feature_extraction.text import TfidfVectorizer
+from sklearn.decomposition import TruncatedSVD
+import nltk
+from nltk.tokenize import sent_tokenize, word_tokenize
+from nltk.corpus import wordnet
+from nltk.chunk import ne_chunk
+from nltk.tag import pos_tag
+from collections import defaultdict, Counter
+import warnings
+from scipy.stats import entropy
+from scipy.spatial.distance import cosine
+import webbrowser
+import os
+import json
+from dataclasses import dataclass, field
+from enum import Enum
+from difflib import SequenceMatcher
+import hashlib
+from datetime import datetime
+import string
+
+warnings.filterwarnings('ignore')
+
+# Download required NLTK data
+for resource in ['punkt', 'stopwords', 'averaged_perceptron_tagger', 
+                 'maxent_ne_chunker', 'words', 'wordnet', 'vader_lexicon']:
+    try:
+        nltk.data.find(f'tokenizers/{resource}')
+    except LookupError:
+        print(f"Downloading {resource}...")
+        nltk.download(resource, quiet=True)
+
+
+class FactType(Enum):
+    """Types of facts that can be extracted"""
+    QUANTITATIVE = "quantitative"
+    TEMPORAL = "temporal"
+    ENTITY_RELATION = "entity_relation"
+    DESCRIPTIVE = "descriptive"
+    CAUSAL = "causal"
+
+
+class VerificationStatus(Enum):
+    """Verification status for facts"""
+    VERIFIED = "verified"
+    CONTRADICTED = "contradicted"
+    UNSUPPORTED = "unsupported"
+    CONSISTENT = "consistent"
+    PARTIAL = "partial"
+
+
+@dataclass
+class ExtractedFact:
+    """Represents an extracted fact with all relevant information"""
+    text: str
+    fact_type: FactType
+    subject: Optional[str] = None
+    predicate: Optional[str] = None
+    object: Optional[str] = None
+    value: Optional[Union[str, float]] = None
+    normalized_value: Optional[Union[str, float]] = None
+    modifiers: List[str] = field(default_factory=list)
+    context: str = ""
+    confidence: float = 1.0
+    sentence_idx: int = 0
+    char_span: Tuple[int, int] = (0, 0)
+    
+    def __hash__(self):
+        """Make fact hashable for set operations"""
+        return hash((self.text, self.fact_type.value, self.normalized_value))
+
+
+@dataclass
+class FactComparison:
+    """Result of comparing two facts"""
+    similarity_score: float
+    is_contradicting: bool
+    is_supporting: bool
+    explanation: str
+    comparison_type: str  # 'identical', 'similar', 'related', 'contradicting', 'unrelated'
+
+
+@dataclass
+class HallucinationResult:
+    """Complete hallucination analysis result"""
+    is_hallucinated: bool
+    confidence: float
+    severity: str  # 'none', 'minor', 'moderate', 'severe'
+    fact_verification: Dict[str, List[ExtractedFact]]  # verified, contradicted, unsupported
+    consistency_score: float
+    specificity_score: float
+    explanation: str
+    detailed_analysis: Dict[str, any]
+
+
+class LocalHallucinationDetector:
+    """Advanced hallucination detection using only local resources"""
+    
+    def __init__(self):
+        """Initialize with local models and resources"""
+        print("Initializing Local Hallucination Detector...")
+        
+        # TF-IDF for semantic similarity
+        self.tfidf_vectorizer = TfidfVectorizer(
+            max_features=5000,
+            ngram_range=(1, 3),
+            stop_words='english',
+            min_df=1
+        )
+        
+        # LSA for dimensionality reduction
+        self.lsa = TruncatedSVD(n_components=100)
+        
+        # Entity extraction patterns
+        self.patterns = self._compile_patterns()
+        
+        # Stopwords for filtering
+        self.stopwords = set(nltk.corpus.stopwords.words('english'))
+        
+        # Sentiment analyzer for tone consistency
+        from nltk.sentiment import SentimentIntensityAnalyzer
+        self.sia = SentimentIntensityAnalyzer()
+        
+        print("Initialization complete!")
+    
+    def _compile_patterns(self) -> Dict[str, List[re.Pattern]]:
+        """Compile regex patterns for fact extraction"""
+        patterns = {
+            'money': [
+                re.compile(r'\$[\d,]+\.?\d*\s*(?:million|billion|thousand|M|B|K)?', re.I),
+                re.compile(r'[\d,]+\.?\d*\s*(?:dollars|USD|euros|EUR|pounds|GBP)', re.I),
+            ],
+            'percentage': [
+                re.compile(r'\b\d+\.?\d*\s*(?:%|percent|percentage)', re.I),
+                re.compile(r'(?:increase|decrease|growth|decline|rise|fall).*?\b\d+\.?\d*\s*(?:%|percent)?', re.I),
+            ],
+            'date': [
+                re.compile(r'\b(?:Q[1-4]\s*\d{4})\b', re.I),
+                re.compile(r'\b(?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)[a-z]*\.?\s*\d{1,2},?\s*\d{4}\b', re.I),
+                re.compile(r'\b\d{1,2}[-/]\d{1,2}[-/]\d{2,4}\b'),
+                re.compile(r'\b(?:January|February|March|April|May|June|July|August|September|October|November|December)\s*\d{1,2},?\s*\d{4}\b', re.I),
+            ],
+            'quantity': [
+                re.compile(r'\b\d+\s*(?:employees?|customers?|users?|units?|items?|products?|people|staff|personnel)\b', re.I),
+            ],
+            'ordinal': [
+                re.compile(r'\b(?:first|second|third|fourth|fifth|\d+(?:st|nd|rd|th))\b', re.I),
+            ]
+        }
+        return patterns
+    
+    def extract_facts(self, text: str) -> List[ExtractedFact]:
+        """Extract all verifiable facts from text"""
+        facts = []
+        sentences = sent_tokenize(text)
+        
+        for sent_idx, sentence in enumerate(sentences):
+            # Extract quantitative facts
+            facts.extend(self._extract_quantitative_facts(sentence, sent_idx))
+            
+            # Extract entity relations
+            facts.extend(self._extract_entity_relations(sentence, sent_idx))
+            
+            # Extract temporal facts
+            facts.extend(self._extract_temporal_facts(sentence, sent_idx))
+            
+            # Extract causal relations
+            facts.extend(self._extract_causal_relations(sentence, sent_idx))
+        
+        return facts
+    
+    def _extract_quantitative_facts(self, sentence: str, sent_idx: int) -> List[ExtractedFact]:
+        """Extract facts containing numbers, money, percentages"""
+        facts = []
+        
+        # Money facts
+        for pattern in self.patterns['money']:
+            for match in pattern.finditer(sentence):
+                value = self._normalize_money(match.group())
+                context = self._get_context(sentence, match.span())
+                
+                fact = ExtractedFact(
+                    text=match.group(),
+                    fact_type=FactType.QUANTITATIVE,
+                    value=match.group(),
+                    normalized_value=value,
+                    context=context,
+                    sentence_idx=sent_idx,
+                    char_span=match.span()
+                )
+                
+                # Extract subject and predicate
+                self._extract_fact_components(sentence, fact)
+                facts.append(fact)
+        
+        # Percentage facts
+        for pattern in self.patterns['percentage']:
+            for match in pattern.finditer(sentence):
+                value = self._normalize_percentage(match.group())
+                context = self._get_context(sentence, match.span())
+                
+                fact = ExtractedFact(
+                    text=match.group(),
+                    fact_type=FactType.QUANTITATIVE,
+                    value=match.group(),
+                    normalized_value=value,
+                    context=context,
+                    sentence_idx=sent_idx,
+                    char_span=match.span()
+                )
+                
+                self._extract_fact_components(sentence, fact)
+                facts.append(fact)
+        
+        # Quantity facts
+        for pattern in self.patterns['quantity']:
+            for match in pattern.finditer(sentence):
+                value = self._normalize_quantity(match.group())
+                context = self._get_context(sentence, match.span())
+                
+                fact = ExtractedFact(
+                    text=match.group(),
+                    fact_type=FactType.QUANTITATIVE,
+                    value=match.group(),
+                    normalized_value=value,
+                    context=context,
+                    sentence_idx=sent_idx,
+                    char_span=match.span()
+                )
+                
+                self._extract_fact_components(sentence, fact)
+                facts.append(fact)
+        
+        return facts
+    
+    def _extract_entity_relations(self, sentence: str, sent_idx: int) -> List[ExtractedFact]:
+        """Extract entity relationships using POS tagging and chunking"""
+        facts = []
+        
+        # Tokenize and POS tag
+        tokens = word_tokenize(sentence)
+        pos_tags = pos_tag(tokens)
+        
+        # Extract named entities
+        chunks = ne_chunk(pos_tags, binary=False)
+        entities = []
+        
+        for chunk in chunks:
+            if hasattr(chunk, 'label'):
+                entity_text = ' '.join([token for token, pos in chunk])
+                entities.append((entity_text, chunk.label()))
+        
+        # Look for verb phrases connecting entities
+        for i, (token, pos) in enumerate(pos_tags):
+            if pos.startswith('VB'):  # Verb
+                # Look for subject before verb
+                subject = self._find_subject(pos_tags, i)
+                # Look for object after verb
+                obj = self._find_object(pos_tags, i)
+                
+                if subject and obj:
+                    fact = ExtractedFact(
+                        text=f"{subject} {token} {obj}",
+                        fact_type=FactType.ENTITY_RELATION,
+                        subject=subject,
+                        predicate=token,
+                        object=obj,
+                        context=sentence,
+                        sentence_idx=sent_idx
+                    )
+                    facts.append(fact)
+        
+        return facts
+    
+    def _extract_temporal_facts(self, sentence: str, sent_idx: int) -> List[ExtractedFact]:
+        """Extract temporal facts (dates, time periods)"""
+        facts = []
+        
+        for pattern in self.patterns['date']:
+            for match in pattern.finditer(sentence):
+                normalized = self._normalize_date(match.group())
+                context = self._get_context(sentence, match.span())
+                
+                fact = ExtractedFact(
+                    text=match.group(),
+                    fact_type=FactType.TEMPORAL,
+                    value=match.group(),
+                    normalized_value=normalized,
+                    context=context,
+                    sentence_idx=sent_idx,
+                    char_span=match.span()
+                )
+                
+                self._extract_fact_components(sentence, fact)
+                facts.append(fact)
+        
+        return facts
+    
+    def _extract_causal_relations(self, sentence: str, sent_idx: int) -> List[ExtractedFact]:
+        """Extract causal relationships"""
+        facts = []
+        
+        # Causal indicators
+        causal_patterns = [
+            r'(?:because|due to|as a result of|caused by|led to|resulted in)',
+            r'(?:therefore|thus|hence|consequently|so)',
+            r'(?:if.*then|when.*then)'
+        ]
+        
+        for pattern in causal_patterns:
+            if re.search(pattern, sentence, re.I):
+                # Split sentence around causal indicator
+                parts = re.split(pattern, sentence, flags=re.I)
+                if len(parts) >= 2:
+                    cause = parts[0].strip()
+                    effect = parts[1].strip() if len(parts) > 1 else ""
+                    
+                    fact = ExtractedFact(
+                        text=sentence,
+                        fact_type=FactType.CAUSAL,
+                        subject=cause,
+                        predicate="causes",
+                        object=effect,
+                        context=sentence,
+                        sentence_idx=sent_idx
+                    )
+                    facts.append(fact)
+        
+        return facts
+    
+    def _normalize_money(self, money_str: str) -> float:
+        """Normalize money values"""
+        try:
+            # Remove currency symbols and commas
+            clean = re.sub(r'[$,]', '', money_str)
+            
+            # Extract number
+            number_match = re.search(r'[\d.]+', clean)
+            if not number_match:
+                return 0.0
+            
+            value = float(number_match.group())
+            
+            # Apply multipliers
+            if re.search(r'(?:million|M)\b', money_str, re.I):
+                value *= 1_000_000
+            elif re.search(r'(?:billion|B)\b', money_str, re.I):
+                value *= 1_000_000_000
+            elif re.search(r'(?:thousand|K)\b', money_str, re.I):
+                value *= 1_000
+            
+            return value
+        except:
+            return 0.0
+    
+    def _normalize_percentage(self, pct_str: str) -> float:
+        """Normalize percentage values"""
+        try:
+            number_match = re.search(r'[\d.]+', pct_str)
+            if number_match:
+                return float(number_match.group())
+            return 0.0
+        except:
+            return 0.0
+    
+    def _normalize_quantity(self, qty_str: str) -> float:
+        """Normalize quantities"""
+        try:
+            number_match = re.search(r'[\d,]+', qty_str)
+            if number_match:
+                return float(number_match.group().replace(',', ''))
+            return 0.0
+        except:
+            return 0.0
+    
+    def _normalize_date(self, date_str: str) -> str:
+        """Normalize dates to standard format"""
+        # Handle quarters
+        quarter_match = re.match(r'Q(\d)\s*(\d{4})', date_str, re.I)
+        if quarter_match:
+            quarter = quarter_match.group(1)
+            year = quarter_match.group(2)
+            return f"{year}-Q{quarter}"
+        
+        # Month mapping
+        months = {
+            'jan': '01', 'january': '01', 'feb': '02', 'february': '02',
+            'mar': '03', 'march': '03', 'apr': '04', 'april': '04',
+            'may': '05', 'jun': '06', 'june': '06', 'jul': '07',
+            'july': '07', 'aug': '08', 'august': '08', 'sep': '09',
+            'september': '09', 'oct': '10', 'october': '10', 'nov': '11',
+            'november': '11', 'dec': '12', 'december': '12'
+        }
+        
+        # Try to parse month day, year format
+        date_lower = date_str.lower()
+        for month_name, month_num in months.items():
+            if month_name in date_lower:
+                # Extract day and year
+                day_year = re.search(r'(\d{1,2}),?\s*(\d{4})', date_str)
+                if day_year:
+                    day = day_year.group(1).zfill(2)
+                    year = day_year.group(2)
+                    return f"{year}-{month_num}-{day}"
+        
+        # Return as-is if can't parse
+        return date_str.lower()
+    
+    def _get_context(self, sentence: str, span: Tuple[int, int], window: int = 50) -> str:
+        """Get context around a span"""
+        start = max(0, span[0] - window)
+        end = min(len(sentence), span[1] + window)
+        return sentence[start:end]
+    
+    def _extract_fact_components(self, sentence: str, fact: ExtractedFact):
+        """Extract subject, predicate, object for a fact"""
+        # Simple approach using position and POS tags
+        tokens = word_tokenize(sentence)
+        pos_tags = pos_tag(tokens)
+        
+        # Find fact position in tokens
+        fact_start = sentence.find(fact.text)
+        if fact_start == -1:
+            return
+        
+        # Find tokens before and after fact
+        before_fact = sentence[:fact_start].strip()
+        after_fact = sentence[fact_start + len(fact.text):].strip()
+        
+        # Extract subject (usually before the fact)
+        if before_fact:
+            before_tokens = word_tokenize(before_fact)
+            before_pos = pos_tag(before_tokens)
+            
+            # Look for noun phrases
+            for i in range(len(before_pos) - 1, -1, -1):
+                token, pos = before_pos[i]
+                if pos.startswith('NN') or pos.startswith('PRP'):
+                    # Collect noun phrase
+                    noun_phrase = []
+                    j = i
+                    while j >= 0 and (before_pos[j][1].startswith('NN') or 
+                                    before_pos[j][1].startswith('JJ') or
+                                    before_pos[j][1].startswith('DT')):
+                        noun_phrase.insert(0, before_pos[j][0])
+                        j -= 1
+                    if noun_phrase:
+                        fact.subject = ' '.join(noun_phrase)
+                        break
+        
+        # Extract predicate (usually a verb near the fact)
+        for token, pos in pos_tags:
+            if pos.startswith('VB'):
+                if token.lower() not in ['is', 'was', 'were', 'are', 'been', 'be']:
+                    fact.predicate = token
+                    break
+    
+    def _find_subject(self, pos_tags: List[Tuple[str, str]], verb_idx: int) -> Optional[str]:
+        """Find subject before a verb"""
+        # Look backwards for noun phrase
+        for i in range(verb_idx - 1, -1, -1):
+            token, pos = pos_tags[i]
+            if pos.startswith('NN') or pos.startswith('PRP'):
+                # Collect full noun phrase
+                noun_phrase = [token]
+                j = i - 1
+                while j >= 0 and (pos_tags[j][1].startswith('JJ') or 
+                                pos_tags[j][1].startswith('DT')):
+                    noun_phrase.insert(0, pos_tags[j][0])
+                    j -= 1
+                return ' '.join(noun_phrase)
+        return None
+    
+    def _find_object(self, pos_tags: List[Tuple[str, str]], verb_idx: int) -> Optional[str]:
+        """Find object after a verb"""
+        # Look forward for noun phrase
+        for i in range(verb_idx + 1, len(pos_tags)):
+            token, pos = pos_tags[i]
+            if pos.startswith('NN'):
+                # Collect full noun phrase
+                noun_phrase = []
+                j = i
+                while j < len(pos_tags) and (pos_tags[j][1].startswith('NN') or 
+                                           pos_tags[j][1].startswith('JJ')):
+                    noun_phrase.append(pos_tags[j][0])
+                    j += 1
+                return ' '.join(noun_phrase)
+        return None
+    
+    def compare_facts(self, fact1: ExtractedFact, fact2: ExtractedFact) -> FactComparison:
+        """Compare two facts to determine their relationship"""
+        # Same type comparison
+        if fact1.fact_type != fact2.fact_type:
+            # Different types - check if they're related
+            context_sim = self._semantic_similarity(fact1.context, fact2.context)
+            return FactComparison(
+                similarity_score=context_sim,
+                is_contradicting=False,
+                is_supporting=False,
+                explanation="Different fact types",
+                comparison_type='unrelated' if context_sim < 0.3 else 'related'
+            )
+        
+        # Quantitative comparison
+        if fact1.fact_type == FactType.QUANTITATIVE:
+            return self._compare_quantitative_facts(fact1, fact2)
+        
+        # Temporal comparison
+        elif fact1.fact_type == FactType.TEMPORAL:
+            return self._compare_temporal_facts(fact1, fact2)
+        
+        # Entity relation comparison
+        elif fact1.fact_type == FactType.ENTITY_RELATION:
+            return self._compare_entity_relations(fact1, fact2)
+        
+        # Default comparison
+        else:
+            text_sim = self._semantic_similarity(fact1.text, fact2.text)
+            return FactComparison(
+                similarity_score=text_sim,
+                is_contradicting=False,
+                is_supporting=text_sim > 0.8,
+                explanation="Text similarity comparison",
+                comparison_type='similar' if text_sim > 0.7 else 'unrelated'
+            )
+    
+    def _compare_quantitative_facts(self, fact1: ExtractedFact, fact2: ExtractedFact) -> FactComparison:
+        """Compare quantitative facts"""
+        # Check if they're about the same thing
+        context_sim = self._semantic_similarity(fact1.context, fact2.context)
+        
+        if context_sim < 0.6:
+            # Different contexts - not comparable
+            return FactComparison(
+                similarity_score=context_sim,
+                is_contradicting=False,
+                is_supporting=False,
+                explanation="Different contexts",
+                comparison_type='unrelated'
+            )
+        
+        # Same context - compare values
+        if fact1.normalized_value == fact2.normalized_value:
+            return FactComparison(
+                similarity_score=1.0,
+                is_contradicting=False,
+                is_supporting=True,
+                explanation="Identical values",
+                comparison_type='identical'
+            )
+        else:
+            # Different values for same context = contradiction
+            return FactComparison(
+                similarity_score=context_sim,
+                is_contradicting=True,
+                is_supporting=False,
+                explanation=f"Conflicting values: {fact1.normalized_value} vs {fact2.normalized_value}",
+                comparison_type='contradicting'
+            )
+    
+    def _compare_temporal_facts(self, fact1: ExtractedFact, fact2: ExtractedFact) -> FactComparison:
+        """Compare temporal facts"""
+        if fact1.normalized_value == fact2.normalized_value:
+            return FactComparison(
+                similarity_score=1.0,
+                is_contradicting=False,
+                is_supporting=True,
+                explanation="Same date/time",
+                comparison_type='identical'
+            )
+        
+        # Check if discussing same event
+        context_sim = self._semantic_similarity(fact1.context, fact2.context)
+        if context_sim > 0.7:
+            # Same event, different dates = contradiction
+            return FactComparison(
+                similarity_score=context_sim,
+                is_contradicting=True,
+                is_supporting=False,
+                explanation=f"Different dates for same event: {fact1.normalized_value} vs {fact2.normalized_value}",
+                comparison_type='contradicting'
+            )
+        
+        return FactComparison(
+            similarity_score=context_sim,
+            is_contradicting=False,
+            is_supporting=False,
+            explanation="Different temporal references",
+            comparison_type='related' if context_sim > 0.5 else 'unrelated'
+        )
+    
+    def _compare_entity_relations(self, fact1: ExtractedFact, fact2: ExtractedFact) -> FactComparison:
+        """Compare entity relationships"""
+        # Compare subjects
+        subject_sim = self._semantic_similarity(
+            fact1.subject or "", fact2.subject or ""
+        ) if fact1.subject and fact2.subject else 0
+        
+        # Compare predicates
+        predicate_sim = self._semantic_similarity(
+            fact1.predicate or "", fact2.predicate or ""
+        ) if fact1.predicate and fact2.predicate else 0
+        
+        # Compare objects
+        object_sim = self._semantic_similarity(
+            fact1.object or "", fact2.object or ""
+        ) if fact1.object and fact2.object else 0
+        
+        # Overall similarity
+        overall_sim = (subject_sim + predicate_sim + object_sim) / 3
+        
+        # Check for contradiction
+        if subject_sim > 0.8 and predicate_sim > 0.7 and object_sim < 0.3:
+            # Same subject and predicate but different object = contradiction
+            return FactComparison(
+                similarity_score=overall_sim,
+                is_contradicting=True,
+                is_supporting=False,
+                explanation=f"Conflicting relations: {fact1.subject} {fact1.predicate} different objects",
+                comparison_type='contradicting'
+            )
+        
+        # Check for support
+        if overall_sim > 0.8:
+            return FactComparison(
+                similarity_score=overall_sim,
+                is_contradicting=False,
+                is_supporting=True,
+                explanation="Matching entity relationship",
+                comparison_type='identical' if overall_sim > 0.95 else 'similar'
+            )
+        
+        return FactComparison(
+            similarity_score=overall_sim,
+            is_contradicting=False,
+            is_supporting=False,
+            explanation="Different entity relationships",
+            comparison_type='related' if overall_sim > 0.5 else 'unrelated'
+        )
+    
+    def _semantic_similarity(self, text1: str, text2: str) -> float:
+        """Calculate semantic similarity using TF-IDF and word overlap"""
+        if not text1 or not text2:
+            return 0.0
+        
+        # For very short texts, use word overlap
+        if len(text1.split()) < 3 or len(text2.split()) < 3:
+            words1 = set(text1.lower().split())
+            words2 = set(text2.lower().split())
+            if not words1 or not words2:
+                return 0.0
+            jaccard = len(words1 & words2) / len(words1 | words2)
+            return jaccard
+        
+        try:
+            # TF-IDF similarity
+            tfidf_matrix = self.tfidf_vectorizer.fit_transform([text1, text2])
+            similarity = cosine_similarity(tfidf_matrix[0:1], tfidf_matrix[1:2])[0][0]
+            
+            # Also consider word overlap for robustness
+            words1 = set(word_tokenize(text1.lower())) - self.stopwords
+            words2 = set(word_tokenize(text2.lower())) - self.stopwords
+            word_overlap = len(words1 & words2) / max(len(words1), len(words2)) if words1 or words2 else 0
+            
+            # Weighted combination
+            return 0.7 * similarity + 0.3 * word_overlap
+            
+        except:
+            return 0.0
+    
+    def verify_facts(self, candidate_facts: List[ExtractedFact], 
+                    reference_facts: List[ExtractedFact]) -> Dict[str, List[ExtractedFact]]:
+        """Verify candidate facts against reference facts"""
+        verified = []
+        contradicted = []
+        unsupported = []
+        
+        for cand_fact in candidate_facts:
+            best_match = None
+            best_score = 0
+            is_contradicted = False
+            
+            for ref_fact in reference_facts:
+                comparison = self.compare_facts(cand_fact, ref_fact)
+                
+                if comparison.is_contradicting:
+                    is_contradicted = True
+                    contradicted.append(cand_fact)
+                    break
+                
+                if comparison.similarity_score > best_score:
+                    best_score = comparison.similarity_score
+                    best_match = comparison
+            
+            if not is_contradicted:
+                if best_match and best_match.is_supporting:
+                    verified.append(cand_fact)
+                else:
+                    unsupported.append(cand_fact)
+        
+        return {
+            'verified': verified,
+            'contradicted': contradicted,
+            'unsupported': unsupported
+        }
+    
+    def calculate_consistency_score(self, verification_results: Dict[str, List[ExtractedFact]]) -> float:
+        """Calculate overall consistency score"""
+        total_facts = sum(len(facts) for facts in verification_results.values())
+        if total_facts == 0:
+            return 1.0
+        
+        verified_count = len(verification_results['verified'])
+        contradicted_count = len(verification_results['contradicted'])
+        
+        # Heavy penalty for contradictions
+        consistency = (verified_count - 2 * contradicted_count) / total_facts
+        return max(0, min(1, consistency))
+    
+    def calculate_specificity_score(self, facts: List[ExtractedFact]) -> float:
+        """Calculate how specific/concrete the facts are"""
+        if not facts:
+            return 0.0
+        
+        specific_facts = 0
+        for fact in facts:
+            # Quantitative and temporal facts are specific
+            if fact.fact_type in [FactType.QUANTITATIVE, FactType.TEMPORAL]:
+                specific_facts += 1
+            # Entity relations with all components are specific
+            elif fact.fact_type == FactType.ENTITY_RELATION:
+                if fact.subject and fact.predicate and fact.object:
+                    specific_facts += 1
+        
+        return specific_facts / len(facts)
+    
+    def analyze_hallucination(self, reference: str, candidate: str) -> HallucinationResult:
+        """Main hallucination analysis"""
+        # Extract facts
+        ref_facts = self.extract_facts(reference)
+        cand_facts = self.extract_facts(candidate)
+        
+        # Verify facts
+        verification_results = self.verify_facts(cand_facts, ref_facts)
+        
+        # Calculate scores
+        consistency_score = self.calculate_consistency_score(verification_results)
+        specificity_score = self.calculate_specificity_score(cand_facts)
+        
+        # Calculate semantic similarity
+        semantic_sim = self._semantic_similarity(reference, candidate)
+        
+        # Sentiment consistency
+        ref_sentiment = self.sia.polarity_scores(reference)
+        cand_sentiment = self.sia.polarity_scores(candidate)
+        sentiment_diff = abs(ref_sentiment['compound'] - cand_sentiment['compound'])
+        
+        # Determine severity
+        contradicted_ratio = len(verification_results['contradicted']) / max(len(cand_facts), 1)
+        unsupported_ratio = len(verification_results['unsupported']) / max(len(cand_facts), 1)
+        
+        if contradicted_ratio > 0.5:
+            severity = 'severe'
+        elif contradicted_ratio > 0.2:
+            severity = 'moderate'
+        elif unsupported_ratio > 0.7:
+            severity = 'minor'
+        else:
+            severity = 'none'
+        
+        # Is hallucinated?
+        is_hallucinated = (
+            consistency_score < 0.5 or
+            contradicted_ratio > 0.3 or
+            (semantic_sim < 0.3 and unsupported_ratio > 0.5)
+        )
+        
+        # Confidence
+        confidence = max(
+            contradicted_ratio,
+            1 - consistency_score,
+            0.5 if is_hallucinated else 0.2
+        )
+        
+        # Generate explanation
+        explanation = self._generate_explanation(
+            verification_results, consistency_score, specificity_score,
+            semantic_sim, severity
+        )
+        
+        return HallucinationResult(
+            is_hallucinated=is_hallucinated,
+            confidence=confidence,
+            severity=severity,
+            fact_verification=verification_results,
+            consistency_score=consistency_score,
+            specificity_score=specificity_score,
+            explanation=explanation,
+            detailed_analysis={
+                'total_facts': len(cand_facts),
+                'verified_facts': len(verification_results['verified']),
+                'contradicted_facts': len(verification_results['contradicted']),
+                'unsupported_facts': len(verification_results['unsupported']),
+                'semantic_similarity': semantic_sim,
+                'sentiment_difference': sentiment_diff
+            }
+        )
+    
+    def _generate_explanation(self, verification_results: Dict[str, List[ExtractedFact]],
+                            consistency_score: float, specificity_score: float,
+                            semantic_sim: float, severity: str) -> str:
+        """Generate human-readable explanation"""
+        parts = []
+        
+        # Summary
+        total_facts = sum(len(facts) for facts in verification_results.values())
+        parts.append(f"Analyzed {total_facts} facts from candidate text:")
+        parts.append(f"- Verified: {len(verification_results['verified'])}")
+        parts.append(f"- Contradicted: {len(verification_results['contradicted'])}")
+        parts.append(f"- Unsupported: {len(verification_results['unsupported'])}")
+        
+        # Key issues
+        if verification_results['contradicted']:
+            parts.append("\nContradictions found:")
+            for fact in verification_results['contradicted'][:3]:
+                parts.append(f"  - {fact.text}")
+        
+        # Scores
+        parts.append(f"\nConsistency Score: {consistency_score:.2%}")
+        parts.append(f"Specificity Score: {specificity_score:.2%}")
+        parts.append(f"Semantic Similarity: {semantic_sim:.2%}")
+        parts.append(f"Severity: {severity.upper()}")
+        
+        return '\n'.join(parts)
+    
+    def build_fact_graph(self, all_texts: List[str], 
+                        analyses: List[Optional[HallucinationResult]]) -> nx.Graph:
+        """Build graph based on fact relationships"""
+        G = nx.Graph()
+        
+        # Extract facts for all texts
+        all_facts = []
+        for text in all_texts:
+            all_facts.append(self.extract_facts(text))
+        
+        # Add nodes
+        for i, (text, analysis) in enumerate(zip(all_texts, analyses)):
+            if i == 0:  # Reference
+                G.add_node(i,
+                          text=text,
+                          is_reference=True,
+                          is_hallucinated=False,
+                          severity='none',
+                          fact_count=len(all_facts[i]))
+            else:
+                G.add_node(i,
+                          text=text,
+                          is_reference=False,
+                          is_hallucinated=analysis.is_hallucinated if analysis else False,
+                          severity=analysis.severity if analysis else 'unknown',
+                          confidence=analysis.confidence if analysis else 0,
+                          consistency_score=analysis.consistency_score if analysis else 0,
+                          specificity_score=analysis.specificity_score if analysis else 0,
+                          fact_count=len(all_facts[i]))
+        
+        # Add edges based on shared/conflicting facts
+        for i in range(len(all_texts)):
+            for j in range(i + 1, len(all_texts)):
+                shared_facts = 0
+                conflicting_facts = 0
+                
+                # Compare facts
+                for fact_i in all_facts[i]:
+                    for fact_j in all_facts[j]:
+                        comparison = self.compare_facts(fact_i, fact_j)
+                        if comparison.is_supporting:
+                            shared_facts += 1
+                        elif comparison.is_contradicting:
+                            conflicting_facts += 1
+                
+                # Add edge if significant relationship
+                if shared_facts > 0 or conflicting_facts > 0:
+                    total_facts = max(len(all_facts[i]), len(all_facts[j]))
+                    weight = shared_facts / total_facts if total_facts > 0 else 0
+                    
+                    G.add_edge(i, j,
+                             weight=weight,
+                             shared_facts=shared_facts,
+                             conflicting_facts=conflicting_facts,
+                             edge_type='conflict' if conflicting_facts > shared_facts else 'support')
+        
+        return G
+    
+    def create_visualization(self, G: nx.Graph, analyses: List[Optional[HallucinationResult]],
+                           save_path: str = "local_hallucination.html") -> str:
+        """Create interactive visualization"""
+        # Calculate layout metrics
+        if G.number_of_edges() > 0:
+            pagerank = nx.pagerank(G, weight='weight')
+            if nx.is_connected(G):
+                closeness = nx.closeness_centrality(G)
+            else:
+                closeness = {n: 0 for n in G.nodes()}
+        else:
+            pagerank = {n: 1/G.number_of_nodes() for n in G.nodes()}
+            closeness = {n: 0 for n in G.nodes()}
+        
+        # Prepare nodes
+        nodes = []
+        for node in G.nodes():
+            node_data = G.nodes[node]
+            
+            # Color based on severity
+            if node_data.get('is_reference'):
+                color = '#0066CC'
+            elif node_data.get('severity') == 'severe':
+                color = '#CC0000'
+            elif node_data.get('severity') == 'moderate':
+                color = '#FF6666'
+            elif node_data.get('severity') == 'minor':
+                color = '#FFAAAA'
+            else:
+                color = '#00CC00'
+            
+            nodes.append({
+                'id': node,
+                'label': f'P{node}',
+                'color': color,
+                'size': 15 + 30 * pagerank[node],
+                'severity': node_data.get('severity', 'unknown'),
+                'is_hallucinated': node_data.get('is_hallucinated', False),
+                'consistency_score': node_data.get('consistency_score', 0),
+                'specificity_score': node_data.get('specificity_score', 0),
+                'fact_count': node_data.get('fact_count', 0),
+                'text': node_data['text'][:200] + '...' if len(node_data['text']) > 200 else node_data['text']
+            })
+        
+        # Prepare edges
+        links = []
+        for u, v, data in G.edges(data=True):
+            color = '#FF0000' if data.get('edge_type') == 'conflict' else '#00FF00'
+            links.append({
+                'source': u,
+                'target': v,
+                'weight': data.get('weight', 0),
+                'shared_facts': data.get('shared_facts', 0),
+                'conflicting_facts': data.get('conflicting_facts', 0),
+                'color': color,
+                'width': 2 + data.get('weight', 0) * 8
+            })
+        
+        # Create HTML
+        html_content = f"""
+<!DOCTYPE html>
+<html>
+<head>
+    <title>Local Hallucination Detection - No API Required</title>
+    <script src="https://d3js.org/d3.v7.min.js"></script>
+    <style>
+        body {{
+            font-family: Arial, sans-serif;
+            margin: 0;
+            padding: 20px;
+            background-color: #f5f5f5;
+        }}
+        #graph {{
+            background-color: white;
+            border: 1px solid #ddd;
+            border-radius: 8px;
+            box-shadow: 0 2px 4px rgba(0,0,0,0.1);
+        }}
+        .tooltip {{
+            position: absolute;
+            text-align: left;
+            padding: 12px;
+            font: 12px sans-serif;
+            background: rgba(0, 0, 0, 0.9);
+            color: white;
+            border-radius: 8px;
+            pointer-events: none;
+            opacity: 0;
+            transition: opacity 0.3s;
+            max-width: 400px;
+            line-height: 1.5;
+        }}
+        .info-row {{
+            margin: 5px 0;
+            display: flex;
+            justify-content: space-between;
+        }}
+        .info-label {{
+            font-weight: bold;
+            color: #66ccff;
+        }}
+        .info-value {{
+            color: #ffffff;
+        }}
+        .severity-badge {{
+            display: inline-block;
+            padding: 3px 8px;
+            border-radius: 4px;
+            font-weight: bold;
+            margin: 5px 0;
+        }}
+        .severity-none {{ background: #00CC00; color: white; }}
+        .severity-minor {{ background: #FFAA00; color: black; }}
+        .severity-moderate {{ background: #FF6600; color: white; }}
+        .severity-severe {{ background: #CC0000; color: white; }}
+        .legend {{
+            position: absolute;
+            top: 20px;
+            right: 20px;
+            background: rgba(255, 255, 255, 0.95);
+            padding: 15px;
+            border-radius: 8px;
+            border: 1px solid #ddd;
+        }}
+        h1 {{ color: #333; }}
+        .controls {{ margin-bottom: 20px; }}
+        button {{
+            padding: 8px 16px;
+            margin-right: 10px;
+            border: none;
+            border-radius: 4px;
+            background-color: #4CAF50;
+            color: white;
+            cursor: pointer;
+        }}
+        button:hover {{ background-color: #45a049; }}
+    </style>
+</head>
+<body>
+    <h1>Local Hallucination Detection - Fact-Based Analysis</h1>
+    <div class="controls">
+        <button onclick="resetView()">Reset View</button>
+        <button onclick="toggleLabels()">Toggle Labels</button>
+    </div>
+    <div id="graph"></div>
+    <div class="tooltip"></div>
+    <div class="legend">
+        <h3>Severity Levels</h3>
+        <div style="display: flex; align-items: center; margin: 5px 0;">
+            <div style="width: 20px; height: 20px; background: #0066CC; margin-right: 8px;"></div>
+            <span>Reference</span>
+        </div>
+        <div style="display: flex; align-items: center; margin: 5px 0;">
+            <div style="width: 20px; height: 20px; background: #CC0000; margin-right: 8px;"></div>
+            <span>Severe</span>
+        </div>
+        <div style="display: flex; align-items: center; margin: 5px 0;">
+            <div style="width: 20px; height: 20px; background: #FF6666; margin-right: 8px;"></div>
+            <span>Moderate</span>
+        </div>
+        <div style="display: flex; align-items: center; margin: 5px 0;">
+            <div style="width: 20px; height: 20px; background: #FFAAAA; margin-right: 8px;"></div>
+            <span>Minor</span>
+        </div>
+        <div style="display: flex; align-items: center; margin: 5px 0;">
+            <div style="width: 20px; height: 20px; background: #00CC00; margin-right: 8px;"></div>
+            <span>None</span>
+        </div>
+    </div>
+    
+    <script>
+        const nodes = {json.dumps(nodes)};
+        const links = {json.dumps(links)};
+        
+        const width = window.innerWidth - 40;
+        const height = 600;
+        
+        const svg = d3.select("#graph")
+            .append("svg")
+            .attr("width", width)
+            .attr("height", height);
+        
+        const g = svg.append("g");
+        
+        const zoom = d3.zoom()
+            .scaleExtent([0.1, 10])
+            .on("zoom", (event) => {{
+                g.attr("transform", event.transform);
+            }});
+        
+        svg.call(zoom);
+        
+        const simulation = d3.forceSimulation(nodes)
+            .force("link", d3.forceLink(links).id(d => d.id).distance(150))
+            .force("charge", d3.forceManyBody().strength(-500))
+            .force("center", d3.forceCenter(width / 2, height / 2))
+            .force("collision", d3.forceCollide().radius(d => d.size + 10));
+        
+        const link = g.append("g")
+            .selectAll("line")
+            .data(links)
+            .enter().append("line")
+            .attr("stroke", d => d.color)
+            .attr("stroke-width", d => d.width)
+            .attr("stroke-opacity", 0.6);
+        
+        const node = g.append("g")
+            .selectAll("circle")
+            .data(nodes)
+            .enter().append("circle")
+            .attr("r", d => d.size)
+            .attr("fill", d => d.color)
+            .attr("stroke", "#333")
+            .attr("stroke-width", 2)
+            .style("cursor", "pointer")
+            .call(d3.drag()
+                .on("start", dragstarted)
+                .on("drag", dragged)
+                .on("end", dragended));
+        
+        const labels = g.append("g")
+            .selectAll("text")
+            .data(nodes)
+            .enter().append("text")
+            .text(d => d.label)
+            .attr("font-size", 12)
+            .attr("dx", d => d.size + 5)
+            .attr("dy", 4);
+        
+        const tooltip = d3.select(".tooltip");
+        
+        node.on("mouseover", function(event, d) {{
+            let html = `<strong>${{d.label}}</strong>`;
+            html += `<div class="severity-badge severity-${{d.severity}}">${{d.severity.toUpperCase()}}</div>`;
+            
+            html += '<div style="margin-top: 10px;">';
+            html += `<div class="info-row"><span class="info-label">Hallucinated:</span><span class="info-value">${{d.is_hallucinated ? 'Yes' : 'No'}}</span></div>`;
+            html += `<div class="info-row"><span class="info-label">Facts Found:</span><span class="info-value">${{d.fact_count}}</span></div>`;
+            html += `<div class="info-row"><span class="info-label">Consistency:</span><span class="info-value">${{(d.consistency_score * 100).toFixed(1)}}%</span></div>`;
+            html += `<div class="info-row"><span class="info-label">Specificity:</span><span class="info-value">${{(d.specificity_score * 100).toFixed(1)}}%</span></div>`;
+            html += '</div>';
+            
+            html += `<div style="margin-top: 10px; border-top: 1px solid #666; padding-top: 10px;">`;
+            html += `<strong>Text:</strong><br/>${{d.text}}`;
+            html += '</div>';
+            
+            tooltip.html(html)
+                .style("left", (event.pageX + 10) + "px")
+                .style("top", (event.pageY - 10) + "px")
+                .style("opacity", 1);
+            
+            d3.select(this).attr("stroke-width", 4);
+        }})
+        .on("mouseout", function() {{
+            tooltip.style("opacity", 0);
+            d3.select(this).attr("stroke-width", 2);
+        }});
+        
+        simulation.on("tick", () => {{
+            link
+                .attr("x1", d => d.source.x)
+                .attr("y1", d => d.source.y)
+                .attr("x2", d => d.target.x)
+                .attr("y2", d => d.target.y);
+            
+            node
+                .attr("cx", d => d.x)
+                .attr("cy", d => d.y);
+            
+            labels
+                .attr("x", d => d.x)
+                .attr("y", d => d.y);
+        }});
+        
+        function dragstarted(event, d) {{
+            if (!event.active) simulation.alphaTarget(0.3).restart();
+            d.fx = d.x;
+            d.fy = d.y;
+        }}
+        
+        function dragged(event, d) {{
+            d.fx = event.x;
+            d.fy = event.y;
+        }}
+        
+        function dragended(event, d) {{
+            if (!event.active) simulation.alphaTarget(0);
+            d.fx = null;
+            d.fy = null;
+        }}
+        
+        function resetView() {{
+            svg.transition().duration(750).call(
+                zoom.transform,
+                d3.zoomIdentity
+            );
+        }}
+        
+        let labelsVisible = true;
+        function toggleLabels() {{
+            labelsVisible = !labelsVisible;
+            labels.style("display", labelsVisible ? "block" : "none");
+        }}
+    </script>
+</body>
+</html>
+"""
+        
+        with open(save_path, 'w', encoding='utf-8') as f:
+            f.write(html_content)
+        
+        return save_path
+    
+    def analyze_batch(self, reference: str, candidates: List[str], output_dir: str = ".") -> Dict:
+        """Analyze multiple candidates against reference"""
+        print("\n" + "="*60)
+        print("LOCAL HALLUCINATION DETECTION ANALYSIS")
+        print("="*60)
+        
+        all_texts = [reference] + candidates
+        analyses = [None]  # Reference has no analysis
+        
+        # Analyze each candidate
+        print("\nAnalyzing candidates...")
+        for i, candidate in enumerate(candidates):
+            print(f"  Analyzing paragraph {i+1}...")
+            analysis = self.analyze_hallucination(reference, candidate)
+            analyses.append(analysis)
+            
+            # Print summary
+            print(f"    Severity: {analysis.severity}")
+            print(f"    Facts: {analysis.detailed_analysis['total_facts']} total, "
+                  f"{analysis.detailed_analysis['verified_facts']} verified, "
+                  f"{analysis.detailed_analysis['contradicted_facts']} contradicted")
+        
+        # Build graph
+        print("\nBuilding fact-based graph...")
+        G = self.build_fact_graph(all_texts, analyses)
+        
+        # Create visualization
+        print("Creating visualization...")
+        viz_path = os.path.join(output_dir, "local_hallucination.html")
+        self.create_visualization(G, analyses[1:], viz_path)
+        
+        # Summary
+        print("\n" + "-"*60)
+        print("SUMMARY")
+        print("-"*60)
+        
+        severity_counts = defaultdict(int)
+        for analysis in analyses[1:]:
+            if analysis:
+                severity_counts[analysis.severity] += 1
+        
+        print(f"Total candidates: {len(candidates)}")
+        for severity in ['none', 'minor', 'moderate', 'severe']:
+            print(f"  {severity.capitalize()}: {severity_counts[severity]}")
+        
+        print(f"\nVisualization saved to: {viz_path}")
+        print("Opening in browser...")
+        webbrowser.open(f'file://{os.path.abspath(viz_path)}')
+        
+        return {
+            'analyses': analyses[1:],
+            'graph': G,
+            'visualization': viz_path
+        }
+
+
+# Example usage
+if __name__ == "__main__":
+    # Initialize detector
+    detector = LocalHallucinationDetector()
+    
+    # Test data
+    reference = """The company reported revenue of $2.5 million in Q4 2023, with a 15% increase from the previous quarter. 
+    CEO John Smith announced expansion plans on January 15, 2024, targeting the Asian market. 
+    The profit margin improved to 22% due to cost optimization strategies."""
+    
+    candidates = [
+        # Consistent
+        """Q4 2023 revenue reached $2.5 million, marking 15% quarterly growth. 
+        John Smith revealed Asian market expansion on January 15, 2024. 
+        Profit margins rose to 22% through cost optimization.""",
+        
+        # Factual errors
+        """The company earned $3.2 million in Q4 2023, a 20% increase. 
+        CEO John Smith discussed expansion plans on January 20, 2024. 
+        Profit margins reached 25% after cost controls.""",
+        
+        # Additional details
+        """In Q4 2023, revenue was $2.5 million with 15% growth. 
+        The company also improved customer satisfaction. 
+        John Smith's January 15 announcement emphasized Asia.""",
+        
+        # Complete contradiction
+        """Q4 2023 saw losses of $1.8 million, down 30% from Q3. 
+        CEO John Smith announced on January 15, 2024 that expansion 
+        was cancelled due to poor performance.""",
+        
+        # Vague/unspecific
+        """The company performed well recently with good growth. 
+        Management is optimistic about international opportunities. 
+        Financial metrics have improved significantly."""
+    ]
+    
+    # Run analysis
+    results = detector.analyze_batch(reference, candidates)
