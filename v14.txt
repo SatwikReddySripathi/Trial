@@ -1,7 +1,8 @@
 """
-Working Hallucination Detection System - Final Version
-=====================================================
-Complete implementation with all metrics and proper visualization
+Hallucination Detection System with All Metrics
+==============================================
+Includes semantic similarity, entailment, factual consistency, and entropy.
+Visualizes only semantically coherent connections.
 """
 
 import numpy as np
@@ -13,17 +14,17 @@ from sklearn.feature_extraction.text import TfidfVectorizer
 import nltk
 from nltk.tokenize import sent_tokenize, word_tokenize
 from nltk.corpus import stopwords
-from collections import defaultdict, Counter
+from collections import Counter
 import warnings
+from scipy.stats import entropy as scipy_entropy
 import webbrowser
 import os
 import json
-import math
 
 warnings.filterwarnings('ignore')
 
 # Download required NLTK data
-for resource in ['punkt', 'stopwords', 'averaged_perceptron_tagger']:
+for resource in ['punkt', 'stopwords', 'averaged_perceptron_tagger', 'wordnet']:
     try:
         nltk.data.find(f'tokenizers/{resource}')
     except LookupError:
@@ -32,321 +33,404 @@ for resource in ['punkt', 'stopwords', 'averaged_perceptron_tagger']:
 
 
 class HallucinationDetector:
-    """Comprehensive hallucination detection system"""
+    """Comprehensive hallucination detection with all metrics"""
     
     def __init__(self):
-        """Initialize the detector"""
         print("Initializing Hallucination Detector...")
         
-        # TF-IDF vectorizer
+        # Text processing
         self.tfidf = TfidfVectorizer(
             max_features=1000,
             ngram_range=(1, 3),
             stop_words='english'
         )
-        
         self.stopwords = set(stopwords.words('english'))
         
-        # Entity patterns
-        self.patterns = {
+        # Entity extraction patterns
+        self.entity_patterns = {
             'money': re.compile(r'\$[\d,]+\.?\d*\s*(?:million|billion|thousand|M|B|K)?', re.I),
-            'percentage': re.compile(r'\b\d+\.?\d*\s*(?:%|percent)', re.I),
-            'date': re.compile(r'\b(?:Q[1-4]\s*\d{4}|(?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)[a-z]*\.?\s*\d{1,2},?\s*\d{4}|\d{1,2}[-/]\d{1,2}[-/]\d{2,4})', re.I),
-            'number': re.compile(r'\b\d+(?:,\d{3})*(?:\.\d+)?\b')
+            'percentage': re.compile(r'\d+\.?\d*\s*(?:%|percent)', re.I),
+            'date': re.compile(r'(?:Q[1-4]\s*\d{4}|(?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)[a-z]*\.?\s*\d{1,2},?\s*\d{4}|\d{1,2}[-/]\d{1,2}[-/]\d{2,4})', re.I),
+            'quantity': re.compile(r'\d+\s*(?:employees?|customers?|users?|units?|items?)', re.I)
         }
         
         # Thresholds
-        self.semantic_threshold = 0.3  # Minimum similarity for edge creation
+        self.min_semantic_similarity = 0.3  # Minimum similarity for graph edges
+        self.hallucination_threshold = 0.6
         
         print("Initialization complete!")
     
-    def extract_entities(self, text: str) -> Dict[str, List[str]]:
-        """Extract entities from text"""
+    def extract_entities(self, text: str) -> Dict[str, List[Tuple[str, Any]]]:
+        """Extract and normalize entities from text"""
         entities = {}
-        for entity_type, pattern in self.patterns.items():
-            entities[entity_type] = pattern.findall(text)
+        
+        for entity_type, pattern in self.entity_patterns.items():
+            matches = []
+            for match in pattern.finditer(text):
+                raw_value = match.group()
+                normalized = self._normalize_entity(raw_value, entity_type)
+                matches.append((raw_value, normalized))
+            entities[entity_type] = matches
+        
         return entities
     
-    def normalize_value(self, value: str, entity_type: str) -> Any:
-        """Normalize entity values"""
-        try:
-            if entity_type == 'money':
-                clean = re.sub(r'[$,]', '', value)
+    def _normalize_entity(self, value: str, entity_type: str) -> Any:
+        """Normalize entity values for comparison"""
+        if entity_type == 'money':
+            # Extract numeric value
+            clean = re.sub(r'[$,]', '', value)
+            try:
                 num = float(re.search(r'[\d.]+', clean).group())
-                if 'million' in value.lower() or 'M' in value:
+                # Apply multipliers
+                if any(x in value.lower() for x in ['million', 'm']):
                     num *= 1_000_000
-                elif 'billion' in value.lower() or 'B' in value:
+                elif any(x in value.lower() for x in ['billion', 'b']):
                     num *= 1_000_000_000
-                elif 'thousand' in value.lower() or 'K' in value:
+                elif any(x in value.lower() for x in ['thousand', 'k']):
                     num *= 1_000
                 return num
-            elif entity_type == 'percentage':
+            except:
+                return 0
+        
+        elif entity_type == 'percentage':
+            try:
                 return float(re.search(r'[\d.]+', value).group())
-            elif entity_type == 'date':
-                return value.lower().replace(',', '').replace('.', '')
-            elif entity_type == 'number':
-                return float(value.replace(',', ''))
-        except:
-            return value
+            except:
+                return 0
+        
+        elif entity_type == 'date':
+            # Simple normalization - remove punctuation and lowercase
+            return re.sub(r'[,.]', '', value.lower())
+        
+        elif entity_type == 'quantity':
+            try:
+                return int(re.search(r'\d+', value).group())
+            except:
+                return 0
+        
         return value
     
     def calculate_semantic_similarity(self, text1: str, text2: str) -> float:
-        """Calculate semantic similarity"""
+        """Calculate semantic similarity between texts"""
         if not text1 or not text2:
             return 0.0
         
+        # Extract meaningful words
+        words1 = set(word_tokenize(text1.lower())) - self.stopwords
+        words2 = set(word_tokenize(text2.lower())) - self.stopwords
+        
+        # For short texts, use Jaccard similarity
+        if len(words1) < 5 or len(words2) < 5:
+            if not words1 or not words2:
+                return 0.0
+            return len(words1 & words2) / len(words1 | words2)
+        
         try:
-            # Word overlap for short texts
-            words1 = set(word_tokenize(text1.lower())) - self.stopwords
-            words2 = set(word_tokenize(text2.lower())) - self.stopwords
-            
-            if len(words1) < 5 or len(words2) < 5:
-                if not words1 or not words2:
-                    return 0.0
-                return len(words1 & words2) / len(words1 | words2)
-            
-            # TF-IDF for longer texts
+            # TF-IDF similarity for longer texts
             tfidf_matrix = self.tfidf.fit_transform([text1, text2])
-            return float(cosine_similarity(tfidf_matrix[0:1], tfidf_matrix[1:2])[0][0])
+            cosine_sim = cosine_similarity(tfidf_matrix[0:1], tfidf_matrix[1:2])[0][0]
+            
+            # Combine with word overlap
+            word_overlap = len(words1 & words2) / max(len(words1), len(words2))
+            
+            # Weighted average
+            return 0.7 * cosine_sim + 0.3 * word_overlap
         except:
             return 0.0
     
     def calculate_entailment(self, premise: str, hypothesis: str) -> Dict[str, float]:
-        """Simple entailment calculation"""
-        semantic_sim = self.calculate_semantic_similarity(premise, hypothesis)
+        """Calculate entailment scores without external models"""
+        # Semantic similarity as base
+        similarity = self.calculate_semantic_similarity(premise, hypothesis)
         
-        # Check for negations
-        negations = {'not', 'no', 'never', 'neither', 'none'}
-        premise_has_neg = bool(set(word_tokenize(premise.lower())) & negations)
-        hypo_has_neg = bool(set(word_tokenize(hypothesis.lower())) & negations)
+        # Check for negation words
+        negations = {'not', 'no', 'never', 'neither', 'none', 'nobody', 'nothing', 'nowhere', "n't"}
         
-        # Simple scoring
-        if premise_has_neg != hypo_has_neg and semantic_sim > 0.5:
-            # Contradiction
-            return {
-                'entailment': 0.1,
-                'contradiction': 0.8,
-                'neutral': 0.1
-            }
-        elif semantic_sim > 0.7:
-            # High similarity = entailment
-            return {
-                'entailment': semantic_sim,
-                'contradiction': 0.1,
-                'neutral': 1 - semantic_sim - 0.1
-            }
+        premise_words = set(word_tokenize(premise.lower()))
+        hypothesis_words = set(word_tokenize(hypothesis.lower()))
+        
+        premise_negations = bool(premise_words & negations)
+        hypothesis_negations = bool(hypothesis_words & negations)
+        
+        # Check for contradiction patterns
+        contradiction_score = 0.0
+        if premise_negations != hypothesis_negations and similarity > 0.5:
+            # One has negation, other doesn't, but they're similar = likely contradiction
+            contradiction_score = 0.7
+        
+        # Check for key fact differences
+        premise_entities = self.extract_entities(premise)
+        hypothesis_entities = self.extract_entities(hypothesis)
+        
+        # If discussing same topics but different values = contradiction
+        for entity_type in premise_entities:
+            if premise_entities[entity_type] and hypothesis_entities[entity_type]:
+                premise_values = {v[1] for v in premise_entities[entity_type]}
+                hypothesis_values = {v[1] for v in hypothesis_entities[entity_type]}
+                
+                if premise_values and hypothesis_values and not (premise_values & hypothesis_values):
+                    contradiction_score = max(contradiction_score, 0.6)
+        
+        # Calculate entailment score
+        if similarity > 0.8 and contradiction_score < 0.3:
+            entailment_score = similarity
         else:
-            # Neutral
-            return {
-                'entailment': semantic_sim * 0.5,
-                'contradiction': 0.1,
-                'neutral': 0.9 - semantic_sim * 0.5
-            }
+            entailment_score = similarity * (1 - contradiction_score)
+        
+        # Neutral is what's left
+        neutral_score = 1.0 - entailment_score - contradiction_score
+        
+        return {
+            'entailment': max(0, min(1, entailment_score)),
+            'contradiction': max(0, min(1, contradiction_score)),
+            'neutral': max(0, min(1, neutral_score))
+        }
     
-    def calculate_factual_consistency(self, ref_entities: Dict, cand_entities: Dict) -> float:
-        """Calculate factual consistency"""
-        total_matches = 0
-        total_entities = 0
+    def calculate_factual_consistency(self, ref_entities: Dict, cand_entities: Dict) -> Dict[str, float]:
+        """Calculate factual consistency between entity sets"""
+        results = {
+            'overall': 1.0,
+            'by_type': {},
+            'contradictions': 0,
+            'matches': 0,
+            'total': 0
+        }
         
         for entity_type in ref_entities:
-            ref_norm = set()
-            cand_norm = set()
+            ref_values = {v[1] for v in ref_entities.get(entity_type, [])}
+            cand_values = {v[1] for v in cand_entities.get(entity_type, [])}
             
-            # Normalize entities
-            for entity in ref_entities[entity_type]:
-                ref_norm.add(str(self.normalize_value(entity, entity_type)))
-            
-            for entity in cand_entities[entity_type]:
-                cand_norm.add(str(self.normalize_value(entity, entity_type)))
-            
-            if ref_norm or cand_norm:
-                matches = len(ref_norm & cand_norm)
-                total = len(ref_norm | cand_norm)
-                total_matches += matches
-                total_entities += total
+            if ref_values or cand_values:
+                matches = len(ref_values & cand_values)
+                total = len(ref_values | cand_values)
+                
+                if total > 0:
+                    consistency = matches / total
+                    results['by_type'][entity_type] = consistency
+                    results['matches'] += matches
+                    results['total'] += total
+                    
+                    # Check for contradictions
+                    if ref_values and cand_values and not (ref_values & cand_values):
+                        results['contradictions'] += 1
         
-        return total_matches / total_entities if total_entities > 0 else 1.0
+        # Calculate overall consistency
+        if results['total'] > 0:
+            results['overall'] = results['matches'] / results['total']
+        
+        return results
     
     def calculate_entropy(self, text: str) -> float:
-        """Calculate text entropy"""
+        """Calculate normalized entropy of text"""
+        # Get word frequencies
         words = [w.lower() for w in word_tokenize(text) if w.isalnum() and w not in self.stopwords]
         
         if not words:
             return 0.0
         
-        # Word frequency
-        word_freq = Counter(words)
-        total = len(words)
+        # Count frequencies
+        word_counts = Counter(words)
+        total_words = len(words)
+        
+        # Calculate probabilities
+        probs = [count/total_words for count in word_counts.values()]
         
         # Shannon entropy
-        entropy = 0
-        for count in word_freq.values():
-            p = count / total
-            if p > 0:
-                entropy -= p * math.log2(p)
+        entropy = -sum(p * np.log2(p) for p in probs if p > 0)
         
-        # Normalize
-        max_entropy = math.log2(len(word_freq)) if len(word_freq) > 1 else 1
-        return entropy / max_entropy if max_entropy > 0 else 0
+        # Normalize by maximum possible entropy
+        max_entropy = np.log2(len(word_counts))
+        normalized_entropy = entropy / max_entropy if max_entropy > 0 else 0
+        
+        return normalized_entropy
     
-    def analyze_paragraph(self, reference: str, candidate: str, idx: int) -> Dict[str, Any]:
-        """Analyze a single paragraph"""
+    def analyze_paragraph(self, reference: str, candidate: str, para_id: int) -> Dict[str, Any]:
+        """Comprehensive analysis of a candidate paragraph against reference"""
         # Extract entities
         ref_entities = self.extract_entities(reference)
         cand_entities = self.extract_entities(candidate)
         
-        # Calculate metrics
+        # Calculate all metrics
         semantic_sim = self.calculate_semantic_similarity(reference, candidate)
-        entailment = self.calculate_entailment(reference, candidate)
+        entailment_scores = self.calculate_entailment(reference, candidate)
         factual_consistency = self.calculate_factual_consistency(ref_entities, cand_entities)
         
-        # Entropy
+        # Entropy calculations
         ref_entropy = self.calculate_entropy(reference)
         cand_entropy = self.calculate_entropy(candidate)
-        entropy_div = abs(cand_entropy - ref_entropy) / (ref_entropy + 0.001)
+        entropy_divergence = abs(cand_entropy - ref_entropy) / (ref_entropy + 0.001)
         
-        # Consistency breakdown
-        consistency_scores = {
+        # Calculate overall consistency (combining all metrics)
+        consistency_components = {
             'semantic': semantic_sim,
-            'factual': factual_consistency,
-            'entailment': entailment['entailment'],
-            'non_contradiction': 1.0 - entailment['contradiction']
+            'factual': factual_consistency['overall'],
+            'entailment': entailment_scores['entailment'],
+            'non_contradiction': 1.0 - entailment_scores['contradiction']
         }
         
-        # Overall consistency
-        overall_consistency = sum(consistency_scores.values()) / len(consistency_scores)
+        # Weighted average for overall consistency
+        weights = {'semantic': 0.3, 'factual': 0.3, 'entailment': 0.2, 'non_contradiction': 0.2}
+        overall_consistency = sum(consistency_components[k] * weights[k] for k in consistency_components)
         
-        # Hallucination score
-        hall_score = 0.0
-        hall_score += (1 - semantic_sim) * 0.3
-        hall_score += (1 - factual_consistency) * 0.3
-        hall_score += entailment['contradiction'] * 0.3
-        hall_score += min(entropy_div * 0.1, 0.1)
+        # Calculate hallucination score
+        hallucination_score = 0.0
         
-        # Determine severity
-        if hall_score > 0.7:
+        # Factor 1: Low semantic similarity
+        if semantic_sim < 0.2:
+            hallucination_score += 0.3
+        else:
+            hallucination_score += (1 - semantic_sim) * 0.25
+        
+        # Factor 2: Factual inconsistency
+        if factual_consistency['contradictions'] > 0:
+            hallucination_score += 0.4
+        else:
+            hallucination_score += (1 - factual_consistency['overall']) * 0.2
+        
+        # Factor 3: Contradiction
+        hallucination_score += entailment_scores['contradiction'] * 0.3
+        
+        # Factor 4: High entropy divergence
+        if entropy_divergence > 0.5:
+            hallucination_score += min(entropy_divergence * 0.2, 0.2)
+        
+        # Determine if hallucinated
+        is_hallucinated = hallucination_score > self.hallucination_threshold
+        
+        # Severity classification
+        if hallucination_score > 0.8:
             severity = 'severe'
-        elif hall_score > 0.5:
+        elif hallucination_score > 0.6:
             severity = 'moderate'
-        elif hall_score > 0.3:
+        elif hallucination_score > 0.4:
             severity = 'minor'
         else:
             severity = 'none'
         
         return {
-            'id': idx,
+            'id': para_id,
             'text': candidate,
-            'is_hallucinated': hall_score > 0.5,
-            'hallucination_score': float(hall_score),
+            'is_hallucinated': is_hallucinated,
+            'hallucination_score': hallucination_score,
             'severity': severity,
-            'semantic_similarity': float(semantic_sim),
-            'entailment_score': float(entailment['entailment']),
-            'contradiction_score': float(entailment['contradiction']),
-            'factual_consistency': float(factual_consistency),
-            'entropy': float(cand_entropy),
-            'entropy_divergence': float(entropy_div),
-            'consistency_breakdown': consistency_scores,
-            'overall_consistency': float(overall_consistency)
+            'overall_consistency': overall_consistency,
+            'metrics': {
+                'semantic_similarity': semantic_sim,
+                'entailment': entailment_scores['entailment'],
+                'contradiction': entailment_scores['contradiction'],
+                'factual_consistency': factual_consistency['overall'],
+                'entropy': cand_entropy,
+                'entropy_divergence': entropy_divergence
+            },
+            'consistency_breakdown': consistency_components,
+            'entity_stats': {
+                'matches': factual_consistency['matches'],
+                'total': factual_consistency['total'],
+                'contradictions': factual_consistency['contradictions']
+            }
         }
     
-    def build_graph(self, reference: str, analyses: List[Dict]) -> nx.Graph:
-        """Build graph with coherent connections"""
-        G = nx.Graph()
+    def build_coherent_graph(self, reference: str, analyses: List[Dict]) -> nx.Graph:
+        """Build graph with only semantically coherent connections"""
+        G = nx.DiGraph()  # Directed graph to show relationships
         
-        # Add nodes
-        # Reference node
-        G.add_node(0)
-        G.nodes[0]['label'] = 'REF'
-        G.nodes[0]['text'] = reference[:200] + '...' if len(reference) > 200 else reference
-        G.nodes[0]['type'] = 'reference'
-        G.nodes[0]['severity'] = 'reference'
+        # Add reference node
+        G.add_node(0, 
+                  node_type='reference',
+                  text=reference[:200] + '...' if len(reference) > 200 else reference,
+                  severity='reference',
+                  is_hallucinated=False)
         
-        # Candidate nodes
+        # Add candidate nodes
         for analysis in analyses:
-            node_id = analysis['id']
-            G.add_node(node_id)
-            G.nodes[node_id]['label'] = f'P{node_id}'
-            G.nodes[node_id]['text'] = analysis['text'][:200] + '...' if len(analysis['text']) > 200 else analysis['text']
-            G.nodes[node_id]['type'] = 'candidate'
-            G.nodes[node_id]['severity'] = analysis['severity']
-            G.nodes[node_id]['hallucinated'] = analysis['is_hallucinated']
-            G.nodes[node_id]['scores'] = {
-                'hallucination': analysis['hallucination_score'],
-                'semantic': analysis['semantic_similarity'],
-                'entailment': analysis['entailment_score'],
-                'contradiction': analysis['contradiction_score'],
-                'factual': analysis['factual_consistency'],
-                'entropy': analysis['entropy'],
-                'consistency': analysis['overall_consistency']
-            }
+            G.add_node(analysis['id'],
+                      node_type='candidate',
+                      text=analysis['text'][:200] + '...' if len(analysis['text']) > 200 else analysis['text'],
+                      severity=analysis['severity'],
+                      is_hallucinated=analysis['is_hallucinated'],
+                      hallucination_score=analysis['hallucination_score'],
+                      overall_consistency=analysis['overall_consistency'],
+                      metrics=analysis['metrics'])
         
-        # Add edges only for semantically coherent pairs
+        # Create edges based on semantic coherence
         all_texts = [reference] + [a['text'] for a in analyses]
         
-        for i in range(len(all_texts)):
-            for j in range(i + 1, len(all_texts)):
-                similarity = self.calculate_semantic_similarity(all_texts[i], all_texts[j])
-                
-                if similarity >= self.semantic_threshold:
-                    G.add_edge(i, j, weight=float(similarity))
+        # Connect reference to each candidate
+        for analysis in analyses:
+            similarity = analysis['metrics']['semantic_similarity']
+            if similarity >= self.min_semantic_similarity:
+                G.add_edge(0, analysis['id'], 
+                          weight=similarity,
+                          edge_type='reference_to_candidate')
+        
+        # Connect candidates to each other if semantically similar
+        for i, analysis_i in enumerate(analyses):
+            for j, analysis_j in enumerate(analyses[i+1:], i+1):
+                similarity = self.calculate_semantic_similarity(analysis_i['text'], analysis_j['text'])
+                if similarity >= self.min_semantic_similarity:
+                    G.add_edge(analysis_i['id'], analysis_j['id'],
+                              weight=similarity,
+                              edge_type='candidate_to_candidate')
         
         return G
     
-    def create_visualization(self, G: nx.Graph, analyses: List[Dict], 
-                           output_path: str = "hallucination_detection.html") -> str:
-        """Create visualization"""
-        # Prepare data for JSON
-        nodes = []
-        for node_id in G.nodes():
-            node_data = G.nodes[node_id]
+    def create_visualization(self, G: nx.DiGraph, analyses: List[Dict], 
+                           output_path: str = "hallucination_analysis.html") -> str:
+        """Create interactive visualization"""
+        # Prepare nodes data
+        nodes_data = []
+        for node in G.nodes():
+            node_attrs = G.nodes[node]
             
-            # Color based on severity
-            colors = {
+            # Determine color
+            color_map = {
                 'reference': '#0066CC',
                 'severe': '#CC0000',
-                'moderate': '#FF6666', 
+                'moderate': '#FF6666',
                 'minor': '#FFAA00',
                 'none': '#00CC00'
             }
             
-            nodes.append({
-                'id': int(node_id),
-                'label': node_data['label'],
-                'color': colors.get(node_data['severity'], '#808080'),
-                'size': 25 if node_data['type'] == 'reference' else 20,
-                'text': node_data['text'],
-                'type': node_data['type'],
-                'severity': node_data['severity'],
-                'hallucinated': node_data.get('hallucinated', False),
-                'scores': node_data.get('scores', {})
-            })
+            node_info = {
+                'id': node,
+                'label': 'REF' if node == 0 else f'P{node}',
+                'color': color_map.get(node_attrs['severity'], '#808080'),
+                'size': 30 if node == 0 else 25,
+                'text': node_attrs['text'],
+                'type': node_attrs['node_type'],
+                'severity': node_attrs['severity'],
+                'is_hallucinated': node_attrs.get('is_hallucinated', False),
+                'hallucination_score': node_attrs.get('hallucination_score', 0),
+                'overall_consistency': node_attrs.get('overall_consistency', 1),
+                'metrics': node_attrs.get('metrics', {})
+            }
+            nodes_data.append(node_info)
         
-        edges = []
+        # Prepare edges data
+        edges_data = []
         for u, v, data in G.edges(data=True):
-            edges.append({
-                'source': int(u),
-                'target': int(v),
-                'weight': float(data['weight'])
+            edges_data.append({
+                'source': u,
+                'target': v,
+                'weight': data['weight'],
+                'type': data['edge_type']
             })
         
-        # Calculate summary stats
-        total_analyses = len(analyses)
+        # Calculate summary statistics
+        total_candidates = len(analyses)
         hallucinated = sum(1 for a in analyses if a['is_hallucinated'])
-        severe = sum(1 for a in analyses if a['severity'] == 'severe')
-        moderate = sum(1 for a in analyses if a['severity'] == 'moderate')
-        minor = sum(1 for a in analyses if a['severity'] == 'minor')
         avg_consistency = sum(a['overall_consistency'] for a in analyses) / len(analyses) if analyses else 0
         
-        # HTML template
-        html = f"""
+        # Create HTML
+        html_content = f"""
 <!DOCTYPE html>
 <html>
 <head>
-    <title>Hallucination Detection Results</title>
+    <title>Hallucination Detection Analysis</title>
     <script src="https://d3js.org/d3.v7.min.js"></script>
     <style>
         body {{
-            font-family: Arial, sans-serif;
+            font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
             margin: 0;
             padding: 20px;
             background: #f5f5f5;
@@ -358,52 +442,73 @@ class HallucinationDetector:
         h1 {{
             text-align: center;
             color: #333;
+            margin-bottom: 30px;
         }}
         .summary {{
             display: grid;
             grid-template-columns: repeat(auto-fit, minmax(150px, 1fr));
-            gap: 15px;
-            margin: 30px 0;
+            gap: 20px;
+            margin-bottom: 30px;
         }}
-        .stat-card {{
+        .summary-card {{
             background: white;
             padding: 20px;
             border-radius: 8px;
-            text-align: center;
             box-shadow: 0 2px 4px rgba(0,0,0,0.1);
+            text-align: center;
         }}
-        .stat-value {{
-            font-size: 32px;
+        .summary-value {{
+            font-size: 36px;
             font-weight: bold;
             color: #0066CC;
+            margin-bottom: 5px;
         }}
-        .stat-label {{
+        .summary-label {{
             color: #666;
-            margin-top: 5px;
+            font-size: 14px;
         }}
-        #graph {{
+        #graph-container {{
             background: white;
             border-radius: 8px;
             box-shadow: 0 2px 4px rgba(0,0,0,0.1);
-            margin: 30px 0;
+            padding: 20px;
+            margin-bottom: 30px;
+        }}
+        .controls {{
+            text-align: center;
+            margin-bottom: 20px;
+        }}
+        button {{
+            background: #0066CC;
+            color: white;
+            border: none;
+            padding: 10px 20px;
+            border-radius: 5px;
+            margin: 0 5px;
+            cursor: pointer;
+            font-size: 14px;
+        }}
+        button:hover {{
+            background: #0052A3;
         }}
         .tooltip {{
             position: absolute;
-            padding: 12px;
-            background: rgba(0, 0, 0, 0.9);
+            padding: 15px;
+            background: rgba(0, 0, 0, 0.95);
             color: white;
             border-radius: 8px;
             pointer-events: none;
             opacity: 0;
             font-size: 13px;
+            line-height: 1.5;
             max-width: 400px;
+            transition: opacity 0.3s;
         }}
         .legend {{
             background: white;
             padding: 20px;
             border-radius: 8px;
             box-shadow: 0 2px 4px rgba(0,0,0,0.1);
-            margin-bottom: 20px;
         }}
         .legend-item {{
             display: inline-block;
@@ -412,27 +517,31 @@ class HallucinationDetector:
         }}
         .legend-color {{
             display: inline-block;
-            width: 20px;
-            height: 20px;
+            width: 16px;
+            height: 16px;
             border-radius: 50%;
-            vertical-align: middle;
             margin-right: 8px;
+            vertical-align: middle;
         }}
-        .controls {{
+        .info {{
             text-align: center;
-            margin: 20px 0;
+            color: #666;
+            margin-top: 20px;
         }}
-        button {{
-            padding: 10px 20px;
-            margin: 0 5px;
-            border: none;
+        .metric-bar {{
+            display: inline-block;
+            width: 100px;
+            height: 10px;
+            background: #e0e0e0;
             border-radius: 5px;
-            background: #0066CC;
-            color: white;
-            cursor: pointer;
+            margin-left: 10px;
+            vertical-align: middle;
         }}
-        button:hover {{
-            background: #0052A3;
+        .metric-fill {{
+            display: inline-block;
+            height: 100%;
+            background: #0066CC;
+            border-radius: 5px;
         }}
     </style>
 </head>
@@ -441,84 +550,82 @@ class HallucinationDetector:
         <h1>Hallucination Detection Analysis</h1>
         
         <div class="summary">
-            <div class="stat-card">
-                <div class="stat-value">{total_analyses}</div>
-                <div class="stat-label">Total Analyzed</div>
+            <div class="summary-card">
+                <div class="summary-value">{total_candidates}</div>
+                <div class="summary-label">Total Candidates</div>
             </div>
-            <div class="stat-card">
-                <div class="stat-value">{hallucinated}</div>
-                <div class="stat-label">Hallucinated</div>
+            <div class="summary-card">
+                <div class="summary-value">{hallucinated}</div>
+                <div class="summary-label">Hallucinated</div>
             </div>
-            <div class="stat-card">
-                <div class="stat-value">{severe}</div>
-                <div class="stat-label">Severe</div>
+            <div class="summary-card">
+                <div class="summary-value">{total_candidates - hallucinated}</div>
+                <div class="summary-label">Consistent</div>
             </div>
-            <div class="stat-card">
-                <div class="stat-value">{moderate}</div>
-                <div class="stat-label">Moderate</div>
+            <div class="summary-card">
+                <div class="summary-value">{avg_consistency:.1%}</div>
+                <div class="summary-label">Avg Consistency</div>
             </div>
-            <div class="stat-card">
-                <div class="stat-value">{minor}</div>
-                <div class="stat-label">Minor</div>
-            </div>
-            <div class="stat-card">
-                <div class="stat-value">{avg_consistency:.1%}</div>
-                <div class="stat-label">Avg Consistency</div>
+            <div class="summary-card">
+                <div class="summary-value">{G.number_of_edges()}</div>
+                <div class="summary-label">Connections</div>
             </div>
         </div>
         
         <div class="legend">
-            <h3>Legend</h3>
             <div class="legend-item">
                 <span class="legend-color" style="background: #0066CC;"></span>
                 Reference
             </div>
             <div class="legend-item">
                 <span class="legend-color" style="background: #CC0000;"></span>
-                Severe
+                Severe Hallucination
             </div>
             <div class="legend-item">
                 <span class="legend-color" style="background: #FF6666;"></span>
-                Moderate
+                Moderate Hallucination
             </div>
             <div class="legend-item">
                 <span class="legend-color" style="background: #FFAA00;"></span>
-                Minor
+                Minor Issues
             </div>
             <div class="legend-item">
                 <span class="legend-color" style="background: #00CC00;"></span>
-                None
+                Consistent
             </div>
         </div>
         
-        <div class="controls">
-            <button onclick="resetView()">Reset View</button>
-            <button onclick="toggleLabels()">Toggle Labels</button>
+        <div id="graph-container">
+            <div class="controls">
+                <button onclick="resetView()">Reset View</button>
+                <button onclick="toggleLabels()">Toggle Labels</button>
+                <button onclick="toggleForce()">Toggle Physics</button>
+            </div>
+            <svg id="graph"></svg>
         </div>
         
-        <div id="graph"></div>
         <div class="tooltip"></div>
         
-        <p style="text-align: center; color: #666; margin-top: 20px;">
-            Edges show semantic similarity ≥ {self.semantic_threshold:.0%}. 
-            Thicker edges indicate stronger similarity.
+        <p class="info">
+            Graph shows only semantically coherent connections (similarity ≥ {self.min_semantic_similarity:.0%}).<br>
+            Thicker edges indicate stronger semantic similarity.
         </p>
     </div>
     
     <script>
-        const nodes = {json.dumps(nodes)};
-        const links = {json.dumps(edges)};
+        const nodes = {json.dumps(nodes_data)};
+        const links = {json.dumps(edges_data)};
         
         const width = 1200;
         const height = 600;
         
         const svg = d3.select("#graph")
-            .append("svg")
             .attr("width", width)
             .attr("height", height);
         
         const g = svg.append("g");
         
+        // Zoom behavior
         const zoom = d3.zoom()
             .scaleExtent([0.1, 10])
             .on("zoom", (event) => {{
@@ -527,12 +634,16 @@ class HallucinationDetector:
         
         svg.call(zoom);
         
-        const simulation = d3.forceSimulation(nodes)
-            .force("link", d3.forceLink(links).id(d => d.id).distance(150))
-            .force("charge", d3.forceManyBody().strength(-400))
-            .force("center", d3.forceCenter(width / 2, height / 2));
+        // Force simulation
+        let simulation = d3.forceSimulation(nodes)
+            .force("link", d3.forceLink(links).id(d => d.id).distance(200))
+            .force("charge", d3.forceManyBody().strength(-500))
+            .force("center", d3.forceCenter(width / 2, height / 2))
+            .force("collision", d3.forceCollide().radius(d => d.size + 20));
         
+        // Draw links
         const link = g.append("g")
+            .attr("class", "links")
             .selectAll("line")
             .data(links)
             .enter().append("line")
@@ -540,7 +651,9 @@ class HallucinationDetector:
             .attr("stroke-opacity", 0.6)
             .attr("stroke-width", d => 1 + d.weight * 5);
         
+        // Draw nodes
         const node = g.append("g")
+            .attr("class", "nodes")
             .selectAll("circle")
             .data(nodes)
             .enter().append("circle")
@@ -554,47 +667,65 @@ class HallucinationDetector:
                 .on("drag", dragged)
                 .on("end", dragended));
         
-        const labels = g.append("g")
+        // Draw labels
+        const label = g.append("g")
+            .attr("class", "labels")
             .selectAll("text")
             .data(nodes)
             .enter().append("text")
             .text(d => d.label)
-            .attr("font-size", 14)
-            .attr("font-weight", "bold")
             .attr("text-anchor", "middle")
-            .attr("dy", -30);
+            .attr("dy", -35)
+            .style("font-weight", "bold")
+            .style("font-size", "14px");
         
+        // Tooltip
         const tooltip = d3.select(".tooltip");
         
         node.on("mouseover", function(event, d) {{
-            let html = `<strong>${{d.label}}</strong><br/>`;
-            html += `Type: ${{d.type}}<br/>`;
+            let html = `<strong>${{d.label}} - ${{d.severity.toUpperCase()}}</strong><br><br>`;
             
             if (d.type === 'candidate') {{
-                html += `Severity: ${{d.severity}}<br/>`;
-                html += `Hallucinated: ${{d.hallucinated ? 'Yes' : 'No'}}<br/><br/>`;
+                html += `<strong>Summary:</strong><br>`;
+                html += `Hallucinated: ${{d.is_hallucinated ? 'Yes' : 'No'}}<br>`;
+                html += `Hallucination Score: ${{(d.hallucination_score * 100).toFixed(1)}}%<br>`;
+                html += `Overall Consistency: ${{(d.overall_consistency * 100).toFixed(1)}}%<br><br>`;
                 
-                html += `<strong>Scores:</strong><br/>`;
-                html += `Hallucination: ${{(d.scores.hallucination * 100).toFixed(1)}}%<br/>`;
-                html += `Consistency: ${{(d.scores.consistency * 100).toFixed(1)}}%<br/>`;
-                html += `Semantic Sim: ${{(d.scores.semantic * 100).toFixed(1)}}%<br/>`;
-                html += `Factual: ${{(d.scores.factual * 100).toFixed(1)}}%<br/>`;
-                html += `Entailment: ${{(d.scores.entailment * 100).toFixed(1)}}%<br/>`;
-                html += `Contradiction: ${{(d.scores.contradiction * 100).toFixed(1)}}%<br/>`;
-                html += `Entropy: ${{d.scores.entropy.toFixed(3)}}<br/>`;
+                html += `<strong>Detailed Metrics:</strong><br>`;
+                if (d.metrics) {{
+                    html += `Semantic Similarity: <span class="metric-bar"><span class="metric-fill" style="width: ${{d.metrics.semantic_similarity * 100}}%"></span></span> ${{(d.metrics.semantic_similarity * 100).toFixed(1)}}%<br>`;
+                    html += `Entailment: <span class="metric-bar"><span class="metric-fill" style="width: ${{d.metrics.entailment * 100}}%"></span></span> ${{(d.metrics.entailment * 100).toFixed(1)}}%<br>`;
+                    html += `Contradiction: <span class="metric-bar"><span class="metric-fill" style="width: ${{d.metrics.contradiction * 100}}%; background: #FF6666;"></span></span> ${{(d.metrics.contradiction * 100).toFixed(1)}}%<br>`;
+                    html += `Factual Consistency: <span class="metric-bar"><span class="metric-fill" style="width: ${{d.metrics.factual_consistency * 100}}%"></span></span> ${{(d.metrics.factual_consistency * 100).toFixed(1)}}%<br>`;
+                    html += `Entropy: ${{d.metrics.entropy.toFixed(3)}}<br>`;
+                    html += `Entropy Divergence: ${{(d.metrics.entropy_divergence * 100).toFixed(1)}}%<br>`;
+                }}
             }}
             
-            html += `<br/><strong>Text:</strong><br/>${{d.text}}`;
+            html += `<br><strong>Text:</strong><br>${{d.text}}`;
             
             tooltip.html(html)
                 .style("left", (event.pageX + 10) + "px")
                 .style("top", (event.pageY - 10) + "px")
                 .style("opacity", 1);
+                
+            // Highlight connected nodes
+            const connectedNodes = new Set([d.id]);
+            links.forEach(l => {{
+                if (l.source.id === d.id) connectedNodes.add(l.target.id);
+                if (l.target.id === d.id) connectedNodes.add(l.source.id);
+            }});
+            
+            node.style("opacity", n => connectedNodes.has(n.id) ? 1 : 0.3);
+            link.style("opacity", l => (l.source.id === d.id || l.target.id === d.id) ? 1 : 0.1);
         }})
         .on("mouseout", function() {{
             tooltip.style("opacity", 0);
+            node.style("opacity", 1);
+            link.style("opacity", 0.6);
         }});
         
+        // Simulation tick
         simulation.on("tick", () => {{
             link
                 .attr("x1", d => d.source.x)
@@ -606,11 +737,12 @@ class HallucinationDetector:
                 .attr("cx", d => d.x)
                 .attr("cy", d => d.y);
             
-            labels
+            label
                 .attr("x", d => d.x)
                 .attr("y", d => d.y);
         }});
         
+        // Drag functions
         function dragstarted(event, d) {{
             if (!event.active) simulation.alphaTarget(0.3).restart();
             d.fx = d.x;
@@ -628,51 +760,46 @@ class HallucinationDetector:
             d.fy = null;
         }}
         
+        // Control functions
         function resetView() {{
             svg.transition().duration(750).call(
                 zoom.transform,
                 d3.zoomIdentity
             );
+            simulation.alpha(1).restart();
         }}
         
         let labelsVisible = true;
         function toggleLabels() {{
             labelsVisible = !labelsVisible;
-            labels.style("display", labelsVisible ? "block" : "none");
+            label.style("display", labelsVisible ? "block" : "none");
+        }}
+        
+        let forceActive = true;
+        function toggleForce() {{
+            forceActive = !forceActive;
+            if (forceActive) {{
+                simulation.alpha(0.3).restart();
+            }} else {{
+                simulation.stop();
+            }}
         }}
     </script>
 </body>
 </html>
 """
         
+        # Save file
         with open(output_path, 'w', encoding='utf-8') as f:
-            f.write(html)
+            f.write(html_content)
         
         return output_path
     
-    def analyze_file(self, reference: str, file_path: str, output_dir: str = ".") -> Dict[str, Any]:
-        """Analyze candidates from file"""
-        print(f"\nReading from: {file_path}")
-        
-        try:
-            with open(file_path, 'r', encoding='utf-8') as f:
-                content = f.read()
-            
-            # Split by double newlines
-            candidates = [p.strip() for p in content.split('\n\n') if p.strip()]
-            print(f"Found {len(candidates)} paragraphs")
-            
-            return self.analyze(reference, candidates, output_dir)
-        
-        except Exception as e:
-            print(f"Error reading file: {e}")
-            return {}
-    
     def analyze(self, reference: str, candidates: List[str], output_dir: str = ".") -> Dict[str, Any]:
-        """Main analysis function"""
-        print("\n" + "="*60)
+        """Analyze candidates for hallucination"""
+        print("\n" + "="*70)
         print("HALLUCINATION DETECTION ANALYSIS")
-        print("="*60)
+        print("="*70)
         
         # Analyze each candidate
         analyses = []
@@ -681,29 +808,45 @@ class HallucinationDetector:
             analysis = self.analyze_paragraph(reference, candidate, i)
             analyses.append(analysis)
             
+            # Print results
+            print(f"  Overall Consistency: {analysis['overall_consistency']:.2%}")
+            print(f"  Hallucination Score: {analysis['hallucination_score']:.2%}")
             print(f"  Severity: {analysis['severity']}")
-            print(f"  Consistency: {analysis['overall_consistency']:.1%}")
-            print(f"  Hallucination Score: {analysis['hallucination_score']:.1%}")
+            print(f"  Metrics:")
+            for metric, value in analysis['metrics'].items():
+                if isinstance(value, float):
+                    print(f"    - {metric}: {value:.3f}")
         
         # Build graph
-        print("\nBuilding graph...")
-        G = self.build_graph(reference, analyses)
-        print(f"Created {G.number_of_nodes()} nodes and {G.number_of_edges()} edges")
+        print("\nBuilding semantic coherence graph...")
+        G = self.build_coherent_graph(reference, analyses)
+        print(f"Created graph with {G.number_of_nodes()} nodes and {G.number_of_edges()} edges")
+        
+        # Calculate total consistency
+        total_consistency = sum(a['overall_consistency'] for a in analyses) / len(analyses) if analyses else 0
         
         # Create visualization
-        print("Creating visualization...")
+        print("\nCreating visualization...")
         viz_path = os.path.join(output_dir, "hallucination_analysis.html")
         self.create_visualization(G, analyses, viz_path)
         
         # Summary
-        total_consistency = sum(a['overall_consistency'] for a in analyses) / len(analyses)
-        
-        print("\n" + "-"*60)
+        print("\n" + "-"*70)
         print("SUMMARY")
-        print("-"*60)
-        print(f"Total analyzed: {len(candidates)}")
-        print(f"Average consistency: {total_consistency:.1%}")
-        print(f"Hallucinated: {sum(1 for a in analyses if a['is_hallucinated'])}")
+        print("-"*70)
+        print(f"Total candidates analyzed: {len(candidates)}")
+        print(f"Overall consistency: {total_consistency:.2%}")
+        print(f"Hallucinated paragraphs: {sum(1 for a in analyses if a['is_hallucinated'])}")
+        print(f"Semantic connections: {G.number_of_edges()}")
+        
+        # Breakdown by severity
+        severity_count = {'none': 0, 'minor': 0, 'moderate': 0, 'severe': 0}
+        for a in analyses:
+            severity_count[a['severity']] += 1
+        
+        print("\nSeverity breakdown:")
+        for severity, count in severity_count.items():
+            print(f"  {severity.capitalize()}: {count}")
         
         print(f"\nVisualization saved to: {viz_path}")
         print("Opening in browser...")
@@ -711,27 +854,30 @@ class HallucinationDetector:
         try:
             webbrowser.open(f'file://{os.path.abspath(viz_path)}')
         except:
-            print("Please open the file manually")
+            print("Please open the HTML file manually in your browser")
         
         return {
             'analyses': analyses,
             'graph': G,
-            'visualization': viz_path,
-            'total_consistency': total_consistency
+            'total_consistency': total_consistency,
+            'visualization_path': viz_path
         }
 
 
-# Example usage
 if __name__ == "__main__":
-    # Initialize detector
+    # Example usage
     detector = HallucinationDetector()
     
-    # Reference text
     reference = """The company reported revenue of $2.5 million in Q4 2023, with a 15% increase from the previous quarter. 
     CEO John Smith announced expansion plans on January 15, 2024, targeting the Asian market. 
     The profit margin improved to 22% due to cost optimization strategies."""
     
-    # Test candidates
+    # If you want to read from file, do it here
+    # with open('candidates.txt', 'r') as f:
+    #     content = f.read()
+    #     candidates = [p.strip() for p in content.split('\n\n') if p.strip()]
+    
+    # Or use a list directly
     candidates = [
         """Q4 2023 revenue reached $2.5 million, marking 15% quarterly growth. 
         John Smith revealed Asian market expansion on January 15, 2024. 
@@ -742,20 +888,12 @@ if __name__ == "__main__":
         Profit margins reached 25% after cost controls.""",
         
         """In Q4 2023, revenue of $2.5 million represented 15% growth. 
-        The Asian market expansion was announced by CEO John Smith. 
-        Cost optimization led to 22% profit margins.""",
+        The Asian market expansion announced by CEO John Smith on January 15, 2024 
+        builds on strong performance. 22% profit margins demonstrate efficiency.""",
         
-        """Business performance showed positive trends in late 2023. 
-        International expansion remains a key strategic priority. 
-        Financial metrics continue to improve significantly."""
+        """The weather forecast shows sunny skies ahead. 
+        Temperature will reach 75 degrees this week. 
+        No rain expected until next month."""
     ]
     
-    # Run analysis
     results = detector.analyze(reference, candidates)
-    
-    # Test file reading
-    print("\n\nTesting file reading...")
-    with open("test_candidates.txt", 'w') as f:
-        f.write('\n\n'.join(candidates))
-    
-    file_results = detector.analyze_file(reference, "test_candidates.txt")
