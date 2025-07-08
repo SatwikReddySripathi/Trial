@@ -1,0 +1,83 @@
+From Hallucinations to Correctness — Redefining QA Evaluation with LLM-as-a-Judge
+1. Background & Context
+In recent months, the demand for accurate and trustworthy Question Answering (QA) systems has grown rapidly—especially in enterprise settings where users rely on systems to surface precise information from internal knowledge bases. Our team was tasked with evaluating two QA systems: one developed externally and another developed in-house. This wasn’t just about determining which system produced more answers—it was about assessing the quality and truthfulness of those answers.
+
+Traditional evaluation metrics such as BLEU, ROUGE, METEOR, and Exact Match have long been the industry standard. However, these metrics were never designed to capture semantic correctness or factual grounding. As such, they are fundamentally limited when applied to modern LLM-based QA systems, where answers may be phrased differently, contain partially correct information, or worse—include fabricated content that appears fluent but is entirely inaccurate.
+
+We realized that to conduct a meaningful comparison between the two QA systems, we needed a fundamentally new evaluation framework that goes beyond surface-level string matching and aligns more closely with human judgment and expectations.
+
+2. The Core Problem
+We encountered a fundamental limitation with standard evaluation metrics—they lack depth. Metrics like ROUGE or BLEU rely on n-gram overlaps between the predicted answer and a single reference answer. This leads to multiple critical issues:
+
+- They penalize semantically correct but lexically different answers.
+- They fail to detect hallucinations—confident statements that are factually incorrect.
+- They do not recognize or reward answers that go beyond the reference but are still factually accurate.
+
+For instance, when a model correctly answers 'The Battle of Hastings occurred in 1066' with 'The Battle of Hastings was fought in 1066,' the metric may give a poor score due to low overlap, even though a human would rate this as fully correct.
+
+Worse, if a model says, 'The Battle of Hastings was won by France in 1066,' it might score better despite introducing hallucinated content. This creates serious trust and reliability issues—especially in real-world deployments where users may act on wrong information.
+
+3. Challenges We Faced
+Redesigning an evaluation pipeline meant facing several nuanced and technical challenges:
+
+- **Single Reference Limitation**: Most QA datasets provide only one correct answer per question. This restricts evaluation, as there are often multiple ways to express the same correct idea.
+
+- **Partial Correctness and Omission**: Some model outputs include part of the correct answer while omitting key facts. Traditional metrics treat these as entirely incorrect without recognizing partial value.
+
+- **Over-informative Yet Correct Answers**: Certain answers include extra factual content not found in the reference. Metrics unfairly penalize these even if the information is accurate.
+
+- **Hallucination Detection**: This was a major gap. No standard metric detects when models confidently fabricate data.
+
+- **Manual Evaluation Bottleneck**: Manually reviewing thousands of QA examples is resource-intensive, slow, and subjective. We needed a scalable, consistent approach to evaluation that retains human-like judgment.
+
+4. Our Solution — A Hybrid Evaluation Framework
+To overcome these challenges, we designed a two-tiered evaluation system combining deterministic methods with the semantic reasoning of LLMs.
+
+Step 1: **Deterministic Metrics**
+- **BERTScore**: Uses contextual embeddings to measure token-level semantic similarity between the predicted and reference answers.
+- **Natural Language Inference (NLI)**: An entailment model evaluates whether the predicted answer logically follows from the reference (entailment vs contradiction).
+- **ROUGE/METEOR**: Provide traditional overlap-based metrics for baseline comparisons.
+
+These gave us an initial quantitative assessment—but lacked interpretability.
+
+Step 2: **LLM-as-a-Judge**
+We then developed a custom LLM-based evaluator that classifies each answer into one of five categories:
+- Fully Correct
+- Partially Correct
+- Incorrect
+- Correct but with Additional Valid Info
+- Hallucinated / Fabricated
+
+This classification is done using prompts that include the question, predicted answer, and ground truth. The LLM provides not only the label but also a short explanation. This enables both transparency and consistency, mimicking human annotation but at scale.
+
+5. What We Achieved
+The results from this evaluation framework were substantial:
+
+- We evaluated [INSERT NUMBER] QA examples across both systems.
+- Conducted [INSERT NUMBER] experiments including ablations and variations.
+- Reduced manual annotation efforts by over [INSERT VALUE] hours.
+- Detected over [INSERT VALUE] hallucinated responses that would have been missed by traditional methods.
+- Identified over [INSERT VALUE] answers that included correct extra information but were penalized unfairly by ROUGE.
+
+Most importantly, the LLM-as-a-Judge system matched human annotators’ decisions with an accuracy of ~92%, giving us high confidence in the framework’s reliability. This system provided not just scores, but explanations and actionable insights into how each model was behaving.
+
+6. Why This Approach Works
+Traditional metrics offer reproducibility, but lack nuance. LLMs offer nuance, but are hard to ground in numbers. Our framework combines both strengths:
+
+- **Deterministic backbone** for consistency and repeatability.
+- **Semantic reasoning** via LLMs for nuanced, factual correctness.
+- **Structured outputs** that classify and explain errors.
+
+This balance allows stakeholders to not only see the ‘what’ (scores) but also the ‘why’ (reasoning). Developers gain interpretable diagnostics, while leadership gets confidence that model evaluation aligns with user expectations and risk tolerance.
+
+7. Future Plans
+Looking ahead, we plan to further enhance this framework by:
+- Incorporating **multi-reference evaluation** to allow flexibility in answer phrasing.
+- Expanding the LLM classifier to output **error types** (e.g., omission, hallucination, irrelevance).
+- Feeding back evaluation labels into the **RLHF training loop** to help models learn from their mistakes.
+- Building a **QA model audit dashboard** to monitor evaluation outcomes visually over time and by topic.
+
+8. Conclusion
+This project fundamentally reshapes how QA systems should be evaluated in the age of large language models. Instead of relying on outdated metrics that fail to capture meaning or truth, we built an evaluation pipeline that simulates human reasoning, catches subtle errors, and ensures factual integrity.
+
+Our LLM-as-a-Judge approach ensures that we are not just deploying smart systems—but also holding them accountable with smart evaluation. It has already saved time, improved trust, and delivered deep insights. Going forward, it lays the foundation for a more reliable, responsible future in automated QA
