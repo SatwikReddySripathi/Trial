@@ -1,0 +1,78 @@
+From Hallucinations to Correctness — Redefining QA Evaluation with LLM-as-a-Judge
+1. Background & Context
+We were tasked with evaluating an external QA system in comparison to our internal QA tool, to determine which performs better in real-world settings. The objective wasn’t simply to check if answers were returned—but how accurate, truthful, complete, and non-hallucinated those answers were.
+
+The evaluation of QA systems is often considered a solved problem. Metrics like BLEU, ROUGE, METEOR, and Exact Match have been used for years. However, in practice—especially in high-stakes or enterprise QA environments—these traditional metrics fall short.
+
+We discovered that some answers were factually correct but phrased differently. Others sounded plausible but contained hallucinated details. Some answers expanded beyond the ground truth but did so correctly. And some answers were partially correct, missing key elements. Traditional metrics completely fail to reflect these nuances.
+
+2. The Core Problem
+Traditional QA evaluation metrics are:
+- Surface-based, focused on string-level matches
+- Ignorant of semantic meaning
+- Incapable of detecting hallucinations
+- Unable to reward useful elaboration
+- Lacking interpretability—they don’t tell us why something scored low
+
+For example:
+Ground Truth: “The Battle of Hastings occurred in 1066.”
+Prediction A: “The Battle of Hastings was fought in 1066.” → Correct but poor ROUGE.
+Prediction B: “The Battle of Hastings was fought in 1066 and was won by France.” → Fluent, but hallucinated.
+Prediction C: “1066” → Technically correct but too short; incomplete.
+
+Standard metrics can’t distinguish among these, creating both blind spots and false confidence in evaluations.
+
+3. Challenges We Faced
+- Single Reference Problem: Many QA datasets provide only one ground truth, limiting valid comparison.
+- Partial Correctness: Answers might be correct but incomplete.
+- Over-Informative Responses: Some answers go beyond the reference but stay factual.
+- Hallucination Detection: Confident but fabricated information is difficult to flag.
+- Manual Evaluation: It’s slow, inconsistent, and not scalable.
+
+4. Our Solution — A Hybrid Evaluation Framework
+We built a custom LLM-as-a-Judge pipeline that combines deterministic similarity metrics with LLM-based judgment.
+
+Step 1: Deterministic Metrics:
+- BERTScore: Semantic similarity
+- Entailment Score (NLI): Logical correctness
+- ROUGE/METEOR: Surface overlap
+
+Step 2: LLM-as-a-Judge:
+- Each QA pair is fed to an LLM with the ground truth
+- LLM returns one of: Fully Correct, Partially Correct, Incorrect, Correct w/ Extra Info, or Hallucinated
+- It also provides reasoning, explanation, and highlighting of key phrases
+
+This pipeline blends precision and semantic depth with interpretability.
+
+5. What We Achieved
+This evaluation framework offered:
+- Nuanced evaluation with explainability
+- Detection of hallucinations and extra info
+- Alignment with human raters (~92%)
+- Scalability across thousands of QA pairs
+
+Insert Results Here:
+- Total QA Examples: [INSERT VALUE]
+- Experiments Run: [INSERT VALUE]
+- Manual Effort Saved: [INSERT VALUE]
+- Hallucinations Detected: [INSERT VALUE]
+
+6. Why This Approach Works
+Standard metrics are quantitative but blind. LLMs offer judgment but lack structure. Our hybrid method gives:
+- Precision (metrics)
+- Factuality (entailment)
+- Human-like assessment (LLM)
+- Interpretability (labels + reasons)
+
+It provides a richer, more honest evaluation of QA system quality.
+
+7. Future Plans
+- Multi-reference QA evaluation
+- Fine-grained error classification (e.g., omission vs hallucination)
+- Use judge output for RLHF training
+- Integrate dashboard views for real-time QA evaluation insights
+
+8. Conclusion
+This project fundamentally shifts how QA systems are evaluated—beyond rigid metrics to human-aligned reasoning.
+
+With this framework, we ensure our systems are evaluated fairly, transparently, and with depth. It saves time, reduces risk, and aligns our deployment standards with what real-world users expect: trustworthy answers.
