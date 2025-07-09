@@ -1,0 +1,1399 @@
+# “””
+Enhanced Hallucination Detection System
+
+Improved factual consistency checking with strict hallucination detection
+for date/money/number mismatches and unverifiable information
+“””
+
+import numpy as np
+from typing import List, Dict, Tuple, Set, Any, Optional
+import re
+import networkx as nx
+from sklearn.metrics.pairwise import cosine_similarity
+from sklearn.feature_extraction.text import TfidfVectorizer
+import nltk
+from nltk.tokenize import sent_tokenize, word_tokenize
+from collections import defaultdict
+import warnings
+from scipy.stats import entropy
+from sentence_transformers import SentenceTransformer
+from transformers import pipeline
+import torch
+import webbrowser
+import os
+import json
+from datetime import datetime
+import dateutil.parser
+
+warnings.filterwarnings(‘ignore’)
+
+# Download required NLTK data
+
+nltk.download(‘punkt’, quiet=True)
+nltk.download(‘stopwords’, quiet=True)
+nltk.download(‘averaged_perceptron_tagger’, quiet=True)
+nltk.download(‘maxent_ne_chunker’, quiet=True)
+nltk.download(‘words’, quiet=True)
+
+class EnhancedHallucinationDetector:
+“”“Enhanced detection with strict factual consistency checking”””
+
+```
+def __init__(self, use_gpu=False):
+    """Initialize the detector"""
+    self.device = 'cuda' if use_gpu and torch.cuda.is_available() else 'cpu'
+    print(f"Initializing Enhanced Hallucination Detector on {self.device}...")
+    
+    # Models
+    print("Loading models...")
+    self.sentence_model = SentenceTransformer('all-MiniLM-L6-v2')
+    self.sentence_model.to(self.device)
+    
+    self.nli_pipeline = pipeline(
+        "text-classification", 
+        model="cross-encoder/nli-deberta-v3-base",
+        device=0 if self.device == 'cuda' else -1
+    )
+    
+    self.tfidf_vectorizer = TfidfVectorizer(
+        max_features=1000,
+        ngram_range=(1, 3),
+        stop_words='english'
+    )
+    
+    # Enhanced patterns for better extraction
+    self.patterns = {
+        'date': r'\b(?:\d{1,2}[-/]\d{1,2}[-/]\d{2,4}|\d{4}[-/]\d{1,2}[-/]\d{1,2}|(?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)[a-z]* \d{1,2},? \d{4}|Q[1-4] \d{4})\b',
+        'money': r'\$[\d,]+(?:\.\d{2})?(?:\s*(?:million|billion|thousand|M|B|K))?\b|\b\d+(?:,\d{3})*(?:\.\d{2})?\s*(?:dollars?|USD|cents?|million|billion)\b',
+        'percentage': r'\b\d+(?:\.\d+)?%',
+        'number': r'\b\d+(?:,\d{3})*(?:\.\d+)?\b',
+        'time': r'\b\d{1,2}:\d{2}(?::\d{2})?\s*(?:AM|PM|am|pm)?\b',
+        'quarter': r'\bQ[1-4]\s*\d{4}\b'
+    }
+    
+    # Stricter thresholds for hallucination detection
+    self.thresholds = {
+        # Semantic similarity thresholds
+        'semantic_high': 0.8,
+        'semantic_medium': 0.6,
+        'semantic_low': 0.3,
+        
+        # Factual consistency thresholds - stricter
+        'factual_strict': 0.95,  # Increased
+        'factual_moderate': 0.8,  # Increased
+        'factual_loose': 0.6,     # Increased
+        
+        # Entailment thresholds
+        'entailment_high': 0.7,
+        'entailment_low': 0.4,
+        'contradiction_high': 0.6,
+        'contradiction_low': 0.3,
+        
+        # Hallucination decision threshold
+        'hallucination': 0.4,  # Lower threshold = more sensitive
+        
+        # New thresholds for extra information
+        'extra_info_tolerance': 0.2  # How much extra info is acceptable
+    }
+    
+    print("Initialization complete!")
+
+def extract_comprehensive_entities(self, text: str) -> Dict[str, Any]:
+    """Extract all entities and facts comprehensively"""
+    entities = {
+        'dates': set(),
+        'dates_normalized': {},  # date_string -> normalized_date
+        'money': set(),
+        'money_normalized': [],  # (value, context, original_string)
+        'percentages': set(),
+        'numbers': set(),
+        'numbers_with_context': [],  # (number, context)
+        'times': set(),
+        'named_entities': {},  # entity -> type
+        'key_facts': [],  # Important factual statements
+        'actions': [],  # What happened (verbs + objects)
+        'claims': [],  # Specific claims made
+        'all_facts': set()  # All extractable facts for comparison
+    }
+    
+    # Extract dates with normalization
+    date_matches = re.findall(self.patterns['date'], text, re.IGNORECASE)
+    for date_str in date_matches:
+        entities['dates'].add(date_str)
+        # Try to normalize the date
+        try:
+            if 'Q' in date_str:  # Quarter format
+                entities['dates_normalized'][date_str] = date_str
+            else:
+                parsed_date = dateutil.parser.parse(date_str, fuzzy=False)
+                entities['dates_normalized'][date_str] = parsed_date.strftime('%Y-%m-%d')
+        except:
+            entities['dates_normalized'][date_str] = date_str
+    
+    # Extract times
+    entities['times'] = set(re.findall(self.patterns['time'], text, re.IGNORECASE))
+    
+    # Extract percentages with context
+    for match in re.finditer(self.patterns['percentage'], text):
+        percentage = match.group()
+        entities['percentages'].add(percentage)
+        context = self._find_context(text, percentage, window=10)
+        entities['all_facts'].add(f"percentage:{percentage}:{context}")
+    
+    # Extract and normalize money with enhanced context
+    for match in re.finditer(self.patterns['money'], text, re.IGNORECASE):
+        money_str = match.group()
+        entities['money'].add(money_str)
+        value = self._normalize_money_value(money_str)
+        context = self._find_context(text, money_str, window=10)
+        if value:
+            entities['money_normalized'].append((value, context, money_str))
+            entities['all_facts'].add(f"money:{value}:{context}")
+    
+    # Extract numbers with context (not part of other entities)
+    for match in re.finditer(self.patterns['number'], text):
+        num_str = match.group()
+        # Check if this number is part of money, percentage, or date
+        is_part_of_other = False
+        for pattern_type in ['money', 'percentage', 'date']:
+            for entity_match in re.finditer(self.patterns[pattern_type], text, re.IGNORECASE):
+                if match.start() >= entity_match.start() and match.end() <= entity_match.end():
+                    is_part_of_other = True
+                    break
+            if is_part_of_other:
+                break
+        
+        if not is_part_of_other:
+            try:
+                num_value = float(num_str.replace(',', ''))
+                entities['numbers'].add(num_value)
+                context = self._find_context(text, num_str, window=10)
+                entities['numbers_with_context'].append((num_value, context))
+                entities['all_facts'].add(f"number:{num_value}:{context}")
+            except:
+                pass
+    
+    # Extract named entities with context
+    try:
+        sentences = sent_tokenize(text)
+        for sent in sentences:
+            tokens = word_tokenize(sent)
+            pos_tags = nltk.pos_tag(tokens)
+            chunks = nltk.ne_chunk(pos_tags, binary=False)
+            
+            for chunk in chunks:
+                if hasattr(chunk, 'label'):
+                    entity_name = ' '.join(c[0] for c in chunk)
+                    entity_type = chunk.label()
+                    entities['named_entities'][entity_name.lower()] = entity_type
+                    entities['all_facts'].add(f"entity:{entity_name.lower()}:{entity_type}")
+    except:
+        pass
+    
+    # Extract key facts (sentences with important information)
+    important_verbs = ['reported', 'announced', 'increased', 'decreased', 'improved', 
+                      'declined', 'rose', 'fell', 'reached', 'achieved', 'lost', 
+                      'gained', 'earned', 'expanded', 'launched', 'released']
+    
+    for sent in sent_tokenize(text):
+        # If sentence contains entities or important verbs
+        has_important_info = (
+            any(verb in sent.lower() for verb in important_verbs) or
+            any(re.search(self.patterns[p], sent) for p in self.patterns)
+        )
+        
+        if has_important_info:
+            entities['key_facts'].append(sent.strip())
+            # Extract specific facts from the sentence
+            self._extract_sentence_facts(sent, entities)
+    
+    # Extract actions (verb phrases) with objects
+    for sent in sent_tokenize(text):
+        tokens = word_tokenize(sent)
+        pos_tags = nltk.pos_tag(tokens)
+        
+        i = 0
+        while i < len(pos_tags):
+            if pos_tags[i][1].startswith('VB'):  # Verb
+                verb = pos_tags[i][0]
+                # Look for object
+                obj_parts = []
+                j = i + 1
+                while j < len(pos_tags) and pos_tags[j][1] in ['NN', 'NNS', 'NNP', 'NNPS', 'DT', 'JJ', 'CD']:
+                    obj_parts.append(pos_tags[j][0])
+                    j += 1
+                if obj_parts:
+                    action = f"{verb} {' '.join(obj_parts)}"
+                    entities['actions'].append(action.lower())
+                    entities['all_facts'].add(f"action:{action.lower()}")
+            i += 1
+    
+    # Extract specific claims (statements with specific values)
+    for sent in sent_tokenize(text):
+        if any(re.search(self.patterns[p], sent) for p in ['money', 'percentage', 'number', 'date']):
+            entities['claims'].append(sent.strip())
+    
+    return entities
+
+def _extract_sentence_facts(self, sentence: str, entities: Dict[str, Any]):
+    """Extract specific facts from a sentence"""
+    # Extract subject-verb-object patterns
+    tokens = word_tokenize(sentence)
+    pos_tags = nltk.pos_tag(tokens)
+    
+    # Simple fact extraction
+    fact_patterns = []
+    for i in range(len(pos_tags) - 2):
+        if pos_tags[i][1] in ['NN', 'NNP', 'NNS', 'NNPS']:
+            if pos_tags[i+1][1].startswith('VB'):
+                if pos_tags[i+2][1] in ['NN', 'NNP', 'CD', 'JJ']:
+                    fact = f"{pos_tags[i][0]} {pos_tags[i+1][0]} {pos_tags[i+2][0]}"
+                    entities['all_facts'].add(f"fact:{fact.lower()}")
+
+def _normalize_money_value(self, money_str: str) -> Optional[float]:
+    """Normalize money string to float value"""
+    try:
+        # Clean the string
+        clean_str = money_str.replace('$', '').replace(',', '').strip()
+        
+        # Extract numeric part
+        numeric_match = re.search(r'([\d.]+)', clean_str)
+        if numeric_match:
+            value = float(numeric_match.group(1))
+            
+            # Check for multipliers
+            lower_str = money_str.lower()
+            if any(x in lower_str for x in ['billion', 'b']):
+                value *= 1000000000
+            elif any(x in lower_str for x in ['million', 'm']):
+                value *= 1000000
+            elif any(x in lower_str for x in ['thousand', 'k']):
+                value *= 1000
+            
+            return value
+    except:
+        pass
+    return None
+
+def _find_context(self, text: str, target: str, window: int = 10) -> str:
+    """Find context around a target string"""
+    idx = text.find(target)
+    if idx == -1:
+        return ""
+    
+    # Get surrounding words
+    words = text.split()
+    target_words = target.split()
+    
+    # Find word indices
+    for i in range(len(words) - len(target_words) + 1):
+        if ' '.join(words[i:i+len(target_words)]) == target:
+            start_idx = max(0, i - window)
+            end_idx = min(len(words), i + len(target_words) + window)
+            context = ' '.join(words[start_idx:end_idx])
+            return context
+    
+    # Fallback to character-based context
+    before_idx = max(0, idx - 50)
+    after_idx = min(len(text), idx + len(target) + 50)
+    return text[before_idx:after_idx].strip()
+
+def check_factual_consistency(self, ref_entities: Dict, cand_entities: Dict) -> Dict[str, Any]:
+    """Enhanced factual consistency checking with strict mismatch detection"""
+    results = {
+        'date_consistency': 1.0,
+        'money_consistency': 1.0,
+        'percentage_consistency': 1.0,
+        'number_consistency': 1.0,
+        'entity_consistency': 1.0,
+        'action_consistency': 1.0,
+        'inconsistencies': [],
+        'missing_facts': [],
+        'additional_facts': [],
+        'contradictions': [],
+        'unverifiable_facts': [],
+        'fact_mismatches': []
+    }
+    
+    # Check dates - any mismatch is a hallucination
+    if ref_entities['dates'] or cand_entities['dates']:
+        ref_dates = ref_entities['dates']
+        cand_dates = cand_entities['dates']
+        
+        # Check normalized dates for better comparison
+        ref_norm = set(ref_entities['dates_normalized'].values())
+        cand_norm = set(cand_entities['dates_normalized'].values())
+        
+        if ref_dates and cand_dates:
+            # Any date in candidate not in reference is a hallucination
+            extra_dates = cand_dates - ref_dates
+            if extra_dates:
+                results['contradictions'].append(f"Date mismatch - found unexpected dates: {extra_dates}")
+                results['date_consistency'] = 0.0
+                results['fact_mismatches'].append(('date', list(ref_dates), list(cand_dates)))
+            
+            # Missing dates are also problematic
+            missing_dates = ref_dates - cand_dates
+            if missing_dates:
+                results['missing_facts'].append(f"Missing dates: {missing_dates}")
+                results['date_consistency'] *= 0.5
+                
+            # If exact matches exist, check normalized versions
+            if not extra_dates and not missing_dates:
+                results['date_consistency'] = 1.0
+        elif ref_dates and not cand_dates:
+            results['missing_facts'].append(f"Missing all dates: {ref_dates}")
+            results['date_consistency'] = 0.0
+        elif not ref_dates and cand_dates:
+            results['unverifiable_facts'].append(f"Unverifiable dates added: {cand_dates}")
+            results['date_consistency'] = 0.0
+    
+    # Check money values - strict matching
+    if ref_entities['money_normalized'] or cand_entities['money_normalized']:
+        ref_money_dict = {}
+        cand_money_dict = {}
+        
+        # Build dictionaries for comparison
+        for value, context, orig in ref_entities['money_normalized']:
+            key = self._extract_money_key(context)
+            ref_money_dict[key] = (value, orig)
+        
+        for value, context, orig in cand_entities['money_normalized']:
+            key = self._extract_money_key(context)
+            cand_money_dict[key] = (value, orig)
+        
+        # Check for mismatches
+        for key, (ref_value, ref_orig) in ref_money_dict.items():
+            if key in cand_money_dict:
+                cand_value, cand_orig = cand_money_dict[key]
+                # Allow only 1% tolerance for rounding
+                if abs(ref_value - cand_value) / max(ref_value, cand_value) > 0.01:
+                    results['contradictions'].append(
+                        f"Money value mismatch: {ref_orig} vs {cand_orig}"
+                    )
+                    results['money_consistency'] = 0.0
+                    results['fact_mismatches'].append(('money', ref_value, cand_value))
+        
+        # Check for extra money values
+        for key, (cand_value, cand_orig) in cand_money_dict.items():
+            if key not in ref_money_dict:
+                results['unverifiable_facts'].append(f"Unverifiable money value: {cand_orig}")
+                results['money_consistency'] = 0.0
+        
+        # Check for missing money values
+        for key, (ref_value, ref_orig) in ref_money_dict.items():
+            if key not in cand_money_dict:
+                results['missing_facts'].append(f"Missing money value: {ref_orig}")
+                results['money_consistency'] *= 0.5
+    
+    # Check percentages - exact matching required
+    if ref_entities['percentages'] or cand_entities['percentages']:
+        ref_pct = ref_entities['percentages']
+        cand_pct = cand_entities['percentages']
+        
+        if ref_pct and cand_pct:
+            # Extract numeric values for comparison
+            ref_pct_values = {self._extract_percentage_value(p) for p in ref_pct}
+            cand_pct_values = {self._extract_percentage_value(p) for p in cand_pct}
+            
+            extra_pct = cand_pct_values - ref_pct_values
+            missing_pct = ref_pct_values - cand_pct_values
+            
+            if extra_pct:
+                results['contradictions'].append(f"Percentage mismatch - unexpected values: {extra_pct}")
+                results['percentage_consistency'] = 0.0
+                results['fact_mismatches'].append(('percentage', list(ref_pct_values), list(cand_pct_values)))
+            
+            if missing_pct:
+                results['missing_facts'].append(f"Missing percentages: {missing_pct}")
+                results['percentage_consistency'] *= 0.5
+                
+            if not extra_pct and not missing_pct:
+                results['percentage_consistency'] = 1.0
+        elif ref_pct and not cand_pct:
+            results['missing_facts'].append(f"Missing all percentages: {ref_pct}")
+            results['percentage_consistency'] = 0.0
+        elif not ref_pct and cand_pct:
+            results['unverifiable_facts'].append(f"Unverifiable percentages added: {cand_pct}")
+            results['percentage_consistency'] = 0.0
+    
+    # Check named entities
+    if ref_entities['named_entities'] or cand_entities['named_entities']:
+        ref_entities_set = set(ref_entities['named_entities'].keys())
+        cand_entities_set = set(cand_entities['named_entities'].keys())
+        
+        # Extra entities that weren't in reference
+        extra_entities = cand_entities_set - ref_entities_set
+        if extra_entities:
+            # Check if these are significant entities
+            significant_extra = [e for e in extra_entities 
+                               if ref_entities['named_entities'].get(e, 'UNKNOWN') in ['PERSON', 'ORG']]
+            if significant_extra:
+                results['unverifiable_facts'].append(f"Unverifiable entities: {significant_extra}")
+                results['entity_consistency'] *= 0.7
+        
+        # Missing entities
+        missing_entities = ref_entities_set - cand_entities_set
+        if missing_entities:
+            results['missing_facts'].append(f"Missing entities: {missing_entities}")
+            results['entity_consistency'] *= 0.8
+    
+    # Check for completely new facts
+    ref_facts = ref_entities['all_facts']
+    cand_facts = cand_entities['all_facts']
+    
+    new_facts = cand_facts - ref_facts
+    if new_facts:
+        # Filter out minor variations
+        significant_new_facts = [f for f in new_facts if not self._is_minor_variation(f, ref_facts)]
+        if significant_new_facts:
+            results['unverifiable_facts'].append(f"New unverifiable facts: {len(significant_new_facts)}")
+    
+    # Calculate overall consistency with stricter scoring
+    consistency_scores = [
+        results['date_consistency'],
+        results['money_consistency'],
+        results['percentage_consistency'],
+        results['entity_consistency']
+    ]
+    
+    # Any factual mismatch should heavily penalize the score
+    if results['fact_mismatches'] or results['contradictions']:
+        # Major factual errors
+        results['overall_consistency'] = 0.0
+    elif results['unverifiable_facts']:
+        # Unverifiable information
+        results['overall_consistency'] = min(0.3, np.mean(consistency_scores))
+    else:
+        # Weight critical facts more heavily
+        weights = [2.0, 2.0, 2.0, 1.0]  # Dates, money, percentages are critical
+        results['overall_consistency'] = np.average(consistency_scores, weights=weights)
+    
+    return results
+
+def _extract_money_key(self, context: str) -> str:
+    """Extract key terms from money context for matching"""
+    # Remove common words and extract key terms
+    stopwords = {'the', 'a', 'an', 'in', 'on', 'at', 'to', 'for', 'of', 'with', 'was', 'is', 'are', 'were'}
+    words = context.lower().split()
+    key_words = [w for w in words if w not in stopwords and len(w) > 2]
+    return ' '.join(sorted(key_words[:3]))  # Use first 3 key words
+
+def _extract_percentage_value(self, pct_str: str) -> float:
+    """Extract numeric value from percentage string"""
+    try:
+        return float(pct_str.replace('%', '').strip())
+    except:
+        return 0.0
+
+def _is_minor_variation(self, fact: str, ref_facts: Set[str]) -> bool:
+    """Check if a fact is just a minor variation of existing facts"""
+    fact_parts = fact.lower().split(':')
+    if len(fact_parts) < 2:
+        return True
+    
+    fact_type = fact_parts[0]
+    fact_content = ':'.join(fact_parts[1:])
+    
+    for ref_fact in ref_facts:
+        ref_parts = ref_fact.lower().split(':')
+        if len(ref_parts) < 2:
+            continue
+        
+        ref_type = ref_parts[0]
+        ref_content = ':'.join(ref_parts[1:])
+        
+        # Same type of fact
+        if fact_type == ref_type:
+            # Check similarity
+            if self._string_similarity(fact_content, ref_content) > 0.8:
+                return True
+    
+    return False
+
+def _string_similarity(self, s1: str, s2: str) -> float:
+    """Simple string similarity based on word overlap"""
+    words1 = set(s1.lower().split())
+    words2 = set(s2.lower().split())
+    
+    if not words1 or not words2:
+        return 0.0
+    
+    intersection = len(words1 & words2)
+    union = len(words1 | words2)
+    
+    return intersection / union if union > 0 else 0.0
+
+def classify_hallucination_comprehensive(self, reference: str, candidate: str) -> Dict:
+    """Enhanced hallucination detection with strict fact checking"""
+    # Extract entities
+    ref_entities = self.extract_comprehensive_entities(reference)
+    cand_entities = self.extract_comprehensive_entities(candidate)
+    
+    # 1. Semantic Similarity Analysis
+    semantic_results = self.calculate_semantic_similarity(reference, candidate)
+    
+    # 2. Enhanced Factual Consistency Analysis
+    factual_results = self.check_factual_consistency(ref_entities, cand_entities)
+    
+    # 3. Entailment Analysis
+    entailment_results = self.check_entailment_bidirectional(reference, candidate)
+    
+    # Enhanced Hallucination Detection Logic
+    is_hallucinated = False
+    hallucination_score = 0.0
+    hallucination_type = None
+    confidence = 0.0
+    reasons = []
+    
+    # Priority 1: Check for factual mismatches (highest priority)
+    if factual_results['fact_mismatches']:
+        is_hallucinated = True
+        hallucination_type = "FACTUAL_ERROR"
+        confidence = 0.95
+        for mismatch_type, ref_val, cand_val in factual_results['fact_mismatches']:
+            reasons.append(f"{mismatch_type.capitalize()} mismatch: expected {ref_val}, found {cand_val}")
+    
+    # Priority 2: Check for contradictions in facts
+    elif factual_results['contradictions']:
+        is_hallucinated = True
+        hallucination_type = "CONTRADICTION"
+        confidence = 0.9
+        reasons.extend(factual_results['contradictions'])
+    
+    # Priority 3: Check for unverifiable information
+    elif factual_results['unverifiable_facts']:
+        # High semantic similarity but new facts = likely hallucination
+        if semantic_results['combined'] > self.thresholds['semantic_high']:
+            is_hallucinated = True
+            hallucination_type = "FABRICATION"
+            confidence = 0.85
+            reasons.extend(factual_results['unverifiable_facts'])
+        # Medium similarity with new facts = suspicious
+        elif semantic_results['combined'] > self.thresholds['semantic_medium']:
+            is_hallucinated = True
+            hallucination_type = "UNVERIFIABLE_ADDITION"
+            confidence = 0.75
+            reasons.extend(factual_results['unverifiable_facts'])
+    
+    # Priority 4: Check for missing critical information
+    elif factual_results['missing_facts'] and len(factual_results['missing_facts']) > 2:
+        is_hallucinated = True
+        hallucination_type = "CRITICAL_OMISSION"
+        confidence = 0.7
+        reasons.extend(factual_results['missing_facts'])
+    
+    # Priority 5: Check entailment-based contradictions
+    elif entailment_results['contradiction'] > self.thresholds['contradiction_high']:
+        is_hallucinated = True
+        hallucination_type = "LOGICAL_CONTRADICTION"
+        confidence = 0.65
+        reasons.append(f"High contradiction score: {entailment_results['contradiction']:.2f}")
+    
+    # Priority 6: Low factual consistency despite high similarity
+    elif (semantic_results['combined'] > self.thresholds['semantic_high'] and
+          factual_results['overall_consistency'] < self.thresholds['factual_strict']):
+        is_hallucinated = True
+        hallucination_type = "SUBTLE_INCONSISTENCY"
+        confidence = 0.6
+        if factual_results['inconsistencies']:
+            reasons.extend(factual_results['inconsistencies'])
+    
+    # Calculate comprehensive hallucination score
+    hallucination_score = self._calculate_enhanced_hallucination_score(
+        semantic_results, factual_results, entailment_results, 
+        is_hallucinated, len(reasons)
+    )
+    
+    return {
+        'is_hallucinated': is_hallucinated,
+        'hallucination_score': hallucination_score,
+        'hallucination_type': hallucination_type,
+        'confidence': confidence,
+        'reasons': reasons,
+        'semantic_similarity': semantic_results,
+        'factual_consistency': factual_results,
+        'entailment': entailment_results,
+        'entities': {
+            'reference': ref_entities,
+            'candidate': cand_entities
+        }
+    }
+
+def _calculate_enhanced_hallucination_score(self, semantic: Dict, factual: Dict, 
+                                          entailment: Dict, is_hallucinated: bool,
+                                          num_reasons: int) -> float:
+    """Calculate enhanced hallucination score with stricter penalties"""
+    # Base components
+    semantic_component = 1 - semantic['combined']
+    factual_component = 1 - factual['overall_consistency']
+    contradiction_component = entailment['contradiction']
+    
+    # Penalty for number of issues found
+    issue_penalty = min(num_reasons * 0.1, 0.5)
+    
+    # Stricter weighting based on factual errors
+    if factual_results['fact_mismatches'] or factual_results['contradictions']:
+        # Critical factual errors - maximum penalty
+        score = 0.9 + (contradiction_component * 0.1)
+    elif factual_results['unverifiable_facts']:
+        # Unverifiable information - high penalty
+        weights = [0.2, 0.5, 0.3]
+        score = (
+            semantic_component * weights[0] +
+            factual_component * weights[1] +
+            contradiction_component * weights[2]
+        ) + issue_penalty
+    else:
+        # Standard calculation
+        if semantic['combined'] > self.thresholds['semantic_high']:
+            weights = [0.2, 0.5, 0.3]
+        elif semantic['combined'] > self.thresholds['semantic_medium']:
+            weights = [0.3, 0.4, 0.3]
+        else:
+            weights = [0.5, 0.25, 0.25]
+        
+        score = (
+            semantic_component * weights[0] +
+            factual_component * weights[1] +
+            contradiction_component * weights[2]
+        )
+    
+    # Ensure consistency with boolean classification
+    if is_hallucinated and score < 0.5:
+        score = 0.5 + (score * 0.5)
+    elif not is_hallucinated and score > 0.5:
+        score = score * 0.5
+    
+    return min(score, 1.0)
+
+def calculate_semantic_similarity(self, text1: str, text2: str) -> Dict[str, float]:
+    """Calculate multiple semantic similarity metrics"""
+    results = {}
+    
+    # Sentence transformer similarity
+    try:
+        embeddings = self.sentence_model.encode([text1, text2])
+        results['transformer_similarity'] = float(cosine_similarity([embeddings[0]], [embeddings[1]])[0][0])
+    except:
+        results['transformer_similarity'] = 0.0
+    
+    # TF-IDF similarity
+    try:
+        texts = [text1, text2]
+        tfidf_matrix = self.tfidf_vectorizer.fit_transform(texts)
+        results['tfidf_similarity'] = float(cosine_similarity(tfidf_matrix[0:1], tfidf_matrix[1:2])[0][0])
+    except:
+        results['tfidf_similarity'] = 0.0
+    
+    # Word overlap (Jaccard similarity)
+    words1 = set(word_tokenize(text1.lower()))
+    words2 = set(word_tokenize(text2.lower()))
+    if words1 or words2:
+        results['word_overlap'] = len(words1 & words2) / len(words1 | words2)
+    else:
+        results['word_overlap'] = 0.0
+    
+    # Combined score
+    results['combined'] = (
+        results['transformer_similarity'] * 0.5 +
+        results['tfidf_similarity'] * 0.3 +
+        results['word_overlap'] * 0.2
+    )
+    
+    return results
+
+def check_entailment_bidirectional(self, text1: str, text2: str) -> Dict[str, float]:
+    """Check entailment in both directions"""
+    forward = self.check_entailment(text1, text2)
+    backward = self.check_entailment(text2, text1)
+    
+    results = {
+        'entailment': (forward['entailment'] + backward['entailment']) / 2,
+        'neutral': (forward['neutral'] + backward['neutral']) / 2,
+        'contradiction': max(forward['contradiction'], backward['contradiction']),
+        'forward_entailment': forward['entailment'],
+        'backward_entailment': backward['entailment'],
+        'forward_contradiction': forward['contradiction'],
+        'backward_contradiction': backward['contradiction']
+    }
+    
+    return results
+
+def check_entailment(self, premise: str, hypothesis: str) -> Dict[str, float]:
+    """Check entailment with error handling"""
+    try:
+        results = self.nli_pipeline(f"{premise} [SEP] {hypothesis}")
+        
+        scores = {'entailment': 0.0, 'neutral': 0.0, 'contradiction': 0.0}
+        mapping = {'ENTAILMENT': 'entailment', 'NEUTRAL': 'neutral', 'CONTRADICTION': 'contradiction'}
+        
+        for result in results:
+            label = result['label'].upper()
+            if label in mapping:
+                scores[mapping[label]] = result['score']
+        
+        return scores
+    except:
+        return {'entailment': 0.0, 'neutral': 1.0, 'contradiction': 0.0}
+
+# ... [Rest of the methods remain the same as in the original code] ...
+
+def calculate_edge_properties(self, text1: str, text2: str) -> Dict:
+    """Calculate properties for graph edges"""
+    forward = self.classify_hallucination_comprehensive(text1, text2)
+    backward = self.classify_hallucination_comprehensive(text2, text1)
+    
+    consistency_score = 1 - (forward['hallucination_score'] + backward['hallucination_score']) / 2
+    
+    if forward['is_hallucinated'] and backward['is_hallucinated']:
+        edge_type = 'mutual_hallucination'
+    elif forward['is_hallucinated'] or backward['is_hallucinated']:
+        edge_type = 'partial_hallucination'
+    else:
+        edge_type = 'consistent'
+    
+    return {
+        'weight': consistency_score,
+        'edge_type': edge_type,
+        'semantic_similarity': forward['semantic_similarity']['combined'],
+        'factual_consistency': forward['factual_consistency']['overall_consistency']
+    }
+
+def build_comprehensive_graph(self, paragraphs: List[str]) -> Tuple[nx.Graph, List[Dict], Dict]:
+    """Build graph with comprehensive analysis"""
+    n = len(paragraphs)
+    G = nx.Graph()
+    
+    for i, text in enumerate(paragraphs):
+        entities = self.extract_comprehensive_entities(text)
+        G.add_node(i,
+                  text=text,
+                  is_reference=(i == 0),
+                  num_facts=len(entities['key_facts']),
+                  num_entities=len(entities['named_entities']),
+                  entropy=self.calculate_entropy(text))
+    
+    classifications = []
+    for i in range(1, n):
+        classification = self.classify_hallucination_comprehensive(paragraphs[0], paragraphs[i])
+        classification['paragraph_id'] = i
+        classifications.append(classification)
+    
+    edge_details = {}
+    for i in range(n):
+        for j in range(i + 1, n):
+            edge_props = self.calculate_edge_properties(paragraphs[i], paragraphs[j])
+            
+            if edge_props['semantic_similarity'] > 0.2:
+                G.add_edge(i, j, **edge_props)
+                edge_details[(i, j)] = edge_props
+    
+    return G, classifications, edge_details
+
+def calculate_metrics(self, G: nx.Graph) -> Dict:
+    """Calculate graph metrics"""
+    metrics = {
+        'pagerank': nx.pagerank(G, weight='weight') if G.number_of_edges() > 0 else {n: 1/G.number_of_nodes() for n in G.nodes()},
+        'betweenness': nx.betweenness_centrality(G),
+        'closeness': nx.closeness_centrality(G),
+        'degree': dict(G.degree()),
+        'components': list(nx.connected_components(G)),
+        'isolated': list(nx.isolates(G))
+    }
+    return metrics
+
+def calculate_final_score(self, G: nx.Graph, classifications: List[Dict], metrics: Dict) -> Dict:
+    """Calculate comprehensive final scores"""
+    scores = {
+        'factual_accuracy': 0.0,
+        'semantic_coherence': 0.0,
+        'logical_consistency': 0.0,
+        'information_completeness': 0.0,
+        'overall_reliability': 0.0
+    }
+    
+    if not classifications:
+        return scores
+    
+    # 1. Factual Accuracy Score - stricter calculation
+    factual_consistency_scores = [c['factual_consistency']['overall_consistency'] 
+                                for c in classifications]
+    scores['factual_accuracy'] = np.mean(factual_consistency_scores) if factual_consistency_scores else 0.0
+    
+    # 2. Semantic Coherence Score
+    semantic_scores = [c['semantic_similarity']['combined'] for c in classifications]
+    scores['semantic_coherence'] = np.mean(semantic_scores) if semantic_scores else 0.0
+    
+    # 3. Logical Consistency Score
+    contradiction_scores = [1 - c['entailment']['contradiction'] for c in classifications]
+    scores['logical_consistency'] = np.mean(contradiction_scores) if contradiction_scores else 0.0
+    
+    # 4. Information Completeness Score
+    missing_info_counts = [len(c['factual_consistency']['missing_facts']) for c in classifications]
+    unverifiable_counts = [len(c['factual_consistency']['unverifiable_facts']) for c in classifications]
+    
+    total_issues = sum(missing_info_counts) + sum(unverifiable_counts)
+    if total_issues > 0:
+        scores['information_completeness'] = max(0, 1 - (total_issues / (len(classifications) * 5)))
+    else:
+        scores['information_completeness'] = 1.0
+    
+    # 5. Overall Reliability Score - stricter calculation
+    hallucination_rate = sum(1 for c in classifications if c['is_hallucinated']) / len(classifications)
+    
+    # Penalize based on types of hallucinations
+    critical_hallucinations = sum(1 for c in classifications 
+                                if c.get('hallucination_type') in ['FACTUAL_ERROR', 'CONTRADICTION'])
+    critical_rate = critical_hallucinations / len(classifications)
+    
+    scores['overall_reliability'] = (
+        (1 - hallucination_rate) * 0.3 +
+        (1 - critical_rate) * 0.2 +
+        scores['factual_accuracy'] * 0.3 +
+        scores['logical_consistency'] * 0.1 +
+        scores['information_completeness'] * 0.1
+    )
+    
+    return scores
+
+def calculate_entropy(self, text: str) -> float:
+    """Calculate text entropy"""
+    words = word_tokenize(text.lower())
+    if not words:
+        return 0.0
+    
+    word_freq = defaultdict(int)
+    for word in words:
+        word_freq[word] += 1
+    
+    total = len(words)
+    probs = [count/total for count in word_freq.values()]
+    return entropy(probs)
+
+def create_visualization(self, G: nx.Graph, metrics: Dict, classifications: List[Dict],
+                       final_scores: Dict, save_path: str = "enhanced_analysis.html") -> str:
+    """Create enhanced visualization"""
+    # Prepare nodes
+    nodes = []
+    for node in G.nodes():
+        if G.nodes[node].get('is_reference', False):
+            color = '#0066CC'
+            status = 'REFERENCE'
+        elif node in metrics['isolated']:
+            color = '#666666'
+            status = 'ISOLATED'
+        elif node > 0 and node <= len(classifications):
+            c = classifications[node - 1]
+            if c['is_hallucinated']:
+                # Different colors for different hallucination types
+                color_map = {
+                    'FACTUAL_ERROR': '#FF0000',
+                    'CONTRADICTION': '#CC0000',
+                    'FABRICATION': '#FF3333',
+                    'UNVERIFIABLE_ADDITION': '#FF6666',
+                    'CRITICAL_OMISSION': '#FF9999',
+                    'LOGICAL_CONTRADICTION': '#FFCCCC',
+                    'SUBTLE_INCONSISTENCY': '#FFDDDD'
+                }
+                color = color_map.get(c['hallucination_type'], '#FF6666')
+                status = f"HALLUCINATED ({c['hallucination_type']})"
+            else:
+                pr = metrics['pagerank'][node]
+                max_pr = max(v for k, v in metrics['pagerank'].items() if k != 0)
+                normalized_pr = pr / max_pr if max_pr > 0 else 0.5
+                green = int(100 + 155 * normalized_pr)
+                color = f'#{0:02x}{green:02x}{0:02x}'
+                status = 'CONSISTENT'
+        else:
+            color = '#666666'
+            status = 'UNKNOWN'
+        
+        node_obj = {
+            'id': node,
+            'label': f'P{node}',
+            'color': color,
+            'status': status,
+            'size': 15 + 35 * metrics['pagerank'][node],
+            'text': G.nodes[node]['text'],
+            'metrics': {
+                'pagerank': metrics['pagerank'][node],
+                'degree': metrics['degree'][node]
+            }
+        }
+        
+        if node > 0 and node <= len(classifications):
+            c = classifications[node - 1]
+            node_obj.update({
+                'hallucination_score': c['hallucination_score'],
+                'semantic_similarity': c['semantic_similarity']['combined'],
+                'factual_consistency': c['factual_consistency']['overall_consistency'],
+                'entailment': c['entailment']['entailment'],
+                'contradiction': c['entailment']['contradiction'],
+                'reasons': c.get('reasons', []),
+                'confidence': c.get('confidence', 0)
+            })
+        
+        nodes.append(node_obj)
+    
+    # Prepare edges
+    links = []
+    for u, v, data in G.edges(data=True):
+        color = '#00AA00' if data['edge_type'] == 'consistent' else '#FFA500' if data['edge_type'] == 'partial_hallucination' else '#FF0000'
+        links.append({
+            'source': u,
+            'target': v,
+            'weight': data['weight'],
+            'color': color,
+            'width': 1 + data['weight'] * 5
+        })
+    
+    # Create HTML with enhanced styling
+    html_content = f"""
+```
+
+<!DOCTYPE html>
+
+<html>
+<head>
+    <title>Enhanced Hallucination Analysis</title>
+    <script src="https://d3js.org/d3.v7.min.js"></script>
+    <style>
+        body {{
+            font-family: Arial, sans-serif;
+            margin: 0;
+            padding: 20px;
+            background-color: #f0f0f0;
+        }}
+        .container {{
+            max-width: 1400px;
+            margin: 0 auto;
+        }}
+        .scores-container {{
+            display: grid;
+            grid-template-columns: repeat(5, 1fr);
+            gap: 15px;
+            margin-bottom: 20px;
+        }}
+        .score-card {{
+            background: white;
+            padding: 20px;
+            border-radius: 10px;
+            box-shadow: 0 2px 4px rgba(0,0,0,0.1);
+            text-align: center;
+        }}
+        .score-value {{
+            font-size: 36px;
+            font-weight: bold;
+            margin: 10px 0;
+        }}
+        .score-label {{
+            font-size: 14px;
+            color: #666;
+        }}
+        #graph {{
+            background: white;
+            border-radius: 10px;
+            box-shadow: 0 2px 4px rgba(0,0,0,0.1);
+            margin-bottom: 20px;
+        }}
+        .tooltip {{
+            position: absolute;
+            padding: 15px;
+            background: rgba(0, 0, 0, 0.95);
+            color: white;
+            border-radius: 8px;
+            font-size: 12px;
+            line-height: 1.6;
+            pointer-events: none;
+            opacity: 0;
+            max-width: 500px;
+        }}
+        .legend {{
+            background: white;
+            padding: 20px;
+            border-radius: 10px;
+            box-shadow: 0 2px 4px rgba(0,0,0,0.1);
+            margin-bottom: 20px;
+        }}
+        .legend-grid {{
+            display: grid;
+            grid-template-columns: repeat(3, 1fr);
+            gap: 15px;
+        }}
+        .legend-item {{
+            display: flex;
+            align-items: center;
+            gap: 10px;
+        }}
+        .legend-color {{
+            width: 20px;
+            height: 20px;
+            border-radius: 50%;
+            border: 1px solid #333;
+        }}
+        .controls {{
+            text-align: center;
+            margin-bottom: 20px;
+        }}
+        button {{
+            padding: 10px 20px;
+            margin: 0 5px;
+            border: none;
+            border-radius: 5px;
+            background: #2196F3;
+            color: white;
+            cursor: pointer;
+            font-size: 14px;
+        }}
+        button:hover {{
+            background: #1976D2;
+        }}
+        h1 {{
+            text-align: center;
+            color: #333;
+        }}
+        .subtitle {{
+            text-align: center;
+            color: #666;
+            margin-bottom: 30px;
+        }}
+        .critical-warning {{
+            background: #ffebee;
+            border-left: 4px solid #f44336;
+            padding: 15px;
+            margin-bottom: 20px;
+            border-radius: 4px;
+        }}
+        .critical-warning h3 {{
+            color: #d32f2f;
+            margin-top: 0;
+        }}
+    </style>
+</head>
+<body>
+    <div class="container">
+        <h1>Enhanced Hallucination Detection Analysis</h1>
+        <p class="subtitle">Strict Factual Consistency Checking with Zero Tolerance for Mismatches</p>
+
+```
+    {self._create_warning_section(classifications)}
+    
+    <div class="scores-container">
+        <div class="score-card">
+            <div class="score-label">Overall Reliability</div>
+            <div class="score-value" style="color: {'#4CAF50' if final_scores['overall_reliability'] > 0.7 else '#FF9800' if final_scores['overall_reliability'] > 0.4 else '#F44336'}">
+                {final_scores['overall_reliability']:.1%}
+            </div>
+        </div>
+        <div class="score-card">
+            <div class="score-label">Factual Accuracy</div>
+            <div class="score-value">{final_scores['factual_accuracy']:.1%}</div>
+        </div>
+        <div class="score-card">
+            <div class="score-label">Logical Consistency</div>
+            <div class="score-value">{final_scores['logical_consistency']:.1%}</div>
+        </div>
+        <div class="score-card">
+            <div class="score-label">Semantic Coherence</div>
+            <div class="score-value">{final_scores['semantic_coherence']:.1%}</div>
+        </div>
+        <div class="score-card">
+            <div class="score-label">Information Completeness</div>
+            <div class="score-value">{final_scores['information_completeness']:.1%}</div>
+        </div>
+    </div>
+    
+    <div class="legend">
+        <h3>Legend</h3>
+        <div class="legend-grid">
+            <div class="legend-item">
+                <div class="legend-color" style="background: #0066CC;"></div>
+                <span>Reference (Ground Truth)</span>
+            </div>
+            <div class="legend-item">
+                <div class="legend-color" style="background: #FF0000;"></div>
+                <span>Factual Error (Critical)</span>
+            </div>
+            <div class="legend-item">
+                <div class="legend-color" style="background: #CC0000;"></div>
+                <span>Contradiction (Critical)</span>
+            </div>
+            <div class="legend-item">
+                <div class="legend-color" style="background: #FF3333;"></div>
+                <span>Fabrication (High Risk)</span>
+            </div>
+            <div class="legend-item">
+                <div class="legend-color" style="background: #FF6666;"></div>
+                <span>Unverifiable Addition</span>
+            </div>
+            <div class="legend-item">
+                <div class="legend-color" style="background: #FF9999;"></div>
+                <span>Critical Omission</span>
+            </div>
+            <div class="legend-item">
+                <div class="legend-color" style="background: linear-gradient(to right, #64FF64, #006400);"></div>
+                <span>Consistent (by PageRank)</span>
+            </div>
+            <div class="legend-item">
+                <div class="legend-color" style="background: #666666;"></div>
+                <span>Isolated</span>
+            </div>
+        </div>
+    </div>
+    
+    <div class="controls">
+        <button onclick="resetView()">Reset View</button>
+        <button onclick="toggleLabels()">Toggle Labels</button>
+        <button onclick="highlightHallucinations()">Highlight Hallucinations</button>
+        <button onclick="showCriticalOnly()">Show Critical Only</button>
+    </div>
+    
+    <div id="graph"></div>
+    <div class="tooltip"></div>
+</div>
+
+<script>
+    const nodes = {json.dumps(nodes)};
+    const links = {json.dumps(links)};
+    
+    const width = 1200;
+    const height = 700;
+    
+    const svg = d3.select("#graph")
+        .append("svg")
+        .attr("width", width)
+        .attr("height", height);
+    
+    const g = svg.append("g");
+    const tooltip = d3.select(".tooltip");
+    
+    const zoom = d3.zoom()
+        .scaleExtent([0.1, 10])
+        .on("zoom", (event) => {{
+            g.attr("transform", event.transform);
+        }});
+    
+    svg.call(zoom);
+    
+    const simulation = d3.forceSimulation(nodes)
+        .force("link", d3.forceLink(links).id(d => d.id).distance(150))
+        .force("charge", d3.forceManyBody().strength(-500))
+        .force("center", d3.forceCenter(width / 2, height / 2))
+        .force("collision", d3.forceCollide().radius(d => d.size + 10));
+    
+    const link = g.append("g")
+        .selectAll("line")
+        .data(links)
+        .enter().append("line")
+        .attr("stroke", d => d.color)
+        .attr("stroke-width", d => d.width)
+        .attr("stroke-opacity", 0.6);
+    
+    const node = g.append("g")
+        .selectAll("circle")
+        .data(nodes)
+        .enter().append("circle")
+        .attr("r", d => d.size)
+        .attr("fill", d => d.color)
+        .attr("stroke", "#333")
+        .attr("stroke-width", 2)
+        .style("cursor", "pointer")
+        .call(d3.drag()
+            .on("start", dragstarted)
+            .on("drag", dragged)
+            .on("end", dragended));
+    
+    const labels = g.append("g")
+        .selectAll("text")
+        .data(nodes)
+        .enter().append("text")
+        .text(d => d.label)
+        .attr("font-size", 14)
+        .attr("font-weight", "bold")
+        .attr("dx", d => d.size + 5)
+        .attr("dy", 5);
+    
+    node.on("mouseover", function(event, d) {{
+        let html = `<strong>${{d.label}} - ${{d.status}}</strong><br/>`;
+        html += `<hr style="margin: 8px 0; border-color: #555;">`;
+        
+        if (d.status !== 'REFERENCE') {{
+            html += `<strong>Scores:</strong><br/>`;
+            html += `• Hallucination: ${{(d.hallucination_score || 0).toFixed(3)}}<br/>`;
+            html += `• Semantic Similarity: ${{(d.semantic_similarity || 0).toFixed(3)}}<br/>`;
+            html += `• Factual Consistency: ${{(d.factual_consistency || 0).toFixed(3)}}<br/>`;
+            html += `• Entailment: ${{(d.entailment || 0).toFixed(3)}}<br/>`;
+            html += `• Contradiction: ${{(d.contradiction || 0).toFixed(3)}}<br/>`;
+            
+            if (d.confidence) {{
+                html += `• Confidence: ${{(d.confidence * 100).toFixed(0)}}%<br/>`;
+            }}
+        }}
+        
+        html += `<br/><strong>Graph Metrics:</strong><br/>`;
+        html += `• PageRank: ${{d.metrics.pagerank.toFixed(3)}}<br/>`;
+        html += `• Connections: ${{d.metrics.degree}}<br/>`;
+        
+        if (d.reasons && d.reasons.length > 0) {{
+            html += `<br/><strong>Issues Found:</strong><br/>`;
+            d.reasons.forEach(r => {{
+                html += `• ${{r}}<br/>`;
+            }});
+        }}
+        
+        html += `<hr style="margin: 8px 0; border-color: #555;">`;
+        html += `<strong>Text:</strong><br/>`;
+        html += `<div style="max-height: 200px; overflow-y: auto;">${{d.text}}</div>`;
+        
+        tooltip.html(html)
+            .style("left", (event.pageX + 10) + "px")
+            .style("top", (event.pageY - 10) + "px")
+            .style("opacity", 1);
+        
+        d3.select(this).attr("stroke-width", 4);
+        
+        link.style("stroke-opacity", l => 
+            (l.source.id === d.id || l.target.id === d.id) ? 1 : 0.1
+        );
+        
+        node.style("opacity", n => {{
+            if (n.id === d.id) return 1;
+            const connected = links.some(l => 
+                (l.source.id === d.id && l.target.id === n.id) ||
+                (l.target.id === d.id && l.source.id === n.id)
+            );
+            return connected ? 1 : 0.3;
+        }});
+    }})
+    .on("mouseout", function() {{
+        tooltip.style("opacity", 0);
+        d3.select(this).attr("stroke-width", 2);
+        link.style("stroke-opacity", 0.6);
+        node.style("opacity", 1);
+    }});
+    
+    simulation.on("tick", () => {{
+        link
+            .attr("x1", d => d.source.x)
+            .attr("y1", d => d.source.y)
+            .attr("x2", d => d.target.x)
+            .attr("y2", d => d.target.y);
+        
+        node
+            .attr("cx", d => d.x)
+            .attr("cy", d => d.y);
+        
+        labels
+            .attr("x", d => d.x)
+            .attr("y", d => d.y);
+    }});
+    
+    function dragstarted(event, d) {{
+        if (!event.active) simulation.alphaTarget(0.3).restart();
+        d.fx = d.x;
+        d.fy = d.y;
+    }}
+    
+    function dragged(event, d) {{
+        d.fx = event.x;
+        d.fy = event.y;
+    }}
+    
+    function dragended(event, d) {{
+        if (!event.active) simulation.alphaTarget(0);
+        d.fx = null;
+        d.fy = null;
+    }}
+    
+    function resetView() {{
+        svg.transition().duration(750).call(
+            zoom.transform,
+            d3.zoomIdentity
+        );
+        simulation.alpha(1).restart();
+    }}
+    
+    let labelsVisible = true;
+    function toggleLabels() {{
+        labelsVisible = !labelsVisible;
+        labels.style("display", labelsVisible ? "block" : "none");
+    }}
+    
+    function highlightHallucinations() {{
+        node.style("opacity", d => 
+            d.status.includes("HALLUCINATED") ? 1 : 0.3
+        );
+        
+        setTimeout(() => {{
+            node.style("opacity", 1);
+        }}, 3000);
+    }}
+    
+    function showCriticalOnly() {{
+        const criticalTypes = ['FACTUAL_ERROR', 'CONTRADICTION', 'FABRICATION'];
+        node.style("opacity", d => {{
+            if (d.status === 'REFERENCE') return 1;
+            const isCritical = criticalTypes.some(type => d.status.includes(type));
+            return isCritical ? 1 : 0.2;
+        }});
+        
+        setTimeout(() => {{
+            node.style("opacity", 1);
+        }}, 3000);
+    }}
+</script>
+```
+
+</body>
+</html>
+"""
+
+```
+    with open(save_path, 'w', encoding='utf-8') as f:
+        f.write(html_content)
+    
+    return save_path
+
+def _create_warning_section(self, classifications: List[Dict]) -> str:
+    """Create warning section for critical hallucinations"""
+    critical_types = ['FACTUAL_ERROR', 'CONTRADICTION', 'FABRICATION']
+    critical_halls = [c for c in classifications 
+                     if c['is_hallucinated'] and c.get('hallucination_type') in critical_types]
+    
+    if not critical_halls:
+        return ""
+    
+    warning_html = '<div class="critical-warning">'
+    warning_html += f'<h3>⚠️ Critical Issues Detected: {len(critical_halls)} high-risk hallucinations</h3>'
+    warning_html += '<ul>'
+    for c in critical_halls[:3]:  # Show top 3
+        warning_html += f"<li>Paragraph {c['paragraph_id']}: {c['hallucination_type']} - "
+        warning_html += f"{c['reasons'][0] if c['reasons'] else 'Factual inconsistency detected'}</li>"
+    if len(critical_halls) > 3:
+        warning_html += f"<li>... and {len(critical_halls) - 3} more critical issues</li>"
+    warning_html += '</ul></div>'
+    
+    return warning_html
+
+def analyze(self, reference: str, candidates: List[str], output_dir: str = ".") -> Dict:
+    """Complete analysis with enhanced hallucination detection"""
+    print("\n" + "="*60)
+    print("ENHANCED HALLUCINATION DETECTION")
+    print("="*60)
+    
+    all_paragraphs = [reference] + candidates
+    
+    print("\nAnalyzing paragraphs with strict factual checking...")
+    G, classifications, edge_details = self.build_comprehensive_graph(all_paragraphs)
+    
+    print("Calculating metrics...")
+    metrics = self.calculate_metrics(G)
+    
+    print("Computing final scores...")
+    final_scores = self.calculate_final_score(G, classifications, metrics)
+    
+    print("Creating visualization...")
+    viz_path = os.path.join(output_dir, "enhanced_hallucination_analysis.html")
+    self.create_visualization(G, metrics, classifications, final_scores, viz_path)
+```
