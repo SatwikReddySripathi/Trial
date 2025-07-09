@@ -1,0 +1,76 @@
+import difflib
+from typing import List, Dict, Tuple
+
+def compare_key_phrases(reference_phrases: List[str], candidate_phrases: List[str], threshold: float = 0.8) -> Dict:
+“””
+Compare two lists of key phrases using fuzzy matching.
+
+```
+Args:
+    reference_phrases: List of key phrases from reference paragraph
+    candidate_phrases: List of key phrases from candidate paragraph
+    threshold: Minimum similarity score (0-1) to consider phrases as matching
+
+Returns:
+    Dictionary with 'matched', 'missing', and 'extra' phrases
+"""
+# Normalize phrases for comparison
+def normalize(phrase):
+    return ' '.join(phrase.lower().split())
+
+# Find best match for a phrase in a list
+def find_match(phrase, phrase_list):
+    norm_phrase = normalize(phrase)
+    best_match, best_score = None, 0.0
+    
+    for candidate in phrase_list:
+        norm_candidate = normalize(candidate)
+        
+        # Calculate similarity
+        score = difflib.SequenceMatcher(None, norm_phrase, norm_candidate).ratio()
+        
+        # Boost score if one phrase contains the other
+        if norm_phrase in norm_candidate or norm_candidate in norm_phrase:
+            score = max(score, 0.9)
+        
+        if score > best_score:
+            best_score = score
+            best_match = candidate
+    
+    return best_match, best_score
+
+# Track matches
+remaining_candidates = candidate_phrases.copy()
+matched = []
+missing = []
+
+# Match each reference phrase
+for ref_phrase in reference_phrases:
+    match, score = find_match(ref_phrase, remaining_candidates)
+    
+    if score >= threshold and match:
+        matched.append((ref_phrase, match, round(score, 2)))
+        remaining_candidates.remove(match)
+    else:
+        missing.append(ref_phrase)
+
+return {
+    'matched': matched,
+    'missing': missing,
+    'extra': remaining_candidates
+}
+```
+
+# Example usage
+
+if **name** == “**main**”:
+reference = [“machine learning”, “neural networks”, “data analysis”]
+candidate = [“ML”, “neural nets”, “statistical modeling”, “data analysis”]
+
+```
+result = compare_key_phrases(reference, candidate, threshold=0.7)
+
+print("Matched:", result['matched'])
+print("Missing:", result['missing'])
+print("Extra:", result['extra'])
+```
