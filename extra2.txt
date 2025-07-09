@@ -1,0 +1,1013 @@
+# “””
+Zero-Tolerance Hallucination Detection System
+
+ANY information not in ground truth = hallucination
+Simple and strict: if it’s not in the reference, it’s wrong
+“””
+
+import numpy as np
+from typing import List, Dict, Tuple, Set, Any, Optional
+import re
+import networkx as nx
+from sklearn.metrics.pairwise import cosine_similarity
+from sklearn.feature_extraction.text import TfidfVectorizer
+import nltk
+from nltk.tokenize import sent_tokenize, word_tokenize
+from collections import defaultdict
+import warnings
+from scipy.stats import entropy
+from sentence_transformers import SentenceTransformer
+from transformers import pipeline
+import torch
+import webbrowser
+import os
+import json
+
+warnings.filterwarnings(‘ignore’)
+
+# Download required NLTK data
+
+nltk.download(‘punkt’, quiet=True)
+nltk.download(‘stopwords’, quiet=True)
+nltk.download(‘averaged_perceptron_tagger’, quiet=True)
+nltk.download(‘maxent_ne_chunker’, quiet=True)
+nltk.download(‘words’, quiet=True)
+nltk.download(‘wordnet’, quiet=True)
+
+class ZeroToleranceHallucinationDetector:
+“”“Zero tolerance: ANY extra information is hallucination”””
+
+```
+def __init__(self, use_gpu=False):
+    """Initialize the detector"""
+    self.device = 'cuda' if use_gpu and torch.cuda.is_available() else 'cpu'
+    print(f"Initializing Zero-Tolerance Hallucination Detector on {self.device}...")
+    
+    # Models
+    print("Loading models...")
+    self.sentence_model = SentenceTransformer('all-MiniLM-L6-v2')
+    self.sentence_model.to(self.device)
+    
+    self.tfidf_vectorizer = TfidfVectorizer(
+        max_features=1000,
+        ngram_range=(1, 3),
+        stop_words='english'
+    )
+    
+    # Patterns for extraction
+    self.patterns = {
+        'date': r'\b(?:\d{1,2}[-/]\d{1,2}[-/]\d{2,4}|\d{4}[-/]\d{1,2}[-/]\d{1,2}|(?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)[a-z]* \d{1,2},? \d{4}|Q[1-4] \d{4})\b',
+        'money': r'\$[\d,]+(?:\.\d{2})?(?:\s*(?:million|billion|thousand|M|B|K))?\b|\b\d+(?:,\d{3})*(?:\.\d{2})?\s*(?:dollars?|USD|cents?|million|billion)\b',
+        'percentage': r'\b\d+(?:\.\d+)?%',
+        'number': r'\b\d+(?:,\d{3})*(?:\.\d+)?\b',
+        'time': r'\b\d{1,2}:\d{2}(?::\d{2})?\s*(?:AM|PM|am|pm)?\b'
+    }
+    
+    # Common words to ignore
+    self.stopwords = set(['the', 'a', 'an', 'and', 'or', 'but', 'in', 'on', 'at', 'to', 'for', 
+                         'of', 'with', 'by', 'from', 'was', 'is', 'are', 'were', 'been', 'be',
+                         'have', 'has', 'had', 'do', 'does', 'did', 'will', 'would', 'could',
+                         'should', 'may', 'might', 'can', 'this', 'that', 'these', 'those'])
+    
+    print("Initialization complete!")
+
+def extract_all_facts(self, text: str) -> Set[str]:
+    """Extract ALL facts from text as a set of normalized strings"""
+    facts = set()
+    
+    # Normalize text
+    text_lower = text.lower()
+    
+    # Extract sentences and add as facts
+    sentences = sent_tokenize(text)
+    for sent in sentences:
+        # Normalize sentence
+        sent_normalized = sent.lower().strip()
+        facts.add(f"SENTENCE:{sent_normalized}")
+    
+    # Extract all entities with patterns
+    for pattern_name, pattern in self.patterns.items():
+        matches = re.findall(pattern, text, re.IGNORECASE)
+        for match in matches:
+            facts.add(f"{pattern_name.upper()}:{match.lower()}")
+    
+    # Extract words and phrases
+    words = word_tokenize(text_lower)
+    
+    # Single words (excluding stopwords)
+    for word in words:
+        if word not in self.stopwords and word.isalnum():
+            facts.add(f"WORD:{word}")
+    
+    # Bigrams
+    for i in range(len(words) - 1):
+        if words[i] not in self.stopwords or words[i+1] not in self.stopwords:
+            bigram = f"{words[i]} {words[i+1]}"
+            facts.add(f"BIGRAM:{bigram}")
+    
+    # Trigrams
+    for i in range(len(words) - 2):
+        trigram = f"{words[i]} {words[i+1]} {words[i+2]}"
+        facts.add(f"TRIGRAM:{trigram}")
+    
+    # Extract named entities
+    for sent in sentences:
+        tokens = word_tokenize(sent)
+        pos_tags = nltk.pos_tag(tokens)
+        chunks = nltk.ne_chunk(pos_tags, binary=False)
+        
+        for chunk in chunks:
+            if hasattr(chunk, 'label'):
+                entity = ' '.join(c[0] for c in chunk)
+                facts.add(f"ENTITY:{entity.lower()}:{chunk.label()}")
+    
+    # Extract noun phrases
+    for sent in sentences:
+        tokens = word_tokenize(sent)
+        pos_tags = nltk.pos_tag(tokens)
+        
+        # Simple noun phrase extraction
+        i = 0
+        while i < len(pos_tags):
+            if pos_tags[i][1] in ['NN', 'NNS', 'NNP', 'NNPS']:
+                phrase = [pos_tags[i][0]]
+                j = i - 1
+                # Include preceding adjectives
+                while j >= 0 and pos_tags[j][1] in ['JJ', 'JJR', 'JJS', 'DT']:
+                    phrase.insert(0, pos_tags[j][0])
+                    j -= 1
+                # Include following nouns
+                j = i + 1
+                while j < len(pos_tags) and pos_tags[j][1] in ['NN', 'NNS', 'NNP', 'NNPS']:
+                    phrase.append(pos_tags[j][0])
+                    j += 1
+                
+                noun_phrase = ' '.join(phrase).lower()
+                if len(phrase) > 1:  # Only multi-word phrases
+                    facts.add(f"NOUN_PHRASE:{noun_phrase}")
+            i += 1
+    
+    # Extract relationships (subject-verb-object)
+    for sent in sentences:
+        tokens = word_tokenize(sent)
+        pos_tags = nltk.pos_tag(tokens)
+        
+        for i in range(len(pos_tags)):
+            if pos_tags[i][1].startswith('VB'):  # Verb
+                verb = pos_tags[i][0].lower()
+                
+                # Look for subject (before verb)
+                subject = None
+                for j in range(i-1, -1, -1):
+                    if pos_tags[j][1] in ['NN', 'NNS', 'NNP', 'NNPS', 'PRP']:
+                        subject = pos_tags[j][0].lower()
+                        break
+                
+                # Look for object (after verb)
+                obj = None
+                for j in range(i+1, len(pos_tags)):
+                    if pos_tags[j][1] in ['NN', 'NNS', 'NNP', 'NNPS']:
+                        obj = pos_tags[j][0].lower()
+                        break
+                
+                if subject and verb:
+                    facts.add(f"SV:{subject}-{verb}")
+                if verb and obj:
+                    facts.add(f"VO:{verb}-{obj}")
+                if subject and verb and obj:
+                    facts.add(f"SVO:{subject}-{verb}-{obj}")
+    
+    return facts
+
+def find_extra_information(self, ref_facts: Set[str], cand_facts: Set[str]) -> List[str]:
+    """Find all information in candidate that's not in reference"""
+    extra_facts = cand_facts - ref_facts
+    
+    # Group by type for better reporting
+    extra_by_type = defaultdict(list)
+    for fact in extra_facts:
+        fact_type = fact.split(':')[0]
+        fact_content = ':'.join(fact.split(':')[1:])
+        extra_by_type[fact_type].append(fact_content)
+    
+    # Create readable report
+    extra_info = []
+    
+    # Report significant extra information
+    if 'SENTENCE' in extra_by_type:
+        # Check if entire sentences are different
+        for sent in extra_by_type['SENTENCE']:
+            # Check if this sentence shares significant content with reference
+            sent_words = set(sent.split()) - self.stopwords
+            has_overlap = False
+            for ref_fact in ref_facts:
+                if ref_fact.startswith('SENTENCE:'):
+                    ref_sent = ref_fact.split(':', 1)[1]
+                    ref_words = set(ref_sent.split()) - self.stopwords
+                    if len(sent_words & ref_words) / len(sent_words | ref_words) > 0.5:
+                        has_overlap = True
+                        break
+            
+            if not has_overlap:
+                extra_info.append(f"Extra sentence: '{sent}'")
+    
+    # Report extra entities
+    if 'ENTITY' in extra_by_type:
+        entities = [e for e in extra_by_type['ENTITY'] if not any(e.startswith(sw) for sw in self.stopwords)]
+        if entities:
+            extra_info.append(f"Extra entities: {entities}")
+    
+    # Report extra numbers/dates/money
+    for fact_type in ['DATE', 'MONEY', 'PERCENTAGE', 'NUMBER']:
+        if fact_type in extra_by_type:
+            extra_info.append(f"Extra {fact_type.lower()}: {extra_by_type[fact_type]}")
+    
+    # Report extra noun phrases (concepts)
+    if 'NOUN_PHRASE' in extra_by_type:
+        # Filter out phrases that are substrings of reference phrases
+        ref_noun_phrases = [f.split(':', 1)[1] for f in ref_facts if f.startswith('NOUN_PHRASE:')]
+        extra_noun_phrases = []
+        for phrase in extra_by_type['NOUN_PHRASE']:
+            is_substring = False
+            for ref_phrase in ref_noun_phrases:
+                if phrase in ref_phrase or ref_phrase in phrase:
+                    is_substring = True
+                    break
+            if not is_substring:
+                extra_noun_phrases.append(phrase)
+        
+        if extra_noun_phrases:
+            extra_info.append(f"Extra concepts: {extra_noun_phrases}")
+    
+    # Report extra relationships
+    extra_relationships = []
+    for rel_type in ['SVO', 'SV', 'VO']:
+        if rel_type in extra_by_type:
+            extra_relationships.extend(extra_by_type[rel_type])
+    if extra_relationships:
+        extra_info.append(f"Extra relationships: {extra_relationships}")
+    
+    return extra_info
+
+def calculate_semantic_similarity(self, text1: str, text2: str) -> float:
+    """Calculate semantic similarity between texts"""
+    try:
+        embeddings = self.sentence_model.encode([text1, text2])
+        similarity = float(cosine_similarity([embeddings[0]], [embeddings[1]])[0][0])
+        return similarity
+    except:
+        return 0.0
+
+def classify_hallucination(self, reference: str, candidate: str) -> Dict:
+    """Classify if candidate has hallucination (ANY extra info)"""
+    # Extract all facts
+    ref_facts = self.extract_all_facts(reference)
+    cand_facts = self.extract_all_facts(candidate)
+    
+    # Find extra information
+    extra_info = self.find_extra_information(ref_facts, cand_facts)
+    
+    # Find missing information
+    missing_facts = ref_facts - cand_facts
+    missing_info = []
+    
+    # Check for missing key information
+    for pattern_name, pattern in self.patterns.items():
+        ref_matches = set(re.findall(pattern, reference, re.IGNORECASE))
+        cand_matches = set(re.findall(pattern, candidate, re.IGNORECASE))
+        missing = ref_matches - cand_matches
+        if missing:
+            missing_info.append(f"Missing {pattern_name}: {missing}")
+    
+    # Calculate semantic similarity
+    semantic_similarity = self.calculate_semantic_similarity(reference, candidate)
+    
+    # ZERO TOLERANCE CLASSIFICATION
+    is_hallucinated = len(extra_info) > 0  # ANY extra info = hallucination
+    
+    if is_hallucinated:
+        hallucination_type = "EXTRA_INFORMATION"
+        confidence = 1.0  # 100% confidence when extra info is found
+        hallucination_score = 1.0
+        reasons = extra_info
+    elif len(missing_info) > 2:  # Multiple missing critical facts
+        is_hallucinated = True
+        hallucination_type = "CRITICAL_OMISSION"
+        confidence = 0.9
+        hallucination_score = 0.8
+        reasons = missing_info
+    else:
+        # Only if NO extra information and no critical omissions
+        hallucination_type = None
+        confidence = 0.0
+        hallucination_score = 0.0
+        reasons = []
+    
+    return {
+        'is_hallucinated': is_hallucinated,
+        'hallucination_type': hallucination_type,
+        'hallucination_score': hallucination_score,
+        'confidence': confidence,
+        'reasons': reasons,
+        'extra_information': extra_info,
+        'missing_information': missing_info,
+        'semantic_similarity': semantic_similarity,
+        'fact_counts': {
+            'reference': len(ref_facts),
+            'candidate': len(cand_facts),
+            'extra': len(cand_facts - ref_facts),
+            'missing': len(ref_facts - cand_facts)
+        }
+    }
+
+def build_graph(self, paragraphs: List[str]) -> Tuple[nx.Graph, List[Dict]]:
+    """Build graph for visualization"""
+    n = len(paragraphs)
+    G = nx.Graph()
+    
+    # Add nodes
+    for i, text in enumerate(paragraphs):
+        G.add_node(i, text=text, is_reference=(i == 0))
+    
+    # Classify all non-reference paragraphs
+    classifications = []
+    for i in range(1, n):
+        classification = self.classify_hallucination(paragraphs[0], paragraphs[i])
+        classification['paragraph_id'] = i
+        classifications.append(classification)
+    
+    # Add edges based on similarity
+    for i in range(n):
+        for j in range(i + 1, n):
+            sim = self.calculate_semantic_similarity(paragraphs[i], paragraphs[j])
+            if sim > 0.2:  # Only connect if some similarity
+                G.add_edge(i, j, weight=sim)
+    
+    return G, classifications
+
+def create_visualization(self, G: nx.Graph, classifications: List[Dict], 
+                       save_path: str = "zero_tolerance_analysis.html") -> str:
+    """Create visualization"""
+    # Calculate metrics
+    pagerank = nx.pagerank(G) if G.number_of_edges() > 0 else {n: 1/G.number_of_nodes() for n in G.nodes()}
+    
+    # Prepare nodes
+    nodes = []
+    for node in G.nodes():
+        if G.nodes[node].get('is_reference', False):
+            color = '#0066CC'
+            status = 'GROUND TRUTH'
+            size = 40
+        elif node > 0 and node <= len(classifications):
+            c = classifications[node - 1]
+            if c['is_hallucinated']:
+                if c['hallucination_type'] == 'EXTRA_INFORMATION':
+                    color = '#FF0000'  # Bright red
+                    status = 'HALLUCINATED - EXTRA INFO'
+                else:
+                    color = '#FF6666'
+                    status = f'HALLUCINATED - {c["hallucination_type"]}'
+            else:
+                color = '#00FF00'  # Bright green
+                status = 'VALID - NO EXTRA INFO'
+            size = 20 + 20 * pagerank[node]
+        else:
+            color = '#666666'
+            status = 'UNKNOWN'
+            size = 20
+        
+        node_data = {
+            'id': node,
+            'label': f'P{node}',
+            'color': color,
+            'status': status,
+            'size': size,
+            'text': G.nodes[node]['text']
+        }
+        
+        if node > 0 and node <= len(classifications):
+            c = classifications[node - 1]
+            node_data.update({
+                'is_hallucinated': c['is_hallucinated'],
+                'hallucination_type': c.get('hallucination_type', ''),
+                'confidence': c.get('confidence', 0),
+                'extra_info': c.get('extra_information', []),
+                'missing_info': c.get('missing_information', []),
+                'semantic_similarity': c.get('semantic_similarity', 0),
+                'fact_counts': c.get('fact_counts', {})
+            })
+        
+        nodes.append(node_data)
+    
+    # Prepare edges
+    links = []
+    for u, v, data in G.edges(data=True):
+        links.append({
+            'source': u,
+            'target': v,
+            'weight': data.get('weight', 0.5)
+        })
+    
+    # Calculate summary statistics
+    total_candidates = len(classifications)
+    hallucinated = sum(1 for c in classifications if c['is_hallucinated'])
+    extra_info_count = sum(1 for c in classifications if c.get('hallucination_type') == 'EXTRA_INFORMATION')
+    valid_count = total_candidates - hallucinated
+    
+    # Create HTML
+    html_content = f"""
+```
+
+<!DOCTYPE html>
+
+<html>
+<head>
+    <title>Zero-Tolerance Hallucination Detection</title>
+    <script src="https://d3js.org/d3.v7.min.js"></script>
+    <style>
+        body {{
+            font-family: 'Arial', sans-serif;
+            margin: 0;
+            padding: 20px;
+            background-color: #f5f5f5;
+        }}
+        .container {{
+            max-width: 1400px;
+            margin: 0 auto;
+        }}
+        .header {{
+            text-align: center;
+            margin-bottom: 30px;
+            padding: 20px;
+            background: white;
+            border-radius: 10px;
+            box-shadow: 0 2px 4px rgba(0,0,0,0.1);
+        }}
+        h1 {{
+            color: #d32f2f;
+            margin: 0 0 10px 0;
+        }}
+        .warning {{
+            background: #ffebee;
+            border: 2px solid #f44336;
+            padding: 15px;
+            border-radius: 8px;
+            margin: 20px 0;
+            text-align: center;
+            font-weight: bold;
+            color: #c62828;
+        }}
+        .stats {{
+            display: grid;
+            grid-template-columns: repeat(4, 1fr);
+            gap: 15px;
+            margin-bottom: 30px;
+        }}
+        .stat-card {{
+            background: white;
+            padding: 20px;
+            border-radius: 10px;
+            box-shadow: 0 2px 4px rgba(0,0,0,0.1);
+            text-align: center;
+        }}
+        .stat-value {{
+            font-size: 48px;
+            font-weight: bold;
+            margin: 10px 0;
+        }}
+        .stat-label {{
+            font-size: 14px;
+            color: #666;
+            text-transform: uppercase;
+        }}
+        #graph {{
+            background: white;
+            border-radius: 10px;
+            box-shadow: 0 2px 4px rgba(0,0,0,0.1);
+            margin-bottom: 20px;
+            position: relative;
+        }}
+        .tooltip {{
+            position: absolute;
+            padding: 20px;
+            background: rgba(0, 0, 0, 0.95);
+            color: white;
+            border-radius: 8px;
+            font-size: 13px;
+            line-height: 1.6;
+            pointer-events: none;
+            opacity: 0;
+            max-width: 600px;
+            z-index: 1000;
+        }}
+        .legend {{
+            background: white;
+            padding: 20px;
+            border-radius: 10px;
+            box-shadow: 0 2px 4px rgba(0,0,0,0.1);
+            margin-bottom: 20px;
+        }}
+        .legend-grid {{
+            display: grid;
+            grid-template-columns: repeat(3, 1fr);
+            gap: 20px;
+        }}
+        .legend-item {{
+            display: flex;
+            align-items: center;
+            gap: 10px;
+        }}
+        .legend-color {{
+            width: 30px;
+            height: 30px;
+            border-radius: 50%;
+            border: 2px solid #333;
+        }}
+        .controls {{
+            text-align: center;
+            margin-bottom: 20px;
+        }}
+        button {{
+            padding: 12px 24px;
+            margin: 0 5px;
+            border: none;
+            border-radius: 5px;
+            background: #2196F3;
+            color: white;
+            cursor: pointer;
+            font-size: 14px;
+            font-weight: bold;
+            transition: all 0.3s;
+        }}
+        button:hover {{
+            background: #1976D2;
+            transform: translateY(-2px);
+            box-shadow: 0 4px 8px rgba(0,0,0,0.2);
+        }}
+        .extra-info {{
+            color: #ff5252;
+            font-weight: bold;
+        }}
+        .valid-info {{
+            color: #4caf50;
+            font-weight: bold;
+        }}
+        .results-table {{
+            background: white;
+            padding: 20px;
+            border-radius: 10px;
+            box-shadow: 0 2px 4px rgba(0,0,0,0.1);
+            margin-top: 20px;
+        }}
+        table {{
+            width: 100%;
+            border-collapse: collapse;
+        }}
+        th, td {{
+            padding: 12px;
+            text-align: left;
+            border-bottom: 1px solid #ddd;
+        }}
+        th {{
+            background: #f5f5f5;
+            font-weight: bold;
+            color: #333;
+        }}
+        .hallucinated-row {{
+            background: #ffebee;
+        }}
+        .valid-row {{
+            background: #e8f5e9;
+        }}
+    </style>
+</head>
+<body>
+    <div class="container">
+        <div class="header">
+            <h1>🚨 ZERO-TOLERANCE HALLUCINATION DETECTION 🚨</h1>
+            <p style="font-size: 18px; color: #666;">If it's not in the ground truth, it's a hallucination!</p>
+        </div>
+
+```
+    <div class="warning">
+        ⚠️ ZERO TOLERANCE MODE ACTIVE ⚠️<br>
+        ANY information not present in the ground truth is marked as HALLUCINATION
+    </div>
+    
+    <div class="stats">
+        <div class="stat-card">
+            <div class="stat-label">Total Analyzed</div>
+            <div class="stat-value">{total_candidates}</div>
+        </div>
+        <div class="stat-card">
+            <div class="stat-label">Hallucinated</div>
+            <div class="stat-value" style="color: #f44336;">{hallucinated}</div>
+        </div>
+        <div class="stat-card">
+            <div class="stat-label">Extra Info Violations</div>
+            <div class="stat-value" style="color: #ff5722;">{extra_info_count}</div>
+        </div>
+        <div class="stat-card">
+            <div class="stat-label">Valid (No Extra Info)</div>
+            <div class="stat-value" style="color: #4caf50;">{valid_count}</div>
+        </div>
+    </div>
+    
+    <div class="legend">
+        <h3>Legend</h3>
+        <div class="legend-grid">
+            <div class="legend-item">
+                <div class="legend-color" style="background: #0066CC;"></div>
+                <span><strong>Ground Truth</strong> - Reference text</span>
+            </div>
+            <div class="legend-item">
+                <div class="legend-color" style="background: #FF0000;"></div>
+                <span><strong>Extra Information</strong> - Contains facts not in ground truth</span>
+            </div>
+            <div class="legend-item">
+                <div class="legend-color" style="background: #00FF00;"></div>
+                <span><strong>Valid</strong> - Only contains information from ground truth</span>
+            </div>
+        </div>
+    </div>
+    
+    <div class="controls">
+        <button onclick="resetView()">Reset View</button>
+        <button onclick="highlightHallucinations()">Show Only Hallucinations</button>
+        <button onclick="highlightValid()">Show Only Valid</button>
+    </div>
+    
+    <div id="graph"></div>
+    <div class="tooltip"></div>
+    
+    <div class="results-table">
+        <h3>Detailed Results</h3>
+        <table>
+            <thead>
+                <tr>
+                    <th>Paragraph</th>
+                    <th>Status</th>
+                    <th>Extra Information</th>
+                    <th>Similarity</th>
+                </tr>
+            </thead>
+            <tbody>
+                {self._create_results_table(classifications)}
+            </tbody>
+        </table>
+    </div>
+</div>
+
+<script>
+    const nodes = {json.dumps(nodes)};
+    const links = {json.dumps(links)};
+    
+    const width = 1200;
+    const height = 600;
+    
+    const svg = d3.select("#graph")
+        .append("svg")
+        .attr("width", width)
+        .attr("height", height);
+    
+    const g = svg.append("g");
+    const tooltip = d3.select(".tooltip");
+    
+    const zoom = d3.zoom()
+        .scaleExtent([0.1, 10])
+        .on("zoom", (event) => {{
+            g.attr("transform", event.transform);
+        }});
+    
+    svg.call(zoom);
+    
+    const simulation = d3.forceSimulation(nodes)
+        .force("link", d3.forceLink(links).id(d => d.id).distance(200))
+        .force("charge", d3.forceManyBody().strength(-800))
+        .force("center", d3.forceCenter(width / 2, height / 2))
+        .force("collision", d3.forceCollide().radius(d => d.size + 20));
+    
+    const link = g.append("g")
+        .selectAll("line")
+        .data(links)
+        .enter().append("line")
+        .attr("stroke", "#999")
+        .attr("stroke-width", d => Math.sqrt(d.weight) * 5)
+        .attr("stroke-opacity", 0.3);
+    
+    const node = g.append("g")
+        .selectAll("circle")
+        .data(nodes)
+        .enter().append("circle")
+        .attr("r", d => d.size)
+        .attr("fill", d => d.color)
+        .attr("stroke", "#333")
+        .attr("stroke-width", 3)
+        .style("cursor", "pointer")
+        .call(d3.drag()
+            .on("start", dragstarted)
+            .on("drag", dragged)
+            .on("end", dragended));
+    
+    const labels = g.append("g")
+        .selectAll("text")
+        .data(nodes)
+        .enter().append("text")
+        .text(d => d.label)
+        .attr("font-size", 16)
+        .attr("font-weight", "bold")
+        .attr("text-anchor", "middle")
+        .attr("dy", -5);
+    
+    node.on("mouseover", function(event, d) {{
+        let html = `<strong style="font-size: 16px;">${{d.label}} - ${{d.status}}</strong><br/>`;
+        html += `<hr style="margin: 10px 0; border-color: #555;">`;
+        
+        if (d.is_hallucinated !== undefined) {{
+            html += `<strong>Classification:</strong><br/>`;
+            html += `• Status: <span class="${{d.is_hallucinated ? 'extra-info' : 'valid-info'}}">${{d.is_hallucinated ? 'HALLUCINATED' : 'VALID'}}</span><br/>`;
+            html += `• Confidence: ${{(d.confidence * 100).toFixed(0)}}%<br/>`;
+            html += `• Semantic Similarity: ${{(d.semantic_similarity * 100).toFixed(1)}}%<br/>`;
+            
+            if (d.fact_counts) {{
+                html += `<br/><strong>Fact Analysis:</strong><br/>`;
+                html += `• Reference facts: ${{d.fact_counts.reference}}<br/>`;
+                html += `• Candidate facts: ${{d.fact_counts.candidate}}<br/>`;
+                html += `• <span class="extra-info">Extra facts: ${{d.fact_counts.extra}}</span><br/>`;
+                html += `• Missing facts: ${{d.fact_counts.missing}}<br/>`;
+            }}
+            
+            if (d.extra_info && d.extra_info.length > 0) {{
+                html += `<br/><strong class="extra-info">⚠️ EXTRA INFORMATION FOUND:</strong><br/>`;
+                d.extra_info.forEach(info => {{
+                    html += `• ${{info}}<br/>`;
+                }});
+            }}
+            
+            if (d.missing_info && d.missing_info.length > 0) {{
+                html += `<br/><strong>Missing Information:</strong><br/>`;
+                d.missing_info.forEach(info => {{
+                    html += `• ${{info}}<br/>`;
+                }});
+            }}
+        }}
+        
+        html += `<hr style="margin: 10px 0; border-color: #555;">`;
+        html += `<strong>Text:</strong><br/>`;
+        html += `<div style="max-height: 200px; overflow-y: auto; margin-top: 10px; padding: 10px; background: rgba(255,255,255,0.1); border-radius: 4px;">${{d.text}}</div>`;
+        
+        tooltip.html(html)
+            .style("left", (event.pageX + 15) + "px")
+            .style("top", (event.pageY - 15) + "px")
+            .style("opacity", 1);
+        
+        // Highlight connected nodes
+        const connectedNodes = new Set([d.id]);
+        links.forEach(link => {{
+            if (link.source.id === d.id) connectedNodes.add(link.target.id);
+            if (link.target.id === d.id) connectedNodes.add(link.source.id);
+        }});
+        
+        node.style("opacity", n => connectedNodes.has(n.id) ? 1 : 0.2);
+        link.style("opacity", l => 
+            (l.source.id === d.id || l.target.id === d.id) ? 0.8 : 0.05
+        );
+        
+        d3.select(this)
+            .attr("stroke-width", 5)
+            .attr("r", d.size * 1.2);
+    }})
+    .on("mouseout", function(event, d) {{
+        tooltip.style("opacity", 0);
+        
+        node.style("opacity", 1);
+        link.style("opacity", 0.3);
+        
+        d3.select(this)
+            .attr("stroke-width", 3)
+            .attr("r", d.size);
+    }});
+    
+    // Double click to focus on node
+    node.on("dblclick", function(event, d) {{
+        event.stopPropagation();
+        
+        const scale = 2;
+        const translate = [width / 2 - scale * d.x, height / 2 - scale * d.y];
+        
+        svg.transition()
+            .duration(750)
+            .call(zoom.transform, d3.zoomIdentity
+                .translate(translate[0], translate[1])
+                .scale(scale));
+    }});
+    
+    simulation.on("tick", () => {{
+        link
+            .attr("x1", d => d.source.x)
+            .attr("y1", d => d.source.y)
+            .attr("x2", d => d.target.x)
+            .attr("y2", d => d.target.y);
+        
+        node
+            .attr("cx", d => d.x)
+            .attr("cy", d => d.y);
+        
+        labels
+            .attr("x", d => d.x)
+            .attr("y", d => d.y - d.size - 10);
+    }});
+    
+    function dragstarted(event, d) {{
+        if (!event.active) simulation.alphaTarget(0.3).restart();
+        d.fx = d.x;
+        d.fy = d.y;
+    }}
+    
+    function dragged(event, d) {{
+        d.fx = event.x;
+        d.fy = event.y;
+    }}
+    
+    function dragended(event, d) {{
+        if (!event.active) simulation.alphaTarget(0);
+        d.fx = null;
+        d.fy = null;
+    }}
+    
+    function resetView() {{
+        svg.transition().duration(750).call(
+            zoom.transform,
+            d3.zoomIdentity
+        );
+        node.style("opacity", 1);
+        link.style("opacity", 0.3);
+    }}
+    
+    function highlightHallucinations() {{
+        node.style("opacity", d => {{
+            if (d.status === 'GROUND TRUTH') return 1;
+            return d.is_hallucinated ? 1 : 0.1;
+        }});
+        
+        link.style("opacity", 0.05);
+    }}
+    
+    function highlightValid() {{
+        node.style("opacity", d => {{
+            if (d.status === 'GROUND TRUTH') return 1;
+            return !d.is_hallucinated ? 1 : 0.1;
+        }});
+        
+        link.style("opacity", 0.05);
+    }}
+</script>
+```
+
+</body>
+</html>
+"""
+
+```
+    with open(save_path, 'w', encoding='utf-8') as f:
+        f.write(html_content)
+    
+    return save_path
+
+def _create_results_table(self, classifications: List[Dict]) -> str:
+    """Create HTML for results table"""
+    rows = []
+    for c in classifications:
+        status_class = 'hallucinated-row' if c['is_hallucinated'] else 'valid-row'
+        status_text = 'HALLUCINATED' if c['is_hallucinated'] else 'VALID'
+        extra_info = '<br>'.join(c.get('extra_information', [])) if c['is_hallucinated'] else 'None'
+        
+        row = f"""
+            <tr class="{status_class}">
+                <td>Paragraph {c['paragraph_id']}</td>
+                <td><strong>{status_text}</strong></td>
+                <td>{extra_info}</td>
+                <td>{c['semantic_similarity']:.1%}</td>
+            </tr>
+        """
+        rows.append(row)
+    
+    return '\n'.join(rows)
+
+def analyze(self, reference: str, candidates: List[str], output_dir: str = ".") -> Dict:
+    """Run complete analysis"""
+    print("\n" + "="*80)
+    print(" "*20 + "ZERO-TOLERANCE HALLUCINATION DETECTION")
+    print(" "*20 + "If it's not in the ground truth, it's wrong!")
+    print("="*80)
+    
+    all_paragraphs = [reference] + candidates
+    
+    print("\nExtracting all facts from ground truth...")
+    ref_facts = self.extract_all_facts(reference)
+    print(f"Found {len(ref_facts)} facts in ground truth")
+    
+    print("\nAnalyzing candidates for ANY extra information...")
+    G, classifications = self.build_graph(all_paragraphs)
+    
+    print("\nCreating visualization...")
+    viz_path = os.path.join(output_dir, "zero_tolerance_hallucination_analysis.html")
+    self.create_visualization(G, classifications, viz_path)
+    
+    # Print results
+    print("\n" + "-"*80)
+    print("RESULTS")
+    print("-"*80)
+    
+    total = len(candidates)
+    hallucinated = sum(1 for c in classifications if c['is_hallucinated'])
+    extra_info_violations = sum(1 for c in classifications if c.get('hallucination_type') == 'EXTRA_INFORMATION')
+    valid = total - hallucinated
+    
+    print(f"\nTotal candidates analyzed: {total}")
+    print(f"❌ Hallucinated (contain extra info): {hallucinated} ({hallucinated/total*100:.1f}%)")
+    print(f"   - Extra information violations: {extra_info_violations}")
+    print(f"✅ Valid (no extra info): {valid} ({valid/total*100:.1f}%)")
+    
+    # Show details for each paragraph
+    print("\nDETAILED ANALYSIS:")
+    print("-"*80)
+    
+    for i, c in enumerate(classifications):
+        print(f"\n{'='*40}")
+        print(f"PARAGRAPH {i+1}:")
+        print(f"{'='*40}")
+        
+        if c['is_hallucinated']:
+            print(f"❌ STATUS: HALLUCINATED ({c['hallucination_type']})")
+            print(f"   Confidence: {c['confidence']*100:.0f}%")
+            
+            if c['extra_information']:
+                print("\n⚠️  EXTRA INFORMATION FOUND:")
+                for info in c['extra_information']:
+                    print(f"   • {info}")
+        else:
+            print(f"✅ STATUS: VALID - No extra information")
+        
+        print(f"\n📊 Fact Statistics:")
+        print(f"   • Facts in this paragraph: {c['fact_counts']['candidate']}")
+        print(f"   • Extra facts: {c['fact_counts']['extra']}")
+        print(f"   • Missing facts: {c['fact_counts']['missing']}")
+        print(f"   • Semantic similarity: {c['semantic_similarity']:.1%}")
+    
+    print(f"\n{'='*80}")
+    print(f"Visualization saved to: {viz_path}")
+    print("Opening in browser...")
+    webbrowser.open(f'file://{os.path.abspath(viz_path)}')
+    
+    return {
+        'graph': G,
+        'classifications': classifications,
+        'visualization': viz_path,
+        'summary': {
+            'total': total,
+            'hallucinated': hallucinated,
+            'valid': valid,
+            'extra_info_violations': extra_info_violations
+        }
+    }
+```
+
+# Example usage
+
+if **name** == “**main**”:
+detector = ZeroToleranceHallucinationDetector(use_gpu=False)
+
+```
+reference = """The company reported revenue of $2.5 million in Q4 2023, with a 15% increase from the previous quarter. 
+CEO John Smith announced expansion plans on January 15, 2024, targeting the Asian market. 
+The profit margin improved to 22% due to cost optimization strategies implemented in September."""
+
+candidates = [
+    # Should be VALID - same information
+    """Q4 2023 revenue was $2.5 million, up 15% from Q3. John Smith announced Asian expansion 
+    on January 15, 2024. Profit margins reached 22% through cost optimization.""",
+    
+    # Should be HALLUCINATED - wrong numbers (extra info)
+    """The company earned $3.2 million in Q4 2023, showing 20% growth. CEO John Smith revealed 
+    expansion plans on January 20, 2024. Margins improved to 25%.""",
+    
+    # Should be HALLUCINATED - contradiction (wrong direction)
+    """Revenue reached $2.5 million in Q4 2023. However, this represented a 15% decline from Q3. 
+    John Smith announced Asian expansion on January 15, 2024.""",
+    
+    # Should be HALLUCINATED - extra info (customer satisfaction)
+    """Q4 2023 saw $2.5 million in revenue. The company also improved customer satisfaction. 
+    CEO John Smith's January 15, 2024 announcement highlighted Asian opportunities.""",
+    
+    # Should be HALLUCINATED - missing specifics but adding vague claims
+    """The company performed well in Q4 2023. Management is optimistic about future growth 
+    in international markets. Operational efficiency has improved.""",
+    
+    # Should be HALLUCINATED - wrong narrative (struggling vs growth)
+    """In Q4 2023, the company struggled with declining revenue of $2.5 million. 
+    CEO John Smith announced cost-cutting measures on January 15, 2024, abandoning expansion plans."""
+]
+
+results = detector.analyze(reference, candidates)
+```
