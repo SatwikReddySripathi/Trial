@@ -1,0 +1,95 @@
+import re
+import spacy
+from allennlp.predictors.predictor import Predictor
+import allennlp_models.tagging
+from sentence_transformers import SentenceTransformer, util
+import torch
+
+# Load models
+nlp = spacy.load("en_core_web_sm")
+srl = Predictor.from_path("https://storage.googleapis.com/allennlp-public-models/bert-base-srl-2020.11.19.tar.gz")
+sbert = SentenceTransformer("all-MiniLM-L6-v2")
+
+def clean(text):
+    return re.sub(r'[^a-zA-Z0-9$ ]', '', text.lower()).strip()
+
+def extract_triples(text):
+    triples = []
+    sentences = re.split(r'[.?!]', text)
+    for sent in sentences:
+        sent = sent.strip()
+        if not sent:
+            continue
+        result = srl.predict(sentence=sent)
+        words = result["words"]
+        for verb in result["verbs"]:
+            tags = verb["tags"]
+            subj, obj = [], []
+            predicate = verb["verb"]
+            for i, tag in enumerate(tags):
+                if "ARG0" in tag:
+                    subj.append(words[i])
+                elif "ARG1" in tag or "ARG2" in tag:
+                    obj.append(words[i])
+            if subj and obj:
+                triples.append((
+                    clean(" ".join(subj)),
+                    clean(predicate),
+                    clean(" ".join(obj))
+                ))
+    return triples
+
+def triple_similarity(t1, t2, threshold=0.82):
+    # Compare (subj, pred, obj) as full phrases
+    a = " ".join(t1)
+    b = " ".join(t2)
+    emb = sbert.encode([a, b], convert_to_tensor=True)
+    score = util.cos_sim(emb[0], emb[1]).item()
+    return score >= threshold, score
+
+def compare_triples(ref_triples, cand_triples):
+    missing = []
+    extra = []
+    
+    matched_ref = set()
+    matched_cand = set()
+
+    for i, rt in enumerate(ref_triples):
+        matched = False
+        for j, ct in enumerate(cand_triples):
+            is_similar, score = triple_similarity(rt, ct)
+            if is_similar:
+                matched = True
+                matched_ref.add(i)
+                matched_cand.add(j)
+                break
+        if not matched:
+            missing.append(rt)
+
+    for j, ct in enumerate(cand_triples):
+        if j not in matched_cand:
+            extra.append(ct)
+
+    return missing, extra
+
+# === Your Real Inputs ===
+
+reference = """The rule address freeze restriction failed because the address was changed within the last 10 days, and the request amount is greater than the plan check amount threshold of $10,000. The rule withdrawal counter restriction failed because the participant has already made the maximum allowed withdrawals for the year."""
+
+candidate = """The address was changed within the past 10 days as of the transaction date 2024-12-30 on December 22,2024. The participant has made all the available withdrawals for the year. The address freeze rule works for the period (12-12-2024 to 23-12-2024)"""
+
+# === Run Triple Comparison ===
+
+ref_triples = extract_triples(reference)
+cand_triples = extract_triples(candidate)
+missing, extra = compare_triples(ref_triples, cand_triples)
+
+# === Output Results ===
+
+print("\n🔍 MISSING INFORMATION:")
+for t in missing:
+    print(" -", t)
+
+print("\n🧾 EXTRA INFORMATION:")
+for t in extra:
+    print(" -", t)
