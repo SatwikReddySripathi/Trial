@@ -1,0 +1,68 @@
+from allennlp.predictors.predictor import Predictor
+import allennlp_models.tagging
+import re
+
+# Load the SRL model
+srl = Predictor.from_path("https://storage.googleapis.com/allennlp-public-models/bert-base-srl-2020.11.19.tar.gz")
+
+def extract_srl_triples(text):
+    triples = []
+    sentences = re.split(r'[.!?]', text)
+    for sent in sentences:
+        sent = sent.strip()
+        if not sent:
+            continue
+        output = srl.predict(sentence=sent)
+        words = output["words"]
+        for verb in output["verbs"]:
+            tags = verb["tags"]
+            args = {}
+            for i, tag in enumerate(tags):
+                if tag != "O":
+                    label = tag[tag.index("-") + 1:] if "-" in tag else tag
+                    args.setdefault(label, []).append(words[i])
+            subj = " ".join(args.get("ARG0", []))
+            pred = verb["verb"]
+            obj = " ".join(args.get("ARG1", []) + args.get("ARG2", []))
+            triples.append((subj.strip(), pred.strip(), obj.strip()))
+    return triples
+
+def triple_similarity(t1, t2):
+    return t1[0] in t2[0] and t1[1] in t2[1] and t1[2] in t2[2]
+
+def compare_triples(ref_triples, cand_triples):
+    missing = []
+    extra = []
+
+    for t in ref_triples:
+        if not any(triple_similarity(t, c) for c in cand_triples):
+            missing.append(t)
+
+    for t in cand_triples:
+        if not any(triple_similarity(t, r) for r in ref_triples):
+            extra.append(t)
+
+    return missing, extra
+
+# === Input ===
+
+reference = """The rule address freeze restriction failed because the address was changed within the last 10 days, and the request amount is greater than the plan check amount threshold of $10,000. The rule withdrawal counter restriction failed because the participant has already made the maximum allowed withdrawals for the year."""
+
+candidate = """The address was changed within the past 10 days as of the transaction date 2024-12-30 on December 22,2024. The participant has made all the available withdrawals for the year. The address freeze rule works for the period (12-12-2024 to 23-12-2024)"""
+
+# === Run ===
+
+ref_triples = extract_srl_triples(reference)
+cand_triples = extract_srl_triples(candidate)
+
+missing, extra = compare_triples(ref_triples, cand_triples)
+
+# === Output ===
+
+print("\n🔍 Missing Triples from Candidate:")
+for t in missing:
+    print(" -", t)
+
+print("\n🧾 Extra Triples in Candidate:")
+for t in extra:
+    print(" -", t)
