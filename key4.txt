@@ -1,0 +1,55 @@
+import spacy
+from sentence_transformers import SentenceTransformer, util
+import torch
+
+# Load NLP models
+nlp = spacy.load("en_core_web_sm")
+sbert = SentenceTransformer("all-MiniLM-L6-v2")
+
+def get_sentences(text):
+    """Split paragraph into sentences"""
+    doc = nlp(text)
+    return [sent.text.strip() for sent in doc.sents]
+
+def compare_sentences(reference_sents, candidate_sents, threshold=0.80):
+    """Compare lists of sentences and identify missing and extra info"""
+    ref_embeddings = sbert.encode(reference_sents, convert_to_tensor=True)
+    cand_embeddings = sbert.encode(candidate_sents, convert_to_tensor=True)
+
+    # Compare ref → candidate (missing)
+    missing = []
+    for i, ref_sent in enumerate(reference_sents):
+        sims = util.cos_sim(ref_embeddings[i], cand_embeddings)
+        max_sim = float(torch.max(sims))
+        if max_sim < threshold:
+            missing.append((ref_sent, max_sim))
+
+    # Compare candidate → ref (extra)
+    extra = []
+    for i, cand_sent in enumerate(candidate_sents):
+        sims = util.cos_sim(cand_embeddings[i], ref_embeddings)
+        max_sim = float(torch.max(sims))
+        if max_sim < threshold:
+            extra.append((cand_sent, max_sim))
+
+    return missing, extra
+
+# Your input
+reference_text = """The rule address freeze restriction failed because the address was changed within the last 10 days, and the request amount is greater than the plan check amount threshold of $10,000. The rule withdrawal counter restriction failed because the participant has already made the maximum allowed withdrawals for the year."""
+
+candidate_text = """The address was changed within the past 10 days as of the transaction date 2024-12-30 on December 22,2024. The participant has made all the available withdrawals for the year. The address freeze rule works for the period (12-12-2024 to 23-12-2024)"""
+
+# Process
+ref_sents = get_sentences(reference_text)
+cand_sents = get_sentences(candidate_text)
+
+missing_info, extra_info = compare_sentences(ref_sents, cand_sents, threshold=0.80)
+
+# Output
+print("\n🔍 Missing Information from Candidate:")
+for sent, score in missing_info:
+    print(f" - \"{sent}\" (max sim: {score:.2f})")
+
+print("\n🧾 Extra Information in Candidate:")
+for sent, score in extra_info:
+    print(f" - \"{sent}\" (max sim: {score:.2f})")
