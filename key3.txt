@@ -1,0 +1,70 @@
+import spacy
+from sentence_transformers import SentenceTransformer, util
+import torch
+
+# Load NLP models
+nlp = spacy.load("en_core_web_sm")
+sbert = SentenceTransformer('all-MiniLM-L6-v2')
+
+def split_into_semantic_units(text):
+    """Split a paragraph into sentences and key phrases"""
+    doc = nlp(text)
+    units = set()
+    
+    # Add full sentences
+    for sent in doc.sents:
+        units.add(sent.text.strip().lower())
+    
+    # Add noun chunks
+    for chunk in doc.noun_chunks:
+        units.add(chunk.text.strip().lower())
+    
+    # Add named entities (e.g., numbers like '2')
+    for ent in doc.ents:
+        units.add(ent.text.strip().lower())
+    
+    return list(units)
+
+def get_similarity_matrix(source_units, target_units):
+    """Compute pairwise similarity between two sets of phrases"""
+    source_embeddings = sbert.encode(source_units, convert_to_tensor=True)
+    target_embeddings = sbert.encode(target_units, convert_to_tensor=True)
+    similarity_matrix = util.cos_sim(source_embeddings, target_embeddings)
+    return similarity_matrix
+
+def find_unmatched_units(source_units, target_units, sim_matrix, threshold=0.80, direction='source→target'):
+    """Return units from source that have no match in target above threshold"""
+    unmatched = []
+    for i, unit in enumerate(source_units):
+        max_sim = torch.max(sim_matrix[i])
+        if max_sim < threshold:
+            unmatched.append((unit, float(max_sim)))
+    return unmatched
+
+def compare_sentences(reference, candidate, threshold=0.80):
+    ref_units = split_into_semantic_units(reference)
+    cand_units = split_into_semantic_units(candidate)
+
+    ref_to_cand_sim = get_similarity_matrix(ref_units, cand_units)
+    cand_to_ref_sim = ref_to_cand_sim.transpose(0, 1)
+
+    missing_info = find_unmatched_units(ref_units, cand_units, ref_to_cand_sim, threshold, 'ref→cand')
+    extra_info = find_unmatched_units(cand_units, ref_units, cand_to_ref_sim, threshold, 'cand→ref')
+
+    return missing_info, extra_info
+
+# Example input
+reference = "The participant has taken the maximum number of withdrawals for a year which is 2."
+candidate = "The participant has made all the available withdrawals for the year. And is good to go."
+
+# Compare
+missing, extra = compare_sentences(reference, candidate, threshold=0.80)
+
+# Print results
+print("\n--- Missing Information from Candidate ---")
+for unit, score in missing:
+    print(f" - '{unit}' (max similarity: {score:.2f})")
+
+print("\n--- Extra Information in Candidate ---")
+for unit, score in extra:
+    print(f" - '{unit}' (max similarity: {score:.2f})")
