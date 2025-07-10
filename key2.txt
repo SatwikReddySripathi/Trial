@@ -1,0 +1,69 @@
+import spacy
+from sentence_transformers import SentenceTransformer, util
+
+# Load models
+nlp = spacy.load("en_core_web_sm")
+sbert = SentenceTransformer('all-MiniLM-L6-v2')
+
+def extract_chunks(sentence):
+    doc = nlp(sentence)
+    chunks = set()
+
+    for ent in doc.ents:
+        chunks.add(ent.text.lower())
+
+    for chunk in doc.noun_chunks:
+        chunks.add(chunk.text.lower())
+
+    for token in doc:
+        if token.pos_ in ["VERB", "AUX"]:
+            chunks.add(token.lemma_.lower())
+
+    # Optionally add whole sentence as a chunk for high-level match
+    chunks.add(sentence.strip().lower())
+
+    return list(chunks)
+
+def get_best_similarity(chunk, target_chunks, target_embeddings, threshold=0.80):
+    chunk_embedding = sbert.encode(chunk, convert_to_tensor=True)
+    similarities = util.cos_sim(chunk_embedding, target_embeddings)
+    best_score = float(similarities.max())
+    return best_score
+
+def compare_chunks_semantically(ref_chunks, cand_chunks, threshold=0.80):
+    ref_embeddings = sbert.encode(ref_chunks, convert_to_tensor=True)
+    cand_embeddings = sbert.encode(cand_chunks, convert_to_tensor=True)
+
+    missing = []
+    extra = []
+
+    # Check missing (reference → candidate)
+    for i, ref_chunk in enumerate(ref_chunks):
+        best_sim = get_best_similarity(ref_chunk, cand_chunks, cand_embeddings, threshold)
+        if best_sim < threshold:
+            missing.append(ref_chunk)
+
+    # Check extra (candidate → reference)
+    for i, cand_chunk in enumerate(cand_chunks):
+        best_sim = get_best_similarity(cand_chunk, ref_chunks, ref_embeddings, threshold)
+        if best_sim < threshold:
+            extra.append(cand_chunk)
+
+    return missing, extra
+
+# Example
+reference = "The participant has taken the maximum number of withdrawals for a year which is 2."
+candidate = "The participant has made all the available withdrawals for the year. And is good to go."
+
+ref_chunks = extract_chunks(reference)
+cand_chunks = extract_chunks(candidate)
+
+missing, extra = compare_chunks_semantically(ref_chunks, cand_chunks)
+
+print("Missing Information from Candidate:")
+for m in missing:
+    print(f" - {m}")
+
+print("\nExtra Information in Candidate:")
+for e in extra:
+    print(f" - {e}")
