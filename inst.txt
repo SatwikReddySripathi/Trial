@@ -1,0 +1,10 @@
+# 1. Create a clean environment (optional but strongly recommended)
+python -m venv triple_env
+source triple_env/bin/activate  # or .\triple_env\Scripts\activate on Windows
+
+# 2. Install correct versions
+pip install torch==1.10.2
+pip install transformers==4.28.1
+pip install allennlp==2.10.1 allennlp-models==2.10.1
+pip install spacy sentence-transformers
+python -m spacy download en_core_web_sm
