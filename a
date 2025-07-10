@@ -1,0 +1,44 @@
+from transformers import AutoTokenizer, AutoModelForSeq2SeqLM
+
+# Load model and tokenizer
+model_name = "Babelscape/rebel-large"
+tokenizer = AutoTokenizer.from_pretrained(model_name)
+model = AutoModelForSeq2SeqLM.from_pretrained(model_name)
+
+def extract_triples(text):
+    inputs = tokenizer(text, return_tensors="pt", padding=True, truncation=True)
+    outputs = model.generate(**inputs, max_length=512)
+    decoded = tokenizer.batch_decode(outputs, skip_special_tokens=True)[0]
+
+    # Parse into (subject, relation, object) triples
+    triples = []
+    current = {"subject": "", "relation": "", "object": ""}
+    mode = None
+
+    for token in decoded.split():
+        if "<triplet>" in token:
+            if current["subject"]:
+                triples.append((current["subject"], current["relation"], current["object"]))
+            current = {"subject": "", "relation": "", "object": ""}
+            mode = "subject"
+        elif "<subj>" in token:
+            mode = "subject"
+        elif "<obj>" in token:
+            mode = "object"
+        elif "<rel>" in token:
+            mode = "relation"
+        else:
+            if mode:
+                current[mode] += (token + " ")
+
+    if current["subject"]:
+        triples.append((current["subject"].strip(), current["relation"].strip(), current["object"].strip()))
+    
+    return triples
+
+# Example usage
+text = "Python is a programming language created by Guido van Rossum in 1991."
+triples = extract_triples(text)
+
+for s, r, o in triples:
+    print(f"({s}, {r}, {o})")
