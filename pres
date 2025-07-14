@@ -1,0 +1,36 @@
+import matplotlib.pyplot as plt
+
+# Example model data
+models = [
+    'Distilled Student Model', 'FLAN-PEFT', 'Qwen0.5B-4bit-PEFT',
+    'Qwen0.5B-8bit-PEFT', 'Qwen1.5B-4bit-PEFT', 'Qwen1.5B-8bit-PEFT',
+    'Qwen1.5B (no finetune)', 'Qwen0.5 (no finetune)', 'Phi3.5-no-finetune', 'Qwen7B'
+]
+performance = [0.52, 0.50, 0.47, 0.42, 0.45, 0.43, 0.30, 0.28, 0.25, 0.65]  # Y-axis
+compute = [1, 1.1, 0.8, 0.9, 1.3, 1.4, 1.6, 0.7, 5, 7.2]                    # X-axis
+
+# Plotting
+plt.figure(figsize=(10, 7))
+plt.scatter(compute, performance)
+
+# Draw quadrant lines (you can choose median or fixed thresholds)
+plt.axhline(0.4, color='gray', linestyle='--')  # Horizontal divider
+plt.axvline(2.0, color='gray', linestyle='--')  # Vertical divider
+
+# Add labels
+for i, model in enumerate(models):
+    plt.annotate(model, (compute[i], performance[i]), textcoords="offset points", xytext=(5,5), ha='left')
+
+plt.title("Performance vs Memory/Compute")
+plt.xlabel("Parameters / Compute Proxy")
+plt.ylabel("Performance (e.g., Accuracy)")
+
+# Optional: Add quadrant labels
+plt.text(0.5, 0.6, "Quadrant 2 - We are interested", fontsize=9, color='blue')
+plt.text(4.5, 0.6, "Quadrant 1 - High perf, high cost", fontsize=9, color='blue')
+plt.text(0.5, 0.2, "Quadrant 3 - Low performance", fontsize=9, color='blue')
+plt.text(4.5, 0.2, "Quadrant 4 - Unlikely", fontsize=9, color='blue')
+
+plt.grid(True)
+plt.tight_layout()
+plt.show()
