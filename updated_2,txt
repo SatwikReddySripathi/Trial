@@ -1,0 +1,1071 @@
+"""
+Comprehensive Hallucination Detection System
+===========================================
+Combines fact extraction, bidirectional entailment, semantic similarity, and entropy analysis
+"""
+
+import re
+import json
+import webbrowser
+import os
+import numpy as np
+from typing import List, Dict, Set, Tuple, Optional
+from dataclasses import dataclass, field
+from collections import defaultdict
+import logging
+import networkx as nx
+from sklearn.feature_extraction.text import TfidfVectorizer
+from sklearn.metrics.pairwise import cosine_similarity
+import nltk
+from nltk.tokenize import sent_tokenize, word_tokenize
+from nltk.corpus import stopwords
+
+# Configure logging
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+logger = logging.getLogger(__name__)
+
+# Download required NLTK data
+try:
+    nltk.data.find('tokenizers/punkt')
+except:
+    nltk.download('punkt', quiet=True)
+try:
+    nltk.data.find('corpora/stopwords')
+except:
+    nltk.download('stopwords', quiet=True)
+
+
+@dataclass
+class Fact:
+    """Represents a fact extracted from text"""
+    fact_type: str
+    subject: str
+    attribute: str
+    value: str
+    raw_text: str
+    
+    def __hash__(self):
+        return hash((self.fact_type, self.subject.lower(), self.attribute.lower()))
+    
+    def matches_key(self, other: 'Fact') -> bool:
+        return (self.fact_type == other.fact_type and 
+                self.subject.lower() == other.subject.lower() and
+                self.attribute.lower() == other.attribute.lower())
+
+
+@dataclass
+class EntailmentResult:
+    """Results of bidirectional entailment check"""
+    forward_entailment: float  # P(hypothesis|premise)
+    backward_entailment: float  # P(premise|hypothesis)
+    contradiction_score: float
+    neutral_score: float
+    bidirectional_consistency: float  # Combined score
+
+
+@dataclass
+class ComprehensiveAnalysis:
+    """Complete analysis results for a paragraph"""
+    # Fact-based metrics
+    fact_precision: float
+    fact_recall: float
+    fact_f1: float
+    contradicted_facts: int
+    missing_facts: int
+    extra_facts: int
+    
+    # Semantic metrics
+    semantic_similarity: float
+    
+    # Entailment metrics
+    entailment: EntailmentResult
+    
+    # Entropy metrics
+    entropy: float
+    entropy_divergence: float
+    perplexity: float
+    
+    # Graph metrics (to be filled after graph construction)
+    pagerank: float = 0.0
+    degree_centrality: float = 0.0
+    clustering_coefficient: float = 0.0
+    
+    # Final scores
+    base_hallucination_score: float = 0.0
+    graph_adjusted_score: float = 0.0
+    is_hallucinated: bool = False
+    confidence: float = 0.0
+
+
+class SimpleFactExtractor:
+    """Extract facts using pattern matching"""
+    
+    def __init__(self):
+        self.patterns = {
+            'money': re.compile(r'(\$[\d,]+(?:\.\d+)?\s*(?:million|billion|thousand|M|B|K)?)', re.IGNORECASE),
+            'percentage': re.compile(r'(\d+(?:\.\d+)?%)', re.IGNORECASE),
+            'date': re.compile(r'((?:January|February|March|April|May|June|July|August|September|October|November|December|Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)\.?\s+\d{1,2},?\s+\d{4}|\d{1,2}[-/]\d{1,2}[-/]\d{2,4})', re.IGNORECASE),
+            'quarter': re.compile(r'(Q[1-4]\s+\d{4})', re.IGNORECASE)
+        }
+    
+    def extract_facts(self, text: str) -> List[Fact]:
+        facts = []
+        sentences = text.split('.')
+        
+        for sent in sentences:
+            sent = sent.strip()
+            if not sent:
+                continue
+            
+            # Extract money facts
+            for match in self.patterns['money'].finditer(sent):
+                money = match.group(0)
+                if 'revenue' in sent.lower():
+                    facts.append(Fact('money', 'company', 'revenue', money, sent))
+                elif 'profit' in sent.lower() and 'margin' not in sent.lower():
+                    facts.append(Fact('money', 'company', 'profit', money, sent))
+            
+            # Extract percentage facts
+            for match in self.patterns['percentage'].finditer(sent):
+                percent = match.group(0)
+                if 'increase' in sent.lower() or 'growth' in sent.lower():
+                    facts.append(Fact('percentage', 'metric', 'increase', percent, sent))
+                elif 'profit margin' in sent.lower():
+                    facts.append(Fact('percentage', 'profit margin', 'value', percent, sent))
+                elif 'employee satisfaction' in sent.lower():
+                    facts.append(Fact('percentage', 'employee satisfaction', 'score', percent, sent))
+                elif 'customer retention' in sent.lower():
+                    facts.append(Fact('percentage', 'customer retention', 'rate', percent, sent))
+            
+            # Extract date facts
+            for match in self.patterns['date'].finditer(sent):
+                date = match.group(0)
+                if 'announced' in sent.lower():
+                    facts.append(Fact('date', 'announcement', 'date', date, sent))
+            
+            # Extract entity facts
+            if 'ceo' in sent.lower():
+                ceo_match = re.search(r'CEO\s+([A-Z][a-z]+\s+[A-Z][a-z]+)', sent)
+                if ceo_match:
+                    facts.append(Fact('entity', 'CEO', 'name', ceo_match.group(1), sent))
+            
+            if 'market' in sent.lower() and ('expansion' in sent.lower() or 'targeting' in sent.lower()):
+                if 'asian' in sent.lower():
+                    facts.append(Fact('entity', 'expansion', 'target_market', 'Asian', sent))
+                elif 'european' in sent.lower():
+                    facts.append(Fact('entity', 'expansion', 'target_market', 'European', sent))
+        
+        return facts
+
+
+class SemanticAnalyzer:
+    """Analyze semantic similarity and entailment"""
+    
+    def __init__(self):
+        self.tfidf = TfidfVectorizer(max_features=500, ngram_range=(1, 3))
+        self.stop_words = set(stopwords.words('english'))
+    
+    def calculate_semantic_similarity(self, text1: str, text2: str) -> float:
+        """Calculate semantic similarity using multiple methods"""
+        # TF-IDF similarity
+        try:
+            tfidf_matrix = self.tfidf.fit_transform([text1, text2])
+            tfidf_sim = cosine_similarity(tfidf_matrix[0:1], tfidf_matrix[1:2])[0][0]
+        except:
+            tfidf_sim = 0.0
+        
+        # Word overlap (Jaccard similarity)
+        words1 = set([w.lower() for w in word_tokenize(text1) if w.isalnum() and w.lower() not in self.stop_words])
+        words2 = set([w.lower() for w in word_tokenize(text2) if w.isalnum() and w.lower() not in self.stop_words])
+        
+        if words1 and words2:
+            jaccard_sim = len(words1 & words2) / len(words1 | words2)
+        else:
+            jaccard_sim = 0.0
+        
+        # N-gram overlap
+        def get_ngrams(text, n=3):
+            words = [w.lower() for w in word_tokenize(text) if w.isalnum()]
+            return set([' '.join(words[i:i+n]) for i in range(len(words)-n+1)])
+        
+        ngrams1 = get_ngrams(text1)
+        ngrams2 = get_ngrams(text2)
+        
+        if ngrams1 and ngrams2:
+            ngram_sim = len(ngrams1 & ngrams2) / len(ngrams1 | ngrams2)
+        else:
+            ngram_sim = 0.0
+        
+        # Weighted combination
+        return 0.5 * tfidf_sim + 0.3 * jaccard_sim + 0.2 * ngram_sim
+    
+    def calculate_bidirectional_entailment(self, premise: str, hypothesis: str) -> EntailmentResult:
+        """Calculate bidirectional entailment scores"""
+        # Forward entailment: Does premise entail hypothesis?
+        premise_words = set([w.lower() for w in word_tokenize(premise) if w.isalnum() and w.lower() not in self.stop_words])
+        hypothesis_words = set([w.lower() for w in word_tokenize(hypothesis) if w.isalnum() and w.lower() not in self.stop_words])
+        
+        if not hypothesis_words:
+            forward_entailment = 0.0
+        else:
+            # How many hypothesis words are covered by premise
+            forward_entailment = len(premise_words & hypothesis_words) / len(hypothesis_words)
+        
+        # Backward entailment: Does hypothesis entail premise?
+        if not premise_words:
+            backward_entailment = 0.0
+        else:
+            backward_entailment = len(premise_words & hypothesis_words) / len(premise_words)
+        
+        # Check for contradictions
+        negation_words = {'not', 'no', 'never', 'neither', 'nor', 'none'}
+        premise_has_negation = bool(negation_words & set(word_tokenize(premise.lower())))
+        hypothesis_has_negation = bool(negation_words & set(word_tokenize(hypothesis.lower())))
+        
+        # Simple contradiction detection
+        if premise_has_negation != hypothesis_has_negation:
+            contradiction_score = 0.7
+        else:
+            # Use semantic similarity inverse as contradiction proxy
+            similarity = self.calculate_semantic_similarity(premise, hypothesis)
+            if similarity < 0.3 and (forward_entailment < 0.3 or backward_entailment < 0.3):
+                contradiction_score = 0.6
+            else:
+                contradiction_score = 0.1
+        
+        # Neutral score
+        neutral_score = 1.0 - forward_entailment - contradiction_score
+        neutral_score = max(0, min(1, neutral_score))
+        
+        # Bidirectional consistency
+        bidirectional_consistency = (forward_entailment + backward_entailment) / 2 * (1 - contradiction_score)
+        
+        return EntailmentResult(
+            forward_entailment=forward_entailment,
+            backward_entailment=backward_entailment,
+            contradiction_score=contradiction_score,
+            neutral_score=neutral_score,
+            bidirectional_consistency=bidirectional_consistency
+        )
+
+
+class EntropyAnalyzer:
+    """Analyze text entropy and complexity"""
+    
+    def calculate_entropy(self, text: str) -> float:
+        """Calculate Shannon entropy of text"""
+        words = [w.lower() for w in word_tokenize(text) if w.isalnum()]
+        if not words:
+            return 0.0
+        
+        # Count word frequencies
+        word_freq = defaultdict(int)
+        for word in words:
+            word_freq[word] += 1
+        
+        # Calculate probabilities
+        total_words = len(words)
+        probs = [count/total_words for count in word_freq.values()]
+        
+        # Calculate entropy
+        entropy = -sum(p * np.log2(p) for p in probs if p > 0)
+        return entropy
+    
+    def calculate_perplexity(self, text: str) -> float:
+        """Calculate perplexity (2^entropy)"""
+        entropy = self.calculate_entropy(text)
+        return 2 ** entropy
+    
+    def calculate_entropy_divergence(self, ref_text: str, cand_text: str) -> float:
+        """Calculate relative entropy divergence"""
+        ref_entropy = self.calculate_entropy(ref_text)
+        cand_entropy = self.calculate_entropy(cand_text)
+        
+        if ref_entropy == 0:
+            return 0.0
+        
+        return abs(cand_entropy - ref_entropy) / ref_entropy
+
+
+class ComprehensiveHallucinationDetector:
+    """Main detector combining all analysis methods"""
+    
+    def __init__(self):
+        self.fact_extractor = SimpleFactExtractor()
+        self.semantic_analyzer = SemanticAnalyzer()
+        self.entropy_analyzer = EntropyAnalyzer()
+        logger.info("Initialized Comprehensive Hallucination Detector")
+    
+    def compare_facts(self, ref_facts: List[Fact], cand_facts: List[Fact]) -> Dict:
+        """Compare facts and return detailed metrics"""
+        matched = []
+        contradicted = []
+        missing = []
+        extra = []
+        
+        ref_dict = {(f.fact_type, f.subject.lower(), f.attribute.lower()): f for f in ref_facts}
+        cand_dict = {(f.fact_type, f.subject.lower(), f.attribute.lower()): f for f in cand_facts}
+        
+        # Check reference facts
+        for key, ref_fact in ref_dict.items():
+            if key in cand_dict:
+                cand_fact = cand_dict[key]
+                if ref_fact.value.lower() == cand_fact.value.lower():
+                    matched.append((ref_fact, cand_fact))
+                else:
+                    contradicted.append((ref_fact, cand_fact))
+            else:
+                missing.append(ref_fact)
+        
+        # Check extra facts
+        for key, cand_fact in cand_dict.items():
+            if key not in ref_dict:
+                extra.append(cand_fact)
+        
+        return {
+            'matched': matched,
+            'contradicted': contradicted,
+            'missing': missing,
+            'extra': extra
+        }
+    
+    def analyze_paragraph(self, reference: str, candidate: str) -> ComprehensiveAnalysis:
+        """Perform comprehensive analysis of a candidate paragraph"""
+        # Extract facts
+        ref_facts = self.fact_extractor.extract_facts(reference)
+        cand_facts = self.fact_extractor.extract_facts(candidate)
+        
+        # Compare facts
+        fact_comparison = self.compare_facts(ref_facts, cand_facts)
+        
+        # Calculate fact-based metrics
+        total_ref = len(ref_facts) if ref_facts else 1
+        total_cand = len(cand_facts) if cand_facts else 1
+        
+        precision = len(fact_comparison['matched']) / total_cand if cand_facts else 0
+        recall = len(fact_comparison['matched']) / total_ref if ref_facts else 0
+        f1 = 2 * precision * recall / (precision + recall) if (precision + recall) > 0 else 0
+        
+        # Semantic similarity
+        semantic_sim = self.semantic_analyzer.calculate_semantic_similarity(reference, candidate)
+        
+        # Bidirectional entailment
+        entailment = self.semantic_analyzer.calculate_bidirectional_entailment(reference, candidate)
+        
+        # Entropy analysis
+        entropy = self.entropy_analyzer.calculate_entropy(candidate)
+        entropy_divergence = self.entropy_analyzer.calculate_entropy_divergence(reference, candidate)
+        perplexity = self.entropy_analyzer.calculate_perplexity(candidate)
+        
+        # Calculate base hallucination score with STRICTER criteria
+        base_score = 0.0
+        
+        # Factor 1: ANY fact contradictions = immediate high score
+        if fact_comparison['contradicted']:
+            base_score += 0.5 + 0.2 * (len(fact_comparison['contradicted']) / max(1, total_ref))
+        
+        # Factor 2: Missing facts - be stricter
+        missing_ratio = len(fact_comparison['missing']) / total_ref if total_ref > 0 else 0
+        if missing_ratio > 0.2:  # Missing more than 20% of facts
+            base_score += 0.3 * missing_ratio
+        
+        # Factor 3: Extra facts - be stricter
+        if len(fact_comparison['extra']) > 1:  # More than 1 extra fact
+            base_score += 0.2 + 0.1 * min(len(fact_comparison['extra']) / 5, 1)
+        
+        # Factor 4: Low semantic similarity - be stricter
+        if semantic_sim < 0.7:  # Raised threshold
+            base_score += 0.2 * (1 - semantic_sim)
+        
+        # Factor 5: Poor bidirectional entailment - be stricter
+        if entailment.bidirectional_consistency < 0.6:  # Raised threshold
+            base_score += 0.2 * (1 - entailment.bidirectional_consistency)
+        
+        # Factor 6: High contradiction score from entailment
+        if entailment.contradiction_score > 0.3:  # Lowered threshold
+            base_score += 0.3 * entailment.contradiction_score
+        
+        # Factor 7: High entropy divergence
+        if entropy_divergence > 0.3:  # Lowered threshold
+            base_score += 0.2 * min(entropy_divergence, 1.0)
+        
+        # Factor 8: Low fact recall is very important
+        if recall < 0.8:  # Must capture at least 80% of facts
+            base_score += 0.3 * (1 - recall)
+        
+        # Determine initial hallucination status - BE STRICT
+        is_hallucinated = (
+            base_score > 0.4 or  # Lowered threshold
+            len(fact_comparison['contradicted']) > 0 or  # ANY contradiction
+            len(fact_comparison['missing']) > 1 or  # Missing more than 1 fact
+            len(fact_comparison['extra']) > 2 or  # More than 2 extra facts
+            entailment.contradiction_score > 0.5 or
+            semantic_sim < 0.6 or  # Raised minimum similarity
+            recall < 0.7 or  # Must have good recall
+            entailment.bidirectional_consistency < 0.5
+        )
+        
+        # Calculate confidence
+        confidence = min(0.9, max(0.6, abs(base_score - 0.5) * 2))
+        
+        return ComprehensiveAnalysis(
+            # Fact metrics
+            fact_precision=precision,
+            fact_recall=recall,
+            fact_f1=f1,
+            contradicted_facts=len(fact_comparison['contradicted']),
+            missing_facts=len(fact_comparison['missing']),
+            extra_facts=len(fact_comparison['extra']),
+            
+            # Semantic metrics
+            semantic_similarity=semantic_sim,
+            
+            # Entailment metrics
+            entailment=entailment,
+            
+            # Entropy metrics
+            entropy=entropy,
+            entropy_divergence=entropy_divergence,
+            perplexity=perplexity,
+            
+            # Scores
+            base_hallucination_score=base_score,
+            is_hallucinated=is_hallucinated,
+            confidence=confidence
+        )
+    
+    def build_comprehensive_graph(self, reference: str, candidates: List[str], 
+                                analyses: List[ComprehensiveAnalysis]) -> nx.Graph:
+        """Build graph incorporating all metrics"""
+        G = nx.Graph()
+        
+        # Add reference node
+        ref_entropy = self.entropy_analyzer.calculate_entropy(reference)
+        G.add_node(0, 
+                  text=reference,
+                  is_reference=True,
+                  entropy=ref_entropy,
+                  hallucination_score=0.0)
+        
+        # Add candidate nodes
+        for i, (candidate, analysis) in enumerate(zip(candidates, analyses), 1):
+            G.add_node(i,
+                      text=candidate,
+                      is_reference=False,
+                      entropy=analysis.entropy,
+                      hallucination_score=analysis.base_hallucination_score,
+                      analysis=analysis)
+        
+        # Add edges based on comprehensive similarity
+        for i in range(len(G.nodes())):
+            for j in range(i + 1, len(G.nodes())):
+                if i == 0:
+                    # Edge to reference
+                    analysis = analyses[j-1]
+                    # Combine multiple factors for edge weight
+                    weight = (
+                        0.3 * analysis.semantic_similarity +
+                        0.3 * analysis.entailment.bidirectional_consistency +
+                        0.2 * analysis.fact_f1 +
+                        0.2 * (1 - analysis.entropy_divergence)
+                    )
+                else:
+                    # Edge between candidates
+                    text_i = G.nodes[i]['text']
+                    text_j = G.nodes[j]['text']
+                    
+                    sem_sim = self.semantic_analyzer.calculate_semantic_similarity(text_i, text_j)
+                    entailment = self.semantic_analyzer.calculate_bidirectional_entailment(text_i, text_j)
+                    
+                    weight = (
+                        0.5 * sem_sim +
+                        0.5 * entailment.bidirectional_consistency
+                    )
+                
+                if weight > 0.1:  # Only add meaningful edges
+                    G.add_edge(i, j, weight=weight)
+        
+        # Ensure connectivity
+        for node in G.nodes():
+            if node != 0 and G.degree(node) == 0:
+                G.add_edge(0, node, weight=0.01)
+        
+        return G
+    
+    def calculate_graph_metrics(self, G: nx.Graph) -> Dict:
+        """Calculate comprehensive graph metrics"""
+        metrics = {}
+        
+        # Basic centrality metrics
+        metrics['pagerank'] = nx.pagerank(G, weight='weight')
+        metrics['degree_centrality'] = nx.degree_centrality(G)
+        metrics['betweenness_centrality'] = nx.betweenness_centrality(G)
+        metrics['clustering'] = nx.clustering(G, weight='weight')
+        
+        # Eigenvector centrality (influence measure)
+        try:
+            metrics['eigenvector_centrality'] = nx.eigenvector_centrality(G, weight='weight', max_iter=1000)
+        except:
+            metrics['eigenvector_centrality'] = {n: 0 for n in G.nodes()}
+        
+        # Information centrality (based on information flow)
+        if nx.is_connected(G):
+            metrics['information_centrality'] = nx.current_flow_closeness_centrality(G, weight='weight')
+        else:
+            metrics['information_centrality'] = {n: 0 for n in G.nodes()}
+        
+        return metrics
+    
+    def adjust_scores_with_graph(self, analyses: List[ComprehensiveAnalysis], 
+                               G: nx.Graph, metrics: Dict) -> List[ComprehensiveAnalysis]:
+        """Adjust scores based on graph position"""
+        for i, analysis in enumerate(analyses):
+            node_id = i + 1  # Candidates start from node 1
+            
+            # Get graph metrics
+            pagerank = metrics['pagerank'].get(node_id, 0)
+            pagerank_norm = pagerank * len(G.nodes())  # Normalize
+            degree = metrics['degree_centrality'].get(node_id, 0)
+            eigenvector = metrics['eigenvector_centrality'].get(node_id, 0)
+            clustering = metrics['clustering'].get(node_id, 0)
+            
+            # Update analysis with graph metrics
+            analysis.pagerank = pagerank_norm
+            analysis.degree_centrality = degree
+            analysis.clustering_coefficient = clustering
+            
+            # Calculate graph adjustment - BE MORE AGGRESSIVE
+            graph_adjustment = 0.0
+            
+            # Very low centrality is highly suspicious
+            if pagerank_norm < 0.8:  # Raised threshold
+                graph_adjustment += 0.2 * (1 - pagerank_norm)
+            
+            # Low degree means poor connectivity - penalize more
+            if degree < 0.5:  # Raised threshold
+                graph_adjustment += 0.2 * (1 - degree)
+            
+            # Low eigenvector centrality
+            if eigenvector < 0.3:  # Raised threshold
+                graph_adjustment += 0.1
+            
+            # Isolated nodes get maximum penalty
+            if G.degree(node_id) <= 1:  # Only connected to reference or isolated
+                graph_adjustment += 0.3
+            
+            # Adjust final score
+            analysis.graph_adjusted_score = min(1.0, analysis.base_hallucination_score + graph_adjustment)
+            
+            # Update hallucination decision - BE STRICT
+            analysis.is_hallucinated = (
+                analysis.graph_adjusted_score > 0.4 or  # Lowered threshold
+                analysis.contradicted_facts > 0 or
+                analysis.missing_facts > 1 or
+                analysis.extra_facts > 2 or
+                analysis.entailment.contradiction_score > 0.5 or
+                analysis.semantic_similarity < 0.6 or
+                analysis.fact_recall < 0.7 or
+                pagerank_norm < 0.5  # Low centrality alone can trigger
+            )
+        
+        return analyses
+    
+    def create_visualization(self, reference: str, candidates: List[str], 
+                           analyses: List[ComprehensiveAnalysis], G: nx.Graph, 
+                           save_path: str = "comprehensive_analysis.html") -> str:
+        """Create simplified visualization focusing on core metrics"""
+        # Prepare nodes for graph
+        nodes = []
+        for node in G.nodes():
+            if node == 0:
+                color = '#0066CC'
+                label = 'REF'
+                status = 'Reference'
+            else:
+                analysis = analyses[node-1]
+                if analysis.is_hallucinated:
+                    if analysis.contradicted_facts > 0:
+                        color = '#FF0000'
+                    elif analysis.entailment.contradiction_score > 0.6:
+                        color = '#CC0000'
+                    elif analysis.missing_facts > 2:
+                        color = '#FF6600'
+                    else:
+                        color = '#FFA500'
+                    status = 'Hallucinated'
+                else:
+                    color = '#00CC00'
+                    status = 'Consistent'
+                label = f'C{node}'
+            
+            nodes.append({
+                'id': node,
+                'label': label,
+                'color': color,
+                'size': 10 + 30 * G.nodes[node].get('hallucination_score', 0),
+                'status': status
+            })
+        
+        # Prepare edges
+        edges = []
+        for u, v, data in G.edges(data=True):
+            edges.append({
+                'source': u,
+                'target': v,
+                'weight': data['weight'],
+                'color': '#00FF00' if data['weight'] > 0.7 else '#FFA500' if data['weight'] > 0.3 else '#FF0000'
+            })
+        
+        # Get reference facts for display
+        ref_facts = self.fact_extractor.extract_facts(reference)
+        
+        html_content = f"""
+<!DOCTYPE html>
+<html>
+<head>
+    <title>Comprehensive Hallucination Analysis</title>
+    <script src="https://d3js.org/d3.v7.min.js"></script>
+    <style>
+        body {{
+            font-family: Arial, sans-serif;
+            margin: 20px;
+            background-color: #f5f5f5;
+        }}
+        .container {{
+            max-width: 1400px;
+            margin: 0 auto;
+        }}
+        .header {{
+            text-align: center;
+            margin-bottom: 30px;
+        }}
+        .main-grid {{
+            display: grid;
+            grid-template-columns: 2fr 1fr;
+            gap: 20px;
+            margin-bottom: 30px;
+        }}
+        .section {{
+            background: white;
+            padding: 20px;
+            border-radius: 8px;
+            box-shadow: 0 2px 4px rgba(0,0,0,0.1);
+        }}
+        .paragraph {{
+            margin: 15px 0;
+            padding: 15px;
+            border-radius: 5px;
+            border-left: 5px solid;
+        }}
+        .reference {{
+            border-left-color: #0066CC;
+            background: #f0f7ff;
+        }}
+        .consistent {{
+            border-left-color: #00CC00;
+            background: #f0fff0;
+        }}
+        .hallucinated {{
+            border-left-color: #FF0000;
+            background: #fff0f0;
+        }}
+        .metrics-grid {{
+            display: grid;
+            grid-template-columns: repeat(4, 1fr);
+            gap: 10px;
+            margin: 10px 0;
+        }}
+        .metric {{
+            background: #f8f9fa;
+            padding: 10px;
+            border-radius: 5px;
+            text-align: center;
+        }}
+        .metric-value {{
+            font-size: 20px;
+            font-weight: bold;
+            color: #333;
+        }}
+        .metric-label {{
+            font-size: 12px;
+            color: #666;
+            margin-top: 5px;
+        }}
+        .issues {{
+            margin-top: 10px;
+            padding: 10px;
+            background: #f8f9fa;
+            border-radius: 5px;
+        }}
+        .issue-item {{
+            color: #d9534f;
+            margin: 5px 0;
+        }}
+        .fact-list {{
+            margin: 10px 0;
+            padding: 10px;
+            background: #f0f0f0;
+            border-radius: 5px;
+        }}
+        .fact-item {{
+            margin: 5px 0;
+            font-size: 14px;
+        }}
+        #graph-container {{
+            height: 600px;
+            position: sticky;
+            top: 20px;
+        }}
+        .tooltip {{
+            position: absolute;
+            background: rgba(0, 0, 0, 0.8);
+            color: white;
+            padding: 10px;
+            border-radius: 5px;
+            pointer-events: none;
+            opacity: 0;
+            transition: opacity 0.3s;
+            font-size: 12px;
+        }}
+        .legend {{
+            margin-top: 20px;
+            padding: 15px;
+            background: #f8f9fa;
+            border-radius: 5px;
+        }}
+        .legend-item {{
+            display: inline-block;
+            margin-right: 20px;
+        }}
+        .legend-color {{
+            display: inline-block;
+            width: 20px;
+            height: 20px;
+            margin-right: 5px;
+            vertical-align: middle;
+            border: 1px solid #333;
+        }}
+    </style>
+</head>
+<body>
+    <div class="container">
+        <div class="header">
+            <h1>Comprehensive Hallucination Analysis</h1>
+            <p>Fact Extraction + Bidirectional Entailment + Semantic Analysis + Entropy + Graph Metrics</p>
+        </div>
+        
+        <div class="main-grid">
+            <div class="section">
+                <h2>Detailed Analysis</h2>
+                
+                <div class="paragraph reference">
+                    <h3>Reference Text</h3>
+                    <p>{reference}</p>
+                    <div class="fact-list">
+                        <strong>Extracted Facts ({len(ref_facts)}):</strong>
+"""
+        
+        # Add reference facts
+        for fact in ref_facts:
+            html_content += f'<div class="fact-item">• {fact.fact_type}: {fact.subject} - {fact.attribute} = {fact.value}</div>\n'
+        
+        html_content += """
+                    </div>
+                </div>
+"""
+        
+        # Add candidate analyses
+        for i, (candidate, analysis) in enumerate(zip(candidates, analyses)):
+            status = "hallucinated" if analysis.is_hallucinated else "consistent"
+            html_content += f"""
+                <div class="paragraph {status}">
+                    <h3>Candidate {i+1} - {status.upper()}</h3>
+                    <p>{candidate}</p>
+                    
+                    <div class="metrics-grid">
+                        <div class="metric">
+                            <div class="metric-value">{analysis.fact_recall:.2f}</div>
+                            <div class="metric-label">Fact Recall</div>
+                        </div>
+                        <div class="metric">
+                            <div class="metric-value">{analysis.semantic_similarity:.2f}</div>
+                            <div class="metric-label">Semantic Sim</div>
+                        </div>
+                        <div class="metric">
+                            <div class="metric-value">{analysis.entailment.bidirectional_consistency:.2f}</div>
+                            <div class="metric-label">Bi-Entailment</div>
+                        </div>
+                        <div class="metric">
+                            <div class="metric-value">{analysis.graph_adjusted_score:.2f}</div>
+                            <div class="metric-label">Final Score</div>
+                        </div>
+                    </div>
+                    
+                    <div class="issues">
+                        <strong>Analysis Results:</strong>
+"""
+            
+            if analysis.contradicted_facts > 0:
+                html_content += f'<div class="issue-item">⚠️ {analysis.contradicted_facts} contradicted facts</div>'
+            if analysis.missing_facts > 0:
+                html_content += f'<div class="issue-item">⚠️ {analysis.missing_facts} missing facts</div>'
+            if analysis.extra_facts > 0:
+                html_content += f'<div class="issue-item">⚠️ {analysis.extra_facts} extra facts</div>'
+            if analysis.entailment.contradiction_score > 0.5:
+                html_content += f'<div class="issue-item">⚠️ High contradiction score: {analysis.entailment.contradiction_score:.2f}</div>'
+            if analysis.semantic_similarity < 0.6:
+                html_content += f'<div class="issue-item">⚠️ Low semantic similarity: {analysis.semantic_similarity:.2f}</div>'
+            if analysis.entropy_divergence > 0.3:
+                html_content += f'<div class="issue-item">⚠️ High entropy divergence: {analysis.entropy_divergence:.2f}</div>'
+            if analysis.pagerank < 0.5:
+                html_content += f'<div class="issue-item">⚠️ Low graph centrality: {analysis.pagerank:.2f}</div>'
+            
+            if not analysis.is_hallucinated:
+                html_content += '<div style="color: #5cb85c;">✓ All checks passed</div>'
+            
+            html_content += f"""
+                    </div>
+                    
+                    <div style="margin-top: 10px; font-size: 12px; color: #666;">
+                        Forward Entailment: {analysis.entailment.forward_entailment:.2f} | 
+                        Backward Entailment: {analysis.entailment.backward_entailment:.2f} | 
+                        PageRank: {analysis.pagerank:.2f}
+                    </div>
+                </div>
+"""
+        
+        html_content += """
+            </div>
+            
+            <div class="section">
+                <h2>Relationship Graph</h2>
+                <div id="graph-container"></div>
+                
+                <div class="legend">
+                    <div class="legend-item">
+                        <span class="legend-color" style="background: #0066CC;"></span>Reference
+                    </div>
+                    <div class="legend-item">
+                        <span class="legend-color" style="background: #00CC00;"></span>Consistent
+                    </div>
+                    <div class="legend-item">
+                        <span class="legend-color" style="background: #FF0000;"></span>Hallucinated
+                    </div>
+                </div>
+            </div>
+        </div>
+    </div>
+    
+    <div class="tooltip"></div>
+    
+    <script>
+        // Graph visualization
+        const nodes = """ + json.dumps(nodes) + """;
+        const links = """ + json.dumps(edges) + """;
+        
+        const width = document.getElementById('graph-container').offsetWidth;
+        const height = 600;
+        
+        const svg = d3.select("#graph-container")
+            .append("svg")
+            .attr("width", width)
+            .attr("height", height);
+            
+        const tooltip = d3.select(".tooltip");
+        
+        const simulation = d3.forceSimulation(nodes)
+            .force("link", d3.forceLink(links).id(d => d.id).distance(120))
+            .force("charge", d3.forceManyBody().strength(-800))
+            .force("center", d3.forceCenter(width / 2, height / 2))
+            .force("collision", d3.forceCollide().radius(d => d.size + 10));
+        
+        const link = svg.append("g")
+            .selectAll("line")
+            .data(links)
+            .enter().append("line")
+            .attr("stroke", d => d.color)
+            .attr("stroke-width", d => 1 + d.weight * 5)
+            .attr("stroke-opacity", 0.6);
+        
+        const node = svg.append("g")
+            .selectAll("circle")
+            .data(nodes)
+            .enter().append("circle")
+            .attr("r", d => d.size)
+            .attr("fill", d => d.color)
+            .attr("stroke", "#333")
+            .attr("stroke-width", 2)
+            .style("cursor", "pointer")
+            .call(d3.drag()
+                .on("start", dragstarted)
+                .on("drag", dragged)
+                .on("end", dragended));
+        
+        const labels = svg.append("g")
+            .selectAll("text")
+            .data(nodes)
+            .enter().append("text")
+            .text(d => d.label)
+            .attr("font-size", 14)
+            .attr("font-weight", "bold")
+            .attr("text-anchor", "middle")
+            .attr("dy", 4);
+        
+        node.on("mouseover", function(event, d) {
+            tooltip.html(`<strong>${d.label}</strong><br>Status: ${d.status}`)
+                .style("left", (event.pageX + 10) + "px")
+                .style("top", (event.pageY - 10) + "px")
+                .style("opacity", 1);
+        })
+        .on("mouseout", function() {
+            tooltip.style("opacity", 0);
+        });
+        
+        simulation.on("tick", () => {
+            link
+                .attr("x1", d => d.source.x)
+                .attr("y1", d => d.source.y)
+                .attr("x2", d => d.target.x)
+                .attr("y2", d => d.target.y);
+            
+            node
+                .attr("cx", d => d.x)
+                .attr("cy", d => d.y);
+                
+            labels
+                .attr("x", d => d.x)
+                .attr("y", d => d.y);
+        });
+        
+        function dragstarted(event, d) {
+            if (!event.active) simulation.alphaTarget(0.3).restart();
+            d.fx = d.x;
+            d.fy = d.y;
+        }
+        
+        function dragged(event, d) {
+            d.fx = event.x;
+            d.fy = event.y;
+        }
+        
+        function dragended(event, d) {
+            if (!event.active) simulation.alphaTarget(0);
+            d.fx = null;
+            d.fy = null;
+        }
+    </script>
+</body>
+</html>
+"""
+        
+        with open(save_path, 'w', encoding='utf-8') as f:
+            f.write(html_content)
+        
+        return save_path
+    
+    def analyze(self, reference: str, candidates: List[str]) -> Dict:
+        """Perform comprehensive analysis"""
+        print("\n" + "="*70)
+        print("COMPREHENSIVE HALLUCINATION DETECTION ANALYSIS")
+        print("="*70)
+        
+        # Analyze each candidate
+        analyses = []
+        for i, candidate in enumerate(candidates):
+            print(f"\n--- Analyzing Candidate {i+1} ---")
+            analysis = self.analyze_paragraph(reference, candidate)
+            analyses.append(analysis)
+            
+            print(f"Fact F1: {analysis.fact_f1:.3f}")
+            print(f"Semantic Similarity: {analysis.semantic_similarity:.3f}")
+            print(f"Bidirectional Entailment: {analysis.entailment.bidirectional_consistency:.3f}")
+            print(f"Entropy Divergence: {analysis.entropy_divergence:.3f}")
+            print(f"Base Hallucination Score: {analysis.base_hallucination_score:.3f}")
+        
+        # Build comprehensive graph
+        print("\n--- Building Comprehensive Graph ---")
+        G = self.build_comprehensive_graph(reference, candidates, analyses)
+        
+        # Calculate graph metrics
+        print("\n--- Calculating Graph Metrics ---")
+        metrics = self.calculate_graph_metrics(G)
+        
+        # Adjust scores with graph metrics
+        print("\n--- Adjusting Scores with Graph Metrics ---")
+        analyses = self.adjust_scores_with_graph(analyses, G, metrics)
+        
+        # Print final results
+        print("\n--- FINAL RESULTS ---")
+        for i, analysis in enumerate(analyses):
+            print(f"\nCandidate {i+1}:")
+            print(f"  Status: {'HALLUCINATED' if analysis.is_hallucinated else 'CONSISTENT'}")
+            print(f"  Final Score: {analysis.graph_adjusted_score:.3f}")
+            print(f"  Key Issues:")
+            if analysis.contradicted_facts > 0:
+                print(f"    - {analysis.contradicted_facts} contradicted facts")
+            if analysis.entailment.contradiction_score > 0.5:
+                print(f"    - High contradiction in entailment ({analysis.entailment.contradiction_score:.2f})")
+            if analysis.semantic_similarity < 0.5:
+                print(f"    - Low semantic similarity ({analysis.semantic_similarity:.2f})")
+            if analysis.entropy_divergence > 0.5:
+                print(f"    - High entropy divergence ({analysis.entropy_divergence:.2f})")
+        
+        # Create visualization
+        viz_path = self.create_visualization(reference, candidates, analyses, G)
+        print(f"\nVisualization saved to: {viz_path}")
+        
+        try:
+            webbrowser.open(f'file://{os.path.abspath(viz_path)}')
+        except:
+            print("Could not open browser automatically.")
+        
+        return {
+            'analyses': analyses,
+            'graph': G,
+            'metrics': metrics,
+            'visualization': viz_path
+        }
+
+
+# Example usage
+if __name__ == "__main__":
+    detector = ComprehensiveHallucinationDetector()
+    
+    reference = """The company reported revenue of $2.5 million in Q4 2023, with a 15% increase from the previous quarter. 
+    CEO John Smith announced expansion plans on January 15, 2024, targeting the Asian market. 
+    The profit margin improved to 22% due to cost optimization strategies. 
+    Employee satisfaction scores reached 85% in the annual survey."""
+    
+    candidates = [
+        # Should be CONSISTENT - high similarity on all metrics
+        """Q4 2023 revenue reached $2.5 million, marking 15% quarterly growth. 
+        John Smith revealed Asian market expansion on January 15, 2024. 
+        Profit margins rose to 22% through cost optimization. 
+        Employee satisfaction hit 85% in yearly survey.""",
+        
+        # Should be HALLUCINATED - contradictions
+        """The company reported revenue of $3.2 million in Q4 2023, with a 20% increase. 
+        CEO John Smith announced expansion plans on January 20, 2024. 
+        Profit margins reached 25% after cost controls. 
+        Employee satisfaction was 75% in the survey.""",
+        
+        # Should be PARTIALLY HALLUCINATED - missing facts, low recall
+        """The company reported revenue of $2.5 million in Q4 2023. 
+        CEO John Smith announced expansion plans.""",
+        
+        # Should be HALLUCINATED - semantic drift, poor entailment
+        """The technology sector showed strong performance in Q4 2023. 
+        Many companies are expanding internationally. 
+        Cost optimization remains important for profitability. 
+        Employee engagement is a key success factor.""",
+        
+        # Should be HALLUCINATED - high entropy, extra facts
+        """Revenue hit $2.5 million in Q4 2023 with phenomenal 15% growth trajectory. 
+        Visionary CEO John Smith unveiled groundbreaking Asian market expansion on January 15, 2024. 
+        Revolutionary profit margins soared to 22% through innovative optimization. 
+        Unprecedented employee satisfaction reached 85%. 
+        Additionally, breakthrough AI integration yielded remarkable productivity gains. 
+        Sustainability initiatives achieved carbon neutrality ahead of schedule."""
+    ]
+    
+    results = detector.analyze(reference, candidates)
