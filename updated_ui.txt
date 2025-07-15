@@ -1,0 +1,947 @@
+"""
+Simplified Hallucination Detection System with Robust Fact Extraction
+====================================================================
+Focus on extracting and comparing key facts accurately
+"""
+
+import re
+import json
+import webbrowser
+import os
+from typing import List, Dict, Set, Tuple, Optional
+from dataclasses import dataclass, field
+from collections import defaultdict
+import logging
+import networkx as nx
+import numpy as np
+
+# Configure logging
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+logger = logging.getLogger(__name__)
+
+
+@dataclass
+class Fact:
+    """Represents a fact extracted from text"""
+    fact_type: str  # 'money', 'percentage', 'date', 'entity_attribute'
+    subject: str
+    attribute: str
+    value: str
+    raw_text: str
+    
+    def __hash__(self):
+        return hash((self.fact_type, self.subject.lower(), self.attribute.lower()))
+    
+    def matches_key(self, other: 'Fact') -> bool:
+        """Check if facts are about the same thing"""
+        return (self.fact_type == other.fact_type and 
+                self.subject.lower() == other.subject.lower() and
+                self.attribute.lower() == other.attribute.lower())
+
+
+@dataclass
+class FactComparison:
+    """Results of comparing facts between texts"""
+    matched_facts: List[Tuple[Fact, Fact]] = field(default_factory=list)
+    contradicted_facts: List[Tuple[Fact, Fact]] = field(default_factory=list)
+    missing_facts: List[Fact] = field(default_factory=list)
+    extra_facts: List[Fact] = field(default_factory=list)
+    
+    @property
+    def has_contradictions(self) -> bool:
+        return len(self.contradicted_facts) > 0
+    
+    @property
+    def precision(self) -> float:
+        total_candidate = len(self.matched_facts) + len(self.contradicted_facts) + len(self.extra_facts)
+        if total_candidate == 0:
+            return 1.0
+        return len(self.matched_facts) / total_candidate
+    
+    @property
+    def recall(self) -> float:
+        total_reference = len(self.matched_facts) + len(self.contradicted_facts) + len(self.missing_facts)
+        if total_reference == 0:
+            return 1.0
+        return len(self.matched_facts) / total_reference
+
+
+class SimpleFactExtractor:
+    """Extract facts using pattern matching"""
+    
+    def __init__(self):
+        # Compile patterns for efficiency
+        self.patterns = {
+            'money': re.compile(r'(\$[\d,]+(?:\.\d+)?\s*(?:million|billion|thousand|M|B|K)?)', re.IGNORECASE),
+            'percentage': re.compile(r'(\d+(?:\.\d+)?%)', re.IGNORECASE),
+            'date': re.compile(r'((?:January|February|March|April|May|June|July|August|September|October|November|December|Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)\.?\s+\d{1,2},?\s+\d{4}|\d{1,2}[-/]\d{1,2}[-/]\d{2,4})', re.IGNORECASE),
+            'quarter': re.compile(r'(Q[1-4]\s+\d{4})', re.IGNORECASE)
+        }
+    
+    def normalize_value(self, value: str, fact_type: str) -> str:
+        """Normalize values for comparison"""
+        if fact_type == 'money':
+            # Extract numeric value
+            num_str = re.sub(r'[^\d.]', '', value)
+            try:
+                num = float(num_str)
+                if 'million' in value.lower() or 'M' in value:
+                    num *= 1000000
+                elif 'billion' in value.lower() or 'B' in value:
+                    num *= 1000000000
+                elif 'thousand' in value.lower() or 'K' in value:
+                    num *= 1000
+                return str(num)
+            except:
+                return value
+        elif fact_type == 'percentage':
+            return re.sub(r'[^\d.]', '', value)
+        elif fact_type == 'date':
+            # Simple normalization
+            return value.lower().replace(',', '').replace('.', '')
+        return value.lower()
+    
+    def extract_facts(self, text: str) -> List[Fact]:
+        """Extract facts from text"""
+        facts = []
+        sentences = text.split('.')
+        
+        for sent in sentences:
+            sent = sent.strip()
+            if not sent:
+                continue
+            
+            # Extract money facts
+            for match in self.patterns['money'].finditer(sent):
+                money = match.group(0)
+                # Find what this money refers to
+                if 'revenue' in sent.lower():
+                    facts.append(Fact('money', 'company', 'revenue', money, sent))
+                elif 'profit' in sent.lower() and 'margin' in sent.lower():
+                    # This is percentage, not money
+                    continue
+                else:
+                    # Generic money fact
+                    facts.append(Fact('money', 'company', 'financial_metric', money, sent))
+            
+            # Extract percentage facts
+            for match in self.patterns['percentage'].finditer(sent):
+                percent = match.group(0)
+                if 'increase' in sent.lower() or 'growth' in sent.lower():
+                    facts.append(Fact('percentage', 'metric', 'increase', percent, sent))
+                elif 'profit margin' in sent.lower():
+                    facts.append(Fact('percentage', 'profit margin', 'value', percent, sent))
+                elif 'employee satisfaction' in sent.lower():
+                    facts.append(Fact('percentage', 'employee satisfaction', 'score', percent, sent))
+                elif 'customer retention' in sent.lower():
+                    facts.append(Fact('percentage', 'customer retention', 'rate', percent, sent))
+                else:
+                    facts.append(Fact('percentage', 'metric', 'value', percent, sent))
+            
+            # Extract date facts
+            for match in self.patterns['date'].finditer(sent):
+                date = match.group(0)
+                if 'announced' in sent.lower() or 'announcement' in sent.lower():
+                    subject = 'CEO' if 'CEO' in sent else 'announcement'
+                    facts.append(Fact('date', subject, 'announcement_date', date, sent))
+                else:
+                    facts.append(Fact('date', 'event', 'date', date, sent))
+            
+            # Extract quarter facts
+            for match in self.patterns['quarter'].finditer(sent):
+                quarter = match.group(0)
+                facts.append(Fact('quarter', 'period', 'time', quarter, sent))
+            
+            # Extract entity-attribute facts
+            if 'ceo' in sent.lower():
+                # Extract CEO name
+                ceo_match = re.search(r'CEO\s+([A-Z][a-z]+\s+[A-Z][a-z]+)', sent)
+                if ceo_match:
+                    facts.append(Fact('entity_attribute', 'CEO', 'name', ceo_match.group(1), sent))
+            
+            if 'market' in sent.lower() and ('expansion' in sent.lower() or 'targeting' in sent.lower()):
+                # Extract target market
+                if 'asian' in sent.lower():
+                    facts.append(Fact('entity_attribute', 'expansion', 'target_market', 'Asian', sent))
+                elif 'european' in sent.lower():
+                    facts.append(Fact('entity_attribute', 'expansion', 'target_market', 'European', sent))
+        
+        # Remove duplicates
+        unique_facts = []
+        seen = set()
+        for fact in facts:
+            key = (fact.fact_type, fact.subject.lower(), fact.attribute.lower(), fact.value.lower())
+            if key not in seen:
+                seen.add(key)
+                unique_facts.append(fact)
+        
+        return unique_facts
+    
+    def compare_values(self, value1: str, value2: str, fact_type: str) -> bool:
+        """Compare two values of the same fact type"""
+        norm1 = self.normalize_value(value1, fact_type)
+        norm2 = self.normalize_value(value2, fact_type)
+        
+        if fact_type in ['money', 'percentage']:
+            try:
+                num1 = float(norm1)
+                num2 = float(norm2)
+                # Allow small differences (< 1%)
+                return abs(num1 - num2) / max(num1, num2) < 0.01
+            except:
+                return norm1 == norm2
+        else:
+            return norm1 == norm2
+
+
+class HallucinationDetector:
+    """Simple hallucination detector focused on fact checking"""
+    
+    def __init__(self):
+        self.fact_extractor = SimpleFactExtractor()
+        logger.info("Initialized Hallucination Detector")
+    
+    def compare_facts(self, reference_facts: List[Fact], candidate_facts: List[Fact]) -> FactComparison:
+        """Compare facts between reference and candidate"""
+        comparison = FactComparison()
+        
+        # Create lookup dictionaries
+        ref_dict = {(f.fact_type, f.subject.lower(), f.attribute.lower()): f for f in reference_facts}
+        cand_dict = {(f.fact_type, f.subject.lower(), f.attribute.lower()): f for f in candidate_facts}
+        
+        # Check each reference fact
+        for key, ref_fact in ref_dict.items():
+            if key in cand_dict:
+                cand_fact = cand_dict[key]
+                # Compare values
+                if self.fact_extractor.compare_values(ref_fact.value, cand_fact.value, ref_fact.fact_type):
+                    comparison.matched_facts.append((ref_fact, cand_fact))
+                else:
+                    comparison.contradicted_facts.append((ref_fact, cand_fact))
+            else:
+                comparison.missing_facts.append(ref_fact)
+        
+        # Check for extra facts
+        for key, cand_fact in cand_dict.items():
+            if key not in ref_dict:
+                comparison.extra_facts.append(cand_fact)
+        
+        return comparison
+    
+    def classify_paragraph(self, reference: str, candidate: str) -> Dict:
+        """Classify a paragraph based on fact comparison"""
+        ref_facts = self.fact_extractor.extract_facts(reference)
+        cand_facts = self.fact_extractor.extract_facts(candidate)
+        
+        logger.info(f"Extracted {len(ref_facts)} reference facts, {len(cand_facts)} candidate facts")
+        
+        comparison = self.compare_facts(ref_facts, cand_facts)
+        
+        # Calculate base hallucination score
+        base_score = 0.0
+        
+        # Contradictions have highest weight
+        if comparison.has_contradictions:
+            base_score += 0.4 * (len(comparison.contradicted_facts) / max(1, len(ref_facts)))
+        
+        # Missing facts
+        if ref_facts:
+            missing_ratio = len(comparison.missing_facts) / len(ref_facts)
+            base_score += 0.3 * missing_ratio
+        
+        # Extra facts (potential fabrications)
+        if len(comparison.extra_facts) > 2:
+            extra_penalty = min(0.3, 0.1 * (len(comparison.extra_facts) - 2))
+            base_score += extra_penalty
+        
+        # Determine if hallucinated (will be adjusted by graph metrics)
+        is_hallucinated = (
+            comparison.has_contradictions or
+            len(comparison.missing_facts) > len(ref_facts) * 0.3 or
+            len(comparison.extra_facts) > 3
+        )
+        
+        # Calculate confidence
+        if ref_facts:
+            confidence = min(comparison.precision, comparison.recall)
+        else:
+            confidence = 0.5
+        
+        return {
+            'is_hallucinated': is_hallucinated,
+            'base_hallucination_score': base_score,
+            'comparison': comparison,
+            'precision': comparison.precision,
+            'recall': comparison.recall,
+            'confidence': confidence,
+            'ref_facts': ref_facts,
+            'cand_facts': cand_facts
+        }
+    
+    def build_fact_graph(self, reference: str, candidates: List[str], classifications: List[Dict]) -> nx.Graph:
+        """Build a graph based on fact relationships"""
+        G = nx.Graph()
+        
+        # Add reference node
+        ref_facts = self.fact_extractor.extract_facts(reference)
+        G.add_node(0, 
+                  text=reference,
+                  is_reference=True,
+                  facts=ref_facts,
+                  fact_count=len(ref_facts),
+                  hallucination_score=0.0)
+        
+        # Add candidate nodes
+        for i, (candidate, classification) in enumerate(zip(candidates, classifications), 1):
+            G.add_node(i,
+                      text=candidate,
+                      is_reference=False,
+                      facts=classification['cand_facts'],
+                      fact_count=len(classification['cand_facts']),
+                      hallucination_score=classification['base_hallucination_score'],
+                      precision=classification['precision'],
+                      recall=classification['recall'])
+        
+        # Add edges based on fact overlap
+        all_nodes = list(G.nodes())
+        for i in all_nodes:
+            for j in all_nodes[i+1:]:
+                facts_i = G.nodes[i]['facts']
+                facts_j = G.nodes[j]['facts']
+                
+                if not facts_i or not facts_j:
+                    continue
+                
+                # Calculate fact overlap
+                comparison = self.compare_facts(facts_i, facts_j)
+                overlap_score = len(comparison.matched_facts) / max(1, min(len(facts_i), len(facts_j)))
+                
+                # Add edge if there's meaningful overlap or one is reference
+                if overlap_score > 0.1 or (i == 0 or j == 0):
+                    # Edge weight based on similarity and lack of contradictions
+                    contradiction_penalty = 0.5 * (len(comparison.contradicted_facts) / max(1, len(comparison.matched_facts)))
+                    weight = max(0.01, overlap_score * (1 - contradiction_penalty))
+                    
+                    G.add_edge(i, j,
+                             weight=weight,
+                             matched_facts=len(comparison.matched_facts),
+                             contradicted_facts=len(comparison.contradicted_facts),
+                             fact_overlap=overlap_score)
+        
+        # Ensure no isolated nodes by connecting to reference with minimal weight
+        for node in G.nodes():
+            if node != 0 and G.degree(node) == 0:
+                G.add_edge(0, node, weight=0.01, matched_facts=0, contradicted_facts=0, fact_overlap=0)
+        
+        return G
+    
+    def calculate_graph_metrics(self, G: nx.Graph) -> Dict:
+        """Calculate graph centrality metrics"""
+        metrics = {}
+        
+        # PageRank - importance in the fact network
+        metrics['pagerank'] = nx.pagerank(G, weight='weight')
+        
+        # Degree centrality - how connected each node is
+        metrics['degree_centrality'] = nx.degree_centrality(G)
+        
+        # Closeness centrality - how close to other nodes
+        # Use a simple approach for disconnected graphs
+        metrics['closeness_centrality'] = {}
+        for node in G.nodes():
+            # Calculate average shortest path length from this node
+            lengths = []
+            for target in G.nodes():
+                if node != target:
+                    try:
+                        # Use weight as similarity (higher weight = shorter distance)
+                        path_length = nx.shortest_path_length(G, node, target, weight=lambda u,v,d: 1.0 - d.get('weight', 0.5))
+                        lengths.append(path_length)
+                    except nx.NetworkXNoPath:
+                        # No path exists, use a large distance
+                        lengths.append(len(G.nodes()))
+            
+            if lengths:
+                # Closeness is inverse of average distance
+                avg_distance = sum(lengths) / len(lengths)
+                metrics['closeness_centrality'][node] = 1.0 / avg_distance if avg_distance > 0 else 0
+            else:
+                metrics['closeness_centrality'][node] = 0
+        
+        # Normalize closeness centrality to [0, 1]
+        max_closeness = max(metrics['closeness_centrality'].values()) if metrics['closeness_centrality'] else 1
+        if max_closeness > 0:
+            for node in metrics['closeness_centrality']:
+                metrics['closeness_centrality'][node] /= max_closeness
+        
+        # Betweenness centrality
+        metrics['betweenness_centrality'] = nx.betweenness_centrality(G)
+        
+        # Find isolated nodes
+        metrics['isolated_nodes'] = list(nx.isolates(G))
+        
+        # Calculate clustering coefficient
+        metrics['clustering'] = nx.clustering(G, weight='weight')
+        
+        return metrics
+    
+    def adjust_scores_with_graph_metrics(self, G: nx.Graph, classifications: List[Dict], metrics: Dict) -> List[Dict]:
+        """Adjust hallucination scores based on graph properties"""
+        adjusted_classifications = []
+        
+        for i, classification in enumerate(classifications, 1):  # Start from 1 (skip reference)
+            adjusted = classification.copy()
+            
+            # Get graph metrics for this node
+            pagerank = metrics['pagerank'].get(i, 0)
+            degree = metrics['degree_centrality'].get(i, 0)
+            closeness = metrics['closeness_centrality'].get(i, 0)
+            betweenness = metrics['betweenness_centrality'].get(i, 0)
+            clustering = metrics['clustering'].get(i, 0)
+            
+            # Normalize PageRank (it sums to 1 across all nodes)
+            pagerank_normalized = pagerank * len(G.nodes())
+            
+            # Calculate graph-based adjustments
+            graph_score = 0.0
+            
+            # Low PageRank indicates less central/important content
+            if pagerank_normalized < 0.5:
+                graph_score += 0.1 * (1 - pagerank_normalized)
+            
+            # Isolated nodes are suspicious
+            if i in metrics['isolated_nodes']:
+                graph_score += 0.3
+                
+            # Low degree centrality means fewer connections
+            if degree < 0.3:
+                graph_score += 0.1 * (1 - degree)
+            
+            # High clustering with reference is good
+            ref_clustering = nx.clustering(G, 0, weight='weight')
+            if clustering < ref_clustering * 0.5:
+                graph_score += 0.1
+            
+            # Combine base score with graph score
+            final_score = min(1.0, adjusted['base_hallucination_score'] + graph_score)
+            adjusted['final_hallucination_score'] = final_score
+            adjusted['graph_adjustment'] = graph_score
+            
+            # Update hallucination decision
+            adjusted['is_hallucinated'] = (
+                final_score > 0.5 or
+                adjusted['comparison'].has_contradictions or
+                i in metrics['isolated_nodes']
+            )
+            
+            # Add graph metrics to result
+            adjusted['graph_metrics'] = {
+                'pagerank': pagerank,
+                'pagerank_normalized': pagerank_normalized,
+                'degree_centrality': degree,
+                'closeness_centrality': closeness,
+                'betweenness_centrality': betweenness,
+                'clustering': clustering
+            }
+            
+            adjusted_classifications.append(adjusted)
+        
+        return adjusted_classifications
+    
+    def create_visualization(self, results: List[Dict], reference: str, candidates: List[str], 
+                           graph: nx.Graph, metrics: Dict, save_path: str = "hallucination_results.html") -> str:
+        """Create visualization with both fact comparison and graph"""
+        
+        # Prepare graph data for visualization
+        nodes = []
+        for node in graph.nodes():
+            node_data = graph.nodes[node]
+            
+            # Determine color based on status
+            if node == 0:  # Reference
+                color = '#0066CC'
+                status = 'REFERENCE'
+            else:
+                result = results[node - 1]
+                if result['is_hallucinated']:
+                    if result['comparison'].has_contradictions:
+                        color = '#FF0000'  # Red for contradictions
+                    elif len(result['comparison'].missing_facts) > 2:
+                        color = '#FF6600'  # Orange for missing facts
+                    else:
+                        color = '#FFA500'  # Orange for other issues
+                    status = 'HALLUCINATED'
+                else:
+                    color = '#00CC00'  # Green for consistent
+                    status = 'CONSISTENT'
+            
+            # Size based on PageRank
+            size = 10 + 40 * metrics['pagerank'].get(node, 0.1)
+            
+            nodes.append({
+                'id': node,
+                'label': f'Ref' if node == 0 else f'C{node}',
+                'color': color,
+                'size': size,
+                'status': status,
+                'pagerank': float(metrics['pagerank'].get(node, 0)),
+                'degree': float(metrics['degree_centrality'].get(node, 0)),
+                'facts': node_data.get('fact_count', 0)
+            })
+        
+        # Prepare edges
+        edges = []
+        for u, v, data in graph.edges(data=True):
+            edges.append({
+                'source': u,
+                'target': v,
+                'weight': float(data['weight']),
+                'color': '#00FF00' if data['weight'] > 0.7 else '#FFA500' if data['weight'] > 0.3 else '#FF0000'
+            })
+        
+        html_content = """
+<!DOCTYPE html>
+<html>
+<head>
+    <title>Hallucination Detection Results</title>
+    <script src="https://d3js.org/d3.v7.min.js"></script>
+    <style>
+        body {
+            font-family: Arial, sans-serif;
+            margin: 20px;
+            background-color: #f5f5f5;
+        }
+        .container {
+            max-width: 1400px;
+            margin: 0 auto;
+        }
+        .content-grid {
+            display: grid;
+            grid-template-columns: 1fr 500px;
+            gap: 20px;
+            margin-bottom: 20px;
+        }
+        .paragraph {
+            background: white;
+            margin: 20px 0;
+            padding: 20px;
+            border-radius: 8px;
+            box-shadow: 0 2px 4px rgba(0,0,0,0.1);
+        }
+        .reference {
+            border-left: 5px solid #0066CC;
+        }
+        .consistent {
+            border-left: 5px solid #00CC00;
+        }
+        .hallucinated {
+            border-left: 5px solid #FF0000;
+        }
+        .metrics {
+            display: flex;
+            gap: 20px;
+            margin: 10px 0;
+        }
+        .metric {
+            padding: 5px 10px;
+            background: #f0f0f0;
+            border-radius: 4px;
+        }
+        .facts {
+            margin: 10px 0;
+        }
+        .fact {
+            margin: 5px 0;
+            padding: 5px;
+            background: #f9f9f9;
+            border-radius: 4px;
+            font-size: 14px;
+        }
+        .matched { background: #d4edda; }
+        .contradicted { background: #f8d7da; }
+        .missing { background: #fff3cd; }
+        .extra { background: #d1ecf1; }
+        h1, h2 { color: #333; }
+        .label {
+            font-weight: bold;
+            margin-right: 5px;
+        }
+        #graph {
+            background: white;
+            border: 1px solid #ddd;
+            border-radius: 8px;
+            box-shadow: 0 2px 4px rgba(0,0,0,0.1);
+            position: sticky;
+            top: 20px;
+        }
+        .graph-container {
+            background: white;
+            padding: 20px;
+            border-radius: 8px;
+            box-shadow: 0 2px 4px rgba(0,0,0,0.1);
+        }
+        .tooltip {
+            position: absolute;
+            text-align: left;
+            padding: 10px;
+            font: 12px sans-serif;
+            background: rgba(0, 0, 0, 0.8);
+            color: white;
+            border-radius: 5px;
+            pointer-events: none;
+            opacity: 0;
+        }
+        .graph-metrics {
+            display: grid;
+            grid-template-columns: repeat(3, 1fr);
+            gap: 10px;
+            margin-top: 10px;
+        }
+        .graph-metric {
+            background: #f0f0f0;
+            padding: 8px;
+            border-radius: 4px;
+            text-align: center;
+        }
+        .graph-metric .value {
+            font-size: 18px;
+            font-weight: bold;
+            color: #333;
+        }
+        .graph-metric .label {
+            font-size: 12px;
+            color: #666;
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <h1>Hallucination Detection Results with Graph Analysis</h1>
+        
+        <div class="content-grid">
+            <div class="results-section">
+                <div class="paragraph reference">
+                    <h2>Reference Text</h2>
+                    <p>""" + reference + """</p>
+                    <div class="facts">
+                        <h3>Extracted Facts:</h3>
+"""
+        
+        # Add reference facts
+        ref_facts = self.fact_extractor.extract_facts(reference)
+        for fact in ref_facts:
+            html_content += f'<div class="fact"><span class="label">{fact.fact_type}:</span> {fact.subject} - {fact.attribute} = {fact.value}</div>\n'
+        
+        html_content += """
+                    </div>
+                </div>
+"""
+        
+        # Add candidate paragraphs
+        for i, (candidate, result) in enumerate(zip(candidates, results)):
+            status = "hallucinated" if result['is_hallucinated'] else "consistent"
+            html_content += f"""
+                <div class="paragraph {status}">
+                    <h2>Candidate {i+1} - {"HALLUCINATED" if result['is_hallucinated'] else "CONSISTENT"}</h2>
+                    <p>{candidate}</p>
+                    
+                    <div class="metrics">
+                        <div class="metric">Precision: {result['precision']:.2f}</div>
+                        <div class="metric">Recall: {result['recall']:.2f}</div>
+                        <div class="metric">Base Score: {result['base_hallucination_score']:.2f}</div>
+                        <div class="metric">Final Score: {result.get('final_hallucination_score', result['base_hallucination_score']):.2f}</div>
+                    </div>
+                    
+                    <div class="graph-metrics">
+                        <div class="graph-metric">
+                            <div class="value">{result.get('graph_metrics', {}).get('pagerank_normalized', 0):.2f}</div>
+                            <div class="label">PageRank</div>
+                        </div>
+                        <div class="graph-metric">
+                            <div class="value">{result.get('graph_metrics', {}).get('degree_centrality', 0):.2f}</div>
+                            <div class="label">Degree</div>
+                        </div>
+                        <div class="graph-metric">
+                            <div class="value">{result.get('graph_metrics', {}).get('clustering', 0):.2f}</div>
+                            <div class="label">Clustering</div>
+                        </div>
+                    </div>
+                    
+                    <div class="facts">
+                        <h3>Fact Comparison:</h3>
+"""
+            
+            comparison = result['comparison']
+            
+            # Show matched facts
+            if comparison.matched_facts:
+                html_content += '<h4>✓ Matched Facts:</h4>'
+                for ref_fact, cand_fact in comparison.matched_facts:
+                    html_content += f'<div class="fact matched">{ref_fact.subject} - {ref_fact.attribute}: {cand_fact.value}</div>\n'
+            
+            # Show contradicted facts
+            if comparison.contradicted_facts:
+                html_content += '<h4>✗ Contradicted Facts:</h4>'
+                for ref_fact, cand_fact in comparison.contradicted_facts:
+                    html_content += f'<div class="fact contradicted">{ref_fact.subject} - {ref_fact.attribute}: Reference says "{ref_fact.value}", Candidate says "{cand_fact.value}"</div>\n'
+            
+            # Show missing facts
+            if comparison.missing_facts:
+                html_content += '<h4>⚠ Missing Facts:</h4>'
+                for fact in comparison.missing_facts:
+                    html_content += f'<div class="fact missing">{fact.subject} - {fact.attribute}: {fact.value}</div>\n'
+            
+            # Show extra facts
+            if comparison.extra_facts:
+                html_content += '<h4>+ Extra Facts:</h4>'
+                for fact in comparison.extra_facts:
+                    html_content += f'<div class="fact extra">{fact.subject} - {fact.attribute}: {fact.value}</div>\n'
+            
+            html_content += """
+                    </div>
+                </div>
+"""
+        
+        html_content += """
+            </div>
+            
+            <div class="graph-container">
+                <h2>Fact Relationship Graph</h2>
+                <div id="graph"></div>
+                <div class="tooltip"></div>
+                <p style="margin-top: 10px; font-size: 12px; color: #666;">
+                    Node size = PageRank score<br>
+                    Edge color = Fact overlap strength<br>
+                    Node color = Hallucination status
+                </p>
+            </div>
+        </div>
+    </div>
+    
+    <script>
+        const nodes = """ + json.dumps(nodes) + """;
+        const links = """ + json.dumps(edges) + """;
+        
+        const width = 480;
+        const height = 400;
+        
+        const svg = d3.select("#graph")
+            .append("svg")
+            .attr("width", width)
+            .attr("height", height);
+        
+        const tooltip = d3.select(".tooltip");
+        
+        const simulation = d3.forceSimulation(nodes)
+            .force("link", d3.forceLink(links).id(d => d.id).distance(100))
+            .force("charge", d3.forceManyBody().strength(-300))
+            .force("center", d3.forceCenter(width / 2, height / 2))
+            .force("collision", d3.forceCollide().radius(d => d.size + 5));
+        
+        const link = svg.append("g")
+            .selectAll("line")
+            .data(links)
+            .enter().append("line")
+            .attr("stroke", d => d.color)
+            .attr("stroke-width", d => 1 + d.weight * 3)
+            .attr("stroke-opacity", 0.6);
+        
+        const node = svg.append("g")
+            .selectAll("circle")
+            .data(nodes)
+            .enter().append("circle")
+            .attr("r", d => d.size)
+            .attr("fill", d => d.color)
+            .attr("stroke", "#333")
+            .attr("stroke-width", 2)
+            .call(d3.drag()
+                .on("start", dragstarted)
+                .on("drag", dragged)
+                .on("end", dragended));
+        
+        const labels = svg.append("g")
+            .selectAll("text")
+            .data(nodes)
+            .enter().append("text")
+            .text(d => d.label)
+            .attr("font-size", 12)
+            .attr("dx", d => d.size + 5)
+            .attr("dy", 4);
+        
+        node.on("mouseover", function(event, d) {
+            tooltip.html(`
+                <strong>${d.label} - ${d.status}</strong><br>
+                Facts: ${d.facts}<br>
+                PageRank: ${d.pagerank.toFixed(3)}<br>
+                Degree: ${d.degree.toFixed(3)}
+            `)
+            .style("left", (event.pageX + 10) + "px")
+            .style("top", (event.pageY - 10) + "px")
+            .style("opacity", 1);
+        })
+        .on("mouseout", function() {
+            tooltip.style("opacity", 0);
+        });
+        
+        simulation.on("tick", () => {
+            link
+                .attr("x1", d => d.source.x)
+                .attr("y1", d => d.source.y)
+                .attr("x2", d => d.target.x)
+                .attr("y2", d => d.target.y);
+            
+            node
+                .attr("cx", d => d.x)
+                .attr("cy", d => d.y);
+            
+            labels
+                .attr("x", d => d.x)
+                .attr("y", d => d.y);
+        });
+        
+        function dragstarted(event, d) {
+            if (!event.active) simulation.alphaTarget(0.3).restart();
+            d.fx = d.x;
+            d.fy = d.y;
+        }
+        
+        function dragged(event, d) {
+            d.fx = event.x;
+            d.fy = event.y;
+        }
+        
+        function dragended(event, d) {
+            if (!event.active) simulation.alphaTarget(0);
+            d.fx = null;
+            d.fy = null;
+        }
+    </script>
+</body>
+</html>
+"""
+        
+        with open(save_path, 'w', encoding='utf-8') as f:
+            f.write(html_content)
+        
+        return save_path
+    
+    def analyze(self, reference: str, candidates: List[str]) -> Dict:
+        """Analyze all candidates against reference with graph metrics"""
+        print("\n" + "="*60)
+        print("FACT-BASED HALLUCINATION DETECTION WITH GRAPH ANALYSIS")
+        print("="*60)
+        
+        # Extract reference facts
+        ref_facts = self.fact_extractor.extract_facts(reference)
+        print(f"\nReference facts extracted: {len(ref_facts)}")
+        for fact in ref_facts:
+            print(f"  - {fact.fact_type}: {fact.subject} - {fact.attribute} = {fact.value}")
+        
+        # Initial classification based on facts
+        results = []
+        for i, candidate in enumerate(candidates):
+            print(f"\n--- Analyzing Candidate {i+1} ---")
+            result = self.classify_paragraph(reference, candidate)
+            results.append(result)
+            
+            print(f"Initial Status: {'HALLUCINATED' if result['is_hallucinated'] else 'CONSISTENT'}")
+            print(f"Precision: {result['precision']:.2f}")
+            print(f"Recall: {result['recall']:.2f}")
+            print(f"Base Hallucination Score: {result['base_hallucination_score']:.2f}")
+        
+        # Build fact-based graph
+        print("\n--- Building Fact Graph ---")
+        graph = self.build_fact_graph(reference, candidates, results)
+        print(f"Graph nodes: {graph.number_of_nodes()}, edges: {graph.number_of_edges()}")
+        
+        # Calculate graph metrics
+        print("\n--- Calculating Graph Metrics ---")
+        metrics = self.calculate_graph_metrics(graph)
+        
+        # Print graph insights
+        print("\nGraph Insights:")
+        print(f"  Most central node (PageRank): Node {max(metrics['pagerank'], key=metrics['pagerank'].get)}")
+        print(f"  Isolated nodes: {metrics['isolated_nodes']}")
+        print(f"  Average clustering: {np.mean(list(metrics['clustering'].values())):.3f}")
+        
+        # Adjust scores based on graph metrics
+        print("\n--- Adjusting Scores with Graph Metrics ---")
+        adjusted_results = self.adjust_scores_with_graph_metrics(graph, results, metrics)
+        
+        # Print final results
+        print("\n--- Final Results ---")
+        for i, result in enumerate(adjusted_results):
+            print(f"\nCandidate {i+1}:")
+            print(f"  Final Status: {'HALLUCINATED' if result['is_hallucinated'] else 'CONSISTENT'}")
+            print(f"  Base Score: {result['base_hallucination_score']:.2f}")
+            print(f"  Graph Adjustment: {result['graph_adjustment']:.2f}")
+            print(f"  Final Score: {result['final_hallucination_score']:.2f}")
+            print(f"  PageRank: {result['graph_metrics']['pagerank_normalized']:.3f}")
+            print(f"  Degree Centrality: {result['graph_metrics']['degree_centrality']:.3f}")
+            
+            comparison = result['comparison']
+            if comparison.contradicted_facts:
+                print(f"  Contradictions: {len(comparison.contradicted_facts)}")
+        
+        # Create enhanced visualization
+        viz_path = self.create_visualization(adjusted_results, reference, candidates, graph, metrics)
+        print(f"\nVisualization saved to: {viz_path}")
+        
+        try:
+            webbrowser.open(f'file://{os.path.abspath(viz_path)}')
+        except:
+            print("Could not open browser automatically.")
+        
+        return {
+            'results': adjusted_results,
+            'graph': graph,
+            'metrics': metrics,
+            'visualization': viz_path
+        }
+
+
+# Example usage
+if __name__ == "__main__":
+    detector = HallucinationDetector()
+    
+    reference = """The company reported revenue of $2.5 million in Q4 2023, with a 15% increase from the previous quarter. 
+    CEO John Smith announced expansion plans on January 15, 2024, targeting the Asian market. 
+    The profit margin improved to 22% due to cost optimization strategies. 
+    Employee satisfaction scores reached 85% in the annual survey."""
+    
+    candidates = [
+        # Should be CONSISTENT
+        """Q4 2023 revenue reached $2.5 million, marking 15% quarterly growth. 
+        John Smith revealed Asian market expansion on January 15, 2024. 
+        Profit margins rose to 22% through cost optimization. 
+        Employee satisfaction hit 85% in yearly survey.""",
+        
+        # Should be HALLUCINATED (contradictions)
+        """The company reported revenue of $3.2 million in Q4 2023, with a 20% increase. 
+        CEO John Smith announced expansion plans on January 20, 2024. 
+        Profit margins reached 25% after cost controls. 
+        Employee satisfaction was 75% in the survey.""",
+        
+        # Should be CONSISTENT (missing some facts but no contradictions)
+        """The company reported revenue of $2.5 million in Q4 2023. 
+        CEO John Smith announced expansion plans targeting the Asian market. 
+        The profit margin improved to 22%.""",
+        
+        # Should be HALLUCINATED (too many extra facts)
+        """Revenue was $2.5 million in Q4 2023 with 15% growth. 
+        CEO John Smith announced Asian expansion on January 15, 2024. 
+        Profit margins reached 22% through efficiency. 
+        Employee satisfaction was 85%. 
+        The company also launched three new products. 
+        Stock price increased by 30%. 
+        New offices were opened in Singapore and Tokyo. 
+        The board approved a dividend increase.""",
+        
+        # Should be HALLUCINATED (mixed contradictions)
+        """Q4 2023 revenue was $2.5 million with 15% growth. 
+        John Smith announced European market expansion plans. 
+        Profit margin reached 22%. 
+        Customer retention improved to 95% this quarter."""
+    ]
+    
+    results = detector.analyze(reference, candidates)
