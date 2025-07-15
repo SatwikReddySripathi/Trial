@@ -9,3 +9,21 @@ But building a strong QA system isn’t enough — we need to ensure it performs
 With thousands of QA interactions generated daily, manual evaluation was not scalable or consistent. Traditional metrics like BLEU and ROUGE were also insufficient — they fail to detect hallucinations, ignore meaning, and penalize useful variations.
 
 This led us to build a new hybrid evaluation framework — combining deterministic metrics for consistency with LLM-based semantic judgment for nuance and trustworthiness.
+
+
+
+
+“We use deterministic metrics like a filter. If an answer’s almost identical to the ground truth, we call it correct without LLM review. Only edge cases or uncertain answers go to the LLM. That gives us smarter evaluation with a lot less compute
+
+
+Question + Answer + Ground Truth
+         ↓
+   Deterministic Metrics
+         ↓
+  ┌────────────────────┐
+  │ High Similarity?   │
+  └────────────────────┘
+     Yes         No
+     ↓           ↓
+ Mark Fully   →  Send to LLM
+  Correct        Judge
