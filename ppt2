@@ -1,0 +1,11 @@
+Fidelity associates are asked a wide range of customer queries every day. To support them at scale, we rely on robust Question Answering (QA) models that can retrieve and generate accurate responses from our internal knowledge base.
+
+But building a strong QA system isn’t enough — we need to ensure it performs accurately, reliably, and safely in production settings. That means carefully evaluating:
+	•	🔍 How semantically correct the answers are
+	•	⚖️ Whether the responses are fully or partially correct
+	•	🚫 Whether the model hallucinates (fabricates) facts
+	•	💬 Whether it adds valid extra information beyond the ground truth
+
+With thousands of QA interactions generated daily, manual evaluation was not scalable or consistent. Traditional metrics like BLEU and ROUGE were also insufficient — they fail to detect hallucinations, ignore meaning, and penalize useful variations.
+
+This led us to build a new hybrid evaluation framework — combining deterministic metrics for consistency with LLM-based semantic judgment for nuance and trustworthiness.
