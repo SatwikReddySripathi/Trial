@@ -1,0 +1,36 @@
+import matplotlib.pyplot as plt
+
+# --- Bar Plot for Accuracy by Version ---
+versions = ['V1', 'V2', 'V3']
+accuracy = [52, 85, 96]
+
+fig1, ax1 = plt.subplots(figsize=(8, 6))
+bars = ax1.bar(versions, accuracy, color=['#6baed6', '#74c476', '#fd8d3c'])
+
+# Annotate bars with accuracy percentages
+for bar, acc in zip(bars, accuracy):
+    height = bar.get_height()
+    ax1.text(bar.get_x() + bar.get_width()/2, height + 2, f'{acc}%', ha='center', fontsize=10)
+
+ax1.set_title('Model Accuracy by Version')
+ax1.set_xlabel('Model Version')
+ax1.set_ylabel('Accuracy (%)')
+ax1.set_ylim(0, 110)
+ax1.grid(axis='y')
+
+# --- Pie Chart for V3 Misclassifications ---
+correct = 96
+misclassification = 100 - correct
+partial_correct = 28
+incorrect = 72
+
+fig2, ax2 = plt.subplots(figsize=(6, 6))
+labels = ['Partial Correct (28%)', 'Incorrect (72%)']
+sizes = [partial_correct, incorrect]
+colors = ['#ffc107', '#dc3545']
+
+ax2.pie(sizes, labels=labels, autopct='%1.1f%%', startangle=140, colors=colors)
+ax2.set_title('V3 Misclassification Breakdown')
+
+plt.tight_layout()
+plt.show()
