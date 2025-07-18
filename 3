@@ -1,4 +1,85 @@
 
+import plotly.graph_objects as go
+import networkx as nx
+
+# Sample data (customize as needed)
+nodes = [
+    {"id": 0, "label": "Reference", "type": "reference", "color": "blue"},
+    {"id": 1, "label": "P1", "type": "consistent", "color": "green"},
+    {"id": 2, "label": "P2", "type": "contradiction", "color": "darkred"},
+    {"id": 3, "label": "P3", "type": "factual_error", "color": "darkred"},
+    {"id": 4, "label": "P4", "type": "omission", "color": "lightcoral"},
+    {"id": 5, "label": "P5", "type": "extra", "color": "gray"}
+]
+
+edges = [(0, 1), (0, 2), (0, 3), (0, 4), (0, 5)]
+
+# Build graph
+G = nx.Graph()
+for node in nodes:
+    G.add_node(node["id"], label=node["label"], color=node["color"], type=node["type"])
+G.add_edges_from(edges)
+
+# Positioning
+pos = nx.spring_layout(G, seed=42)
+
+# Node trace
+node_trace = go.Scatter(
+    x=[pos[k][0] for k in G.nodes()],
+    y=[pos[k][1] for k in G.nodes()],
+    mode='markers+text',
+    text=[G.nodes[k]['label'] for k in G.nodes()],
+    textposition="bottom center",
+    hoverinfo='text',
+    marker=dict(
+        size=25,
+        color=[G.nodes[k]['color'] for k in G.nodes()],
+        line=dict(width=2, color='black')
+    ),
+    hovertext=[
+        f"{G.nodes[k]['label']}<br>Type: {G.nodes[k]['type'].replace('_', ' ').title()}<br>Confidence: {0.9 - k*0.1:.2f}<br>Semantic: {0.8 - k*0.05:.2f}"
+        for k in G.nodes()
+    ]
+)
+
+# Edge trace
+edge_trace = go.Scatter(
+    x=sum([[pos[e[0]][0], pos[e[1]][0], None] for e in G.edges()], []),
+    y=sum([[pos[e[0]][1], pos[e[1]][1], None] for e in G.edges()], []),
+    line=dict(width=2, color='lightgray'),
+    hoverinfo='none',
+    mode='lines'
+)
+
+# Layout
+layout = go.Layout(
+    title='Graph Based Reliability Scorer',
+    title_x=0.5,
+    showlegend=False,
+    hovermode='closest',
+    margin=dict(b=20, l=20, r=20, t=60),
+    xaxis=dict(showgrid=False, zeroline=False),
+    yaxis=dict(showgrid=False, zeroline=False),
+    plot_bgcolor='white',
+)
+
+# Combine
+fig = go.Figure(data=[edge_trace, node_trace], layout=layout)
+fig.show()
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 from pyvis.network import Network
 
 # Initialize network (notebook=False by default)
