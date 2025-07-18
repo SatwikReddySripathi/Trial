@@ -1,0 +1,115 @@
+from pyvis.network import Network
+import networkx as nx
+
+# Initialize interactive network
+net = Network(height='750px', width='100%', bgcolor='#ffffff', font_color='black', notebook=False)
+net.force_atlas_2based()
+
+# Title
+print("Generating: Graph Based Reliability Scorer")
+
+# Paragraph metadata
+paragraphs = {
+    0: {
+        "label": "Reference",
+        "type": "reference",
+        "text": "The company reported revenue of $2.5 million in Q4 2023...",
+        "scores": {}
+    },
+    1: {
+        "label": "Candidate 1",
+        "type": "consistent",
+        "text": "Q4 2023 revenue was $2.5M, up 15% from Q3...",
+        "scores": {"Semantic Similarity": 0.92, "Factual Consistency": 1.0, "Contradiction": 0.0}
+    },
+    2: {
+        "label": "Candidate 2",
+        "type": "factual",
+        "text": "The company earned $3.2M in Q4 2023, showing 20% growth...",
+        "scores": {"Semantic Similarity": 0.85, "Factual Consistency": 0.0, "Contradiction": 0.1}
+    },
+    3: {
+        "label": "Candidate 3",
+        "type": "contradiction",
+        "text": "Revenue declined 15% in Q4. John Smith announced expansion...",
+        "scores": {"Semantic Similarity": 0.82, "Factual Consistency": 0.7, "Contradiction": 0.8}
+    },
+    4: {
+        "label": "Candidate 4",
+        "type": "extra",
+        "text": "Customer satisfaction improved, and John Smith confirmed hiring...",
+        "scores": {"Semantic Similarity": 0.5, "Factual Consistency": 1.0, "Contradiction": 0.0}
+    },
+    5: {
+        "label": "Candidate 5",
+        "type": "omission",
+        "text": "The company performed well in Q4 2023...",
+        "scores": {"Semantic Similarity": 0.65, "Factual Consistency": 0.5, "Contradiction": 0.1}
+    }
+}
+
+# Define color map
+color_map = {
+    "reference": "#0066CC",       # Blue
+    "contradiction": "#8B0000",   # Dark Red
+    "factual": "#8B0000",         # Dark Red
+    "omission": "#FF6666",        # Light Red
+    "extra": "#AAAAAA",           # Gray
+    "consistent": "#2ECC71"       # Green
+}
+
+# Add nodes
+for node_id, data in paragraphs.items():
+    tooltip = f"<b>{data['label']}</b><br>{data['text']}<br><br>"
+    for k, v in data["scores"].items():
+        tooltip += f"{k}: {v:.2f}<br>"
+    net.add_node(
+        node_id,
+        label=f"P{node_id}",
+        title=tooltip,
+        color=color_map.get(data["type"], "#999999"),
+        shape="dot",
+        size=20
+    )
+
+# Add edges (connect all to reference node for simplicity)
+edges = [(0, i) for i in range(1, len(paragraphs))]
+for source, target in edges:
+    net.add_edge(source, target)
+
+# Add options (no .configure needed)
+net.set_options("""
+const options = {
+  "nodes": {
+    "font": {"size": 14, "face": "arial"},
+    "scaling": {"min": 10, "max": 30}
+  },
+  "edges": {
+    "color": {"inherit": true},
+    "smooth": {
+      "type": "continuous",
+      "forceDirection": "none",
+      "roundness": 0.5
+    }
+  },
+  "interaction": {
+    "hover": true,
+    "navigationButtons": true,
+    "multiselect": true,
+    "tooltipDelay": 120
+  },
+  "physics": {
+    "enabled": true,
+    "forceAtlas2Based": {
+      "gravitationalConstant": -50,
+      "springLength": 100,
+      "springConstant": 0.05
+    },
+    "minVelocity": 0.75,
+    "solver": "forceAtlas2Based"
+  }
+}
+""")
+
+# Save HTML
+net.show("graph_based_reliability_scorer.html")
