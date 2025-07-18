@@ -1,3 +1,90 @@
+from pyvis.network import Network
+import networkx as nx
+
+# Create graph
+G = nx.Graph()
+
+# Add nodes (id, label, group/type)
+nodes = [
+    (0, "Reference", "reference"),
+    (1, "P1", "consistent"),
+    (2, "P2", "contradiction"),
+    (3, "P3", "factual_error"),
+    (4, "P4", "omission"),
+    (5, "P5", "extra")
+]
+
+for nid, label, ntype in nodes:
+    color = {
+        "reference": "blue",
+        "consistent": "green",
+        "contradiction": "#8B0000",     # dark red
+        "factual_error": "#8B0000",     # dark red
+        "omission": "#F08080",          # light red
+        "extra": "gray"
+    }[ntype]
+    
+    tooltip = f"""
+    <b>{label}</b><br>
+    Type: {ntype.replace('_', ' ').title()}<br>
+    Semantic Similarity: {0.65 + 0.03 * nid:.2f}<br>
+    Factual Consistency: {1.0 - 0.1 * nid:.2f}<br>
+    Entailment: {0.8 - 0.05 * nid:.2f}<br>
+    Contradiction: {0.2 + 0.15 * nid:.2f}<br>
+    Confidence: {0.9 - 0.08 * nid:.2f}
+    """
+    
+    G.add_node(nid, label=label, title=tooltip, color=color)
+
+# Add edges
+edges = [(0, i) for i in range(1, 6)]
+G.add_edges_from(edges)
+
+# Create pyvis network
+net = Network(height="700px", width="100%", bgcolor="#ffffff", font_color="black", notebook=False, directed=False)
+net.from_nx(G)
+
+# Customize physics
+net.set_options("""
+var options = {
+  "physics": {
+    "forceAtlas2Based": {
+      "gravitationalConstant": -50,
+      "springLength": 150,
+      "springConstant": 0.05
+    },
+    "minVelocity": 0.75,
+    "solver": "forceAtlas2Based"
+  }
+}
+""")
+
+# Save and open in browser
+net.show("graph_based_reliability_scorer.html")
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 import plotly.graph_objects as go
 import networkx as nx
 import numpy as np
