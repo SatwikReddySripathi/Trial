@@ -15,3 +15,92 @@ Diagram showing three overlapping circles: Factual Consistency, Entailment, Sema
 	•	Misleading/Fabrication: Uses same entities with unrelated facts
 
 Visual: Table or icons showing each type with examples
+
+
+🔍 Slide 5: Core Modules
+
+Break down the 3 detection modules:
+	•	Semantic Similarity
+	•	Embeddings + TF-IDF + Word Overlap
+	•	Factual Consistency
+	•	Named entities, numbers, money, dates, actions
+	•	Entailment
+	•	Bidirectional DeBERTa-based NLI
+
+Visual: Table or side-by-side comparison of modules
+
+⸻
+
+🧠 Slide 6: Classifier Logic
+
+How decisions are made:
+	•	High similarity + factual errors → factual hallucination
+	•	High similarity + contradictions → contradiction
+	•	Low similarity + same entities → misleading
+	•	Missing facts → omission
+
+Visual: Flowchart of decision tree or example-based logic map
+
+⸻
+
+🌐 Slide 7: Graph-Based Framework
+	•	Nodes: Paragraphs
+	•	Edges: Consistency (semantic + factual)
+	•	Metrics:
+	•	PageRank → importance
+	•	Centrality → coherence
+	•	Isolation → hallucination risk
+
+Visual: Sample graph with colored nodes (consistent vs. hallucinated)
+
+⸻
+
+📊 Slide 8: Scoring Metrics
+
+Show the final scores:
+	•	Factual Accuracy
+	•	Logical Consistency
+	•	Semantic Coherence
+	•	Information Completeness
+	•	Overall Reliability (weighted)
+
+Visual: Radar chart or stacked bar chart
+
+⸻
+
+📁 Slide 9: Visualization Demo
+
+Embed screenshots or link to interactive visualization:
+	•	D3-based HTML graph
+	•	Tooltip with paragraph-level analysis
+	•	Color legend for hallucination types
+
+Optional: Short video demo or gif
+
+⸻
+
+🧪 Slide 10: Example Results
+
+
+table
+
+
+Slide 11: Why This Matters
+	•	Unified approach: no need for separate tools for fact-checking, NLI, or semantic match
+	•	Scalable, modular, explainable
+	•	Applicable to summarization, QA, dialogue, RAG systems
+
+Visual: Application icons or domains (chatbots, news gen, etc.)
+
+⸻
+
+🛠️ Slide 12: Future Work
+	•	Integrate retrieval grounding (RAG context)
+	•	Extend to multimodal (text + image)
+	•	Automate feedback loop for self-correction in generation
+
+⸻
+
+📬 Slide 13: Thank You / Q&A
+	•	Contact Info
+	•	GitHub / Live Demo Link (if available)
