@@ -1,3 +1,102 @@
+import plotly.graph_objects as go
+import networkx as nx
+import numpy as np
+
+# Initialize graph
+G = nx.Graph()
+
+# Add nodes with classification types and color coding
+nodes_data = [
+    {"id": 0, "label": "Reference", "type": "reference", "color": "blue"},
+    {"id": 1, "label": "P1", "type": "consistent", "color": "green"},
+    {"id": 2, "label": "P2", "type": "contradiction", "color": "darkred"},
+    {"id": 3, "label": "P3", "type": "factual_error", "color": "firebrick"},
+    {"id": 4, "label": "P4", "type": "omission", "color": "lightcoral"},
+    {"id": 5, "label": "P5", "type": "extra", "color": "gray"}
+]
+
+for node in nodes_data:
+    G.add_node(node["id"], **node)
+
+# Add sample edges (reference to each)
+edges = [(0, i) for i in range(1, 6)]
+G.add_edges_from(edges)
+
+# Generate 3D layout
+pos = nx.spring_layout(G, dim=3, seed=42)
+for n in G.nodes:
+    G.nodes[n]['pos'] = pos[n]
+
+# Create node trace
+node_trace = go.Scatter3d(
+    x=[G.nodes[n]['pos'][0] for n in G.nodes()],
+    y=[G.nodes[n]['pos'][1] for n in G.nodes()],
+    z=[G.nodes[n]['pos'][2] for n in G.nodes()],
+    mode='markers+text',
+    text=[G.nodes[n]['label'] for n in G.nodes()],
+    textposition='bottom center',
+    marker=dict(
+        size=12,
+        color=[G.nodes[n]['color'] for n in G.nodes()],
+        line=dict(width=2, color='black')
+    ),
+    hovertext=[
+        f"{G.nodes[n]['label']}<br>"
+        f"Type: {G.nodes[n]['type'].replace('_',' ').title()}<br>"
+        f"Semantic Similarity: {0.6 + 0.05*n:.2f}<br>"
+        f"Factual Consistency: {1.0 - 0.2*n:.2f}<br>"
+        f"Entailment: {0.7 - 0.1*n:.2f}<br>"
+        f"Contradiction: {0.2 + 0.15*n:.2f}<br>"
+        f"Confidence: {0.9 - 0.1*n:.2f}"
+        for n in G.nodes()
+    ],
+    hoverinfo="text"
+)
+
+# Create edge trace
+edge_x, edge_y, edge_z = [], [], []
+for edge in G.edges():
+    x0, y0, z0 = G.nodes[edge[0]]['pos']
+    x1, y1, z1 = G.nodes[edge[1]]['pos']
+    edge_x += [x0, x1, None]
+    edge_y += [y0, y1, None]
+    edge_z += [z0, z1, None]
+
+edge_trace = go.Scatter3d(
+    x=edge_x, y=edge_y, z=edge_z,
+    mode='lines',
+    line=dict(color='lightgray', width=2),
+    hoverinfo='none'
+)
+
+# Layout with legend and scores
+fig = go.Figure(data=[edge_trace, node_trace])
+
+fig.update_layout(
+    title='Graph Based Reliability Scorer',
+    margin=dict(l=20, r=20, b=20, t=60),
+    showlegend=False,
+    scene=dict(
+        xaxis=dict(showgrid=False, zeroline=False),
+        yaxis=dict(showgrid=False, zeroline=False),
+        zaxis=dict(showgrid=False, zeroline=False)
+    ),
+    annotations=[
+        dict(text="Overall Reliability: <b>65.9%</b>", x=0, y=1.1, showarrow=False, xref="paper", yref="paper"),
+        dict(text="Logical Consistency: <b>93.1%</b>", x=0.33, y=1.1, showarrow=False, xref="paper", yref="paper"),
+        dict(text="Semantic Coherence: <b>63.2%</b>", x=0.66, y=1.1, showarrow=False, xref="paper", yref="paper"),
+        dict(text="Info Completeness: <b>40.0%</b>", x=1.0, y=1.1, showarrow=False, xref="paper", yref="paper")
+    ]
+)
+
+fig.show()
+
+
+
+
+
+
+
 Slide 2: Motivation
 	•	Problem: Hallucinations in LLMs undermine trust in generative NLP
 	•	Challenge: Existing methods are piecemeal — they detect either factual errors or entailment issues, not both
