@@ -195,3 +195,69 @@ All major hallucination types are detected accurately
 	•	“This is especially helpful in LLM evaluation pipelines.”
 
 
+
+Slide Title: Detection Examples Across Hallucination Types
+
+Reference Paragraph (used for all candidates):
+
+"The company reported revenue of $2.5 million in Q4 2023, with a 15% increase from the previous quarter. CEO John Smith announced expansion plans on January 15, 2024, targeting the Asian market. The profit margin improved to 22% due to cost optimization strategies implemented in September."
+
+
+------------------------------------------------------------------------------------
+| Candidate Paragraph                                                                                                 |
+| Detection    | Type             | Confidence | Top Reason(s)                                                         |
+------------------------------------------------------------------------------------
+
+Candidate 1:
+"Q4 2023 revenue was $2.5M, up 15% from Q3. John Smith announced Asian expansion on Jan 15, 2024. Margins reached 22%."
+Detection    : ❌ No
+Type         : Consistent
+Confidence   : —
+Reason       : All key facts matched in value and context.
+
+------------------------------------------------------------------------------------
+
+Candidate 2:
+"The company earned $3.2M in Q4 2023, showing 20% growth. CEO John Smith revealed expansion plans on Jan 20, 2024. Margins hit 25%."
+Detection    : ✅ Yes
+Type         : Factual Error
+Confidence   : 0.90
+Reason       : Money, date, and percentage values differ from reference.
+
+------------------------------------------------------------------------------------
+
+Candidate 3:
+"Revenue reached $2.5M in Q4 2023. However, this represented a 15% decline from Q3. John Smith announced Asian expansion."
+Detection    : ✅ Yes
+Type         : Contradiction
+Confidence   : 0.85
+Reason       : Conflicting direction of revenue trend.
+
+------------------------------------------------------------------------------------
+
+Candidate 4:
+"Q4 2023 saw $2.5M in revenue. The company also improved customer satisfaction. CEO John Smith’s Jan 15, 2024 announcement highlighted Asian opportunities."
+Detection    : ❌ No
+Type         : Consistent
+Confidence   : —
+Reason       : Added info, but no conflict or omission.
+
+------------------------------------------------------------------------------------
+
+Candidate 5:
+"The company performed well in Q4 2023. Management is optimistic about future growth in international markets."
+Detection    : ✅ Yes
+Type         : Omission
+Confidence   : 0.72
+Reason       : No mention of revenue, profit, expansion, or key dates.
+
+------------------------------------------------------------------------------------
+
+Candidate 6:
+"In Q4 2023, the company struggled with declining revenue of $2.5M. CEO John Smith announced cost-cutting measures on Jan 15, 2024, abandoning expansion plans."
+Detection    : ✅ Yes
+Type         : Fabrication
+Confidence   : 0.82
+Reason       : Fabricated reversal of expansion, sentiment, and action.
+
+------------------------------------------------------------------------------------
