@@ -1,3 +1,151 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <title>Hallucination Detection Graph</title>
+  <script src="https://unpkg.com/3d-force-graph"></script>
+  <style>
+    body { margin: 0; overflow: hidden; font-family: sans-serif; }
+    #tooltip {
+      position: absolute;
+      background: rgba(0,0,0,0.85);
+      color: white;
+      padding: 10px;
+      border-radius: 8px;
+      max-width: 300px;
+      font-size: 14px;
+      display: none;
+      pointer-events: none;
+    }
+  </style>
+</head>
+<body>
+<div id="graph"></div>
+<div id="tooltip"></div>
+
+<script>
+  const referenceText = `The company reported revenue of $2.5 million in Q4 2023, with a 15% increase from the previous quarter. CEO John Smith announced expansion plans on January 15, 2024, targeting the Asian market. The profit margin improved to 22% due to cost optimization strategies implemented in September.`;
+
+  const candidates = [
+    {
+      id: 1,
+      text: `Q4 2023 revenue was $2.5M, up 15% from Q3. John Smith announced Asian expansion on Jan 15, 2024. Profit margins reached 22%.`,
+      type: "CONSISTENT",
+      color: "#4CAF50",
+      reason: "All key facts matched",
+      confidence: "N/A"
+    },
+    {
+      id: 2,
+      text: `The company earned $3.2M in Q4 2023, showing 20% growth. CEO John Smith revealed expansion plans on Jan 20, 2024. Margins hit 25%.`,
+      type: "FACTUAL_ERROR",
+      color: "#FF0000",
+      reason: "Money/date/percentage values differ from reference",
+      confidence: "0.90"
+    },
+    {
+      id: 3,
+      text: `Revenue reached $2.5M in Q4 2023. However, this represented a 15% decline from Q3. John Smith announced Asian expansion on January 15.`,
+      type: "CONTRADICTION",
+      color: "#CC3300",
+      reason: "Revenue trend direction is reversed",
+      confidence: "0.85"
+    },
+    {
+      id: 4,
+      text: `Q4 2023 saw $2.5 million in revenue. The company also improved customer satisfaction. CEO John Smith's Jan 15 announcement highlighted Asian opportunities.`,
+      type: "CONSISTENT",
+      color: "#4CAF50",
+      reason: "Additional info only; all reference facts preserved",
+      confidence: "N/A"
+    },
+    {
+      id: 5,
+      text: `The company performed well in Q4 2023. Management is optimistic about future growth in international markets. Operational efficiency has improved.`,
+      type: "OMISSION",
+      color: "#FF9900",
+      reason: "No mention of revenue, profit margin, or expansion plan",
+      confidence: "0.72"
+    },
+    {
+      id: 6,
+      text: `In Q4 2023, the company struggled with declining revenue of $2.5M. CEO John Smith announced cost-cutting measures on January 15, 2024, abandoning expansion plans.`,
+      type: "FABRICATION",
+      color: "#9933CC",
+      reason: "Fabricated reversal of expansion plans",
+      confidence: "0.82"
+    }
+  ];
+
+  const nodes = [
+    { id: 0, label: "Reference", text: referenceText, color: "#0066CC", type: "REFERENCE" },
+    ...candidates
+  ];
+
+  const links = candidates.map(c => ({
+    source: 0,
+    target: c.id,
+    color: "#999",
+    width: 2
+  }));
+
+  const Graph = ForceGraph3D()(document.getElementById('graph'))
+    .graphData({ nodes, links })
+    .nodeLabel(node => `${node.label || "P" + node.id}: ${node.type}`)
+    .nodeColor(node => node.color)
+    .nodeAutoColorBy('type')
+    .linkColor(link => link.color)
+    .linkWidth(link => link.width)
+    .onNodeHover(showTooltip)
+    .onNodeClick(node => alert(node.text));
+
+  const tooltip = document.getElementById('tooltip');
+
+  function showTooltip(node) {
+    if (!node || node.type === "REFERENCE") {
+      tooltip.style.display = 'none';
+      return;
+    }
+
+    tooltip.style.display = 'block';
+    tooltip.innerHTML = `
+      <strong>P${node.id} - ${node.type}</strong><br>
+      <em>Confidence:</em> ${node.confidence}<br>
+      <em>Reason:</em> ${node.reason}<br><br>
+      <strong>Text:</strong><br>${node.text}
+    `;
+
+    document.onmousemove = function(e){
+      tooltip.style.top = (e.pageY + 10) + 'px';
+      tooltip.style.left = (e.pageX + 10) + 'px';
+    }
+  }
+</script>
+</body>
+</html>
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 from pyvis.network import Network
 import networkx as nx
 
