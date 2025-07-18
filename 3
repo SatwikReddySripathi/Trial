@@ -1,3 +1,19 @@
+
+from pyvis.network import Network
+
+# Initialize network (notebook=False by default)
+net = Network(height='750px', width='100%', bgcolor='#ffffff', font_color='black')
+
+# Add a couple of nodes and edges for testing
+net.add_node(0, label="Reference", color="#0066CC", title="This is the reference paragraph.")
+net.add_node(1, label="Factual Error", color="#8B0000", title="Money/date mismatch")
+net.add_edge(0, 1)
+
+# Save to file and open in browser
+net.show("graph_based_reliability_scorer.html")
+
+
+
 from pyvis.network import Network
 import networkx as nx
 
