@@ -1,0 +1,197 @@
+Category
+Description
+Example
+Dates
+Absolute or relative temporal mentions
+“January 15, 2024”, “Q4 2023”
+Money
+Currency strings, normalized to floats
+“$2.5M” → 2_500_000.0
+Percentages
+% expressions
+“15%”
+Named Entities
+People, organizations, locations (via NLTK NE)
+“John Smith” → PERSON
+Actions
+Verb-object phrases
+“announced expansion”
+Claims
+Sentences with quantitative info
+“Revenue was $2.5M in Q4 2023”
+
+
+next slide
+Method
+What It Measures
+Tool Used
+Sentence Embeddings
+Deep contextual similarity
+all-MiniLM-L6-v2 via SentenceTransformers
+TF-IDF Cosine
+Lexical co-occurrence across n-grams
+Scikit-learn TfidfVectorizer
+Word Overlap (Jaccard)
+Token-level intersection over union
+NLTK tokenization
+
+Embeddings capture meaning but miss rare tokens
+	•	TF-IDF highlights shared terms but ignores semantics
+	•	Jaccard adds interpretable coverage metric
+
+→ Hybrid approach = more robust detection
+
+
+Side-by-side or stacked bar chart comparing:
+	•	Embedding score
+	•	TF-IDF similarity
+	•	Jaccard overlap
+	•	Final combined score
+
+Maybe with 2 example paragraph pairs:
+	•	One consistent
+	•	One semantically distant
+
+⸻
+
+🧠 Speaker Notes:
+	•	“Semantic similarity doesn’t tell you whether a claim is true — but it tells you whether it’s relevant.”
+	•	“We only consider hallucination if the candidate is semantically related to the reference.”
+	•	“This layer filters out off-topic but non-harmful outputs
+
+
+
+next slide
+
+how the system detects factual errors, omissions, and contradictions by comparing structured information between the reference and candidate.
+
+
+Fact Type
+Matching Strategy
+Example
+Money
+Normalized value + local context
+“$2.5M revenue” vs “$3.2M revenue”
+Dates
+Set overlap
+“Jan 15, 2024” missing or changed
+Percentages
+Set overlap
+“15%” vs “20%”
+Numbers
+Numerical proximity and relevance
+“Q4 growth 12%” vs “Q4 growth 18%”
+Named Entities
+Set intersection (PERSON, ORG)
+Missing “John Smith”
+Actions
+Verb-object phrase matching
+“announced expansion” vs “cut jobs”
+
+
+We don’t just check whether facts exist — we check whether they match and occur in the same context.”
+	•	“This layer is key to catching subtle numeric hallucinations, which are the most dangerous in domains like finance or medicine.”
+
+
+next slide
+
+Factual matching doesn’t catch semantic opposites
+	•	Contradictions occur even if entities/values match
+
+⸻
+
+🧠 Speaker Notes:
+	•	“A hallucination can be logically false even when it mentions the same facts.”
+	•	“This NLI step captures semantic conflicts, not just mismatches.”
+	•	“We use contradiction scores to detect hallucinations like ‘declined’ vs ‘increased’.
+
+
+next alide
+
+Signal Source
+Metric
+Semantic Module
+Combined similarity score
+Factual Module
+Overall consistency score
+Entailment Module
+Contradiction score (max bidir.)
+
+
+
+
+We don’t rely on a black-box model.
+Instead, we use thresholded signals from 3 modules and apply logical rules.
+
+We prioritize transparency and explainability.”
+	•	“This logic lets users trace why a hallucination was flagged.”
+	•	“We also calibrate confidence based on multiple factors.”
+
+next alode
+
+Element
+Meaning
+Nodes
+Paragraphs (1 reference + N candidates)
+Edges
+Consistency links based on multi-view similarity
+Edge Weight
+1 − average hallucination score between pair
+Edge Type
+Consistent / Partial Hallucination / Mutual Hallucination
+
+
+text: actual paragraph
+	•	num_facts: number of claims extracted
+	•	num_entities: number of named entities
+	•	entropy: lexical entropy of the paragraph
+	•	classification: hallucination type
+	•	PageRank: trustworthiness/centrality score
+
+
+next slide
+
+Candidate Summary (abridged)
+Label
+Detected Type
+Confidence
+Reason
+“Revenue was $2.5M, up 15%. CEO announced expansion Jan 15.”
+CONSISTENT
+—
+—
+All facts aligned
+“Revenue was $3.2M, up 20%. Expansion Jan 20.”
+HALLUCINATED
+Factual Error
+0.90
+Money/date mismatch
+“Revenue declined in Q4. CEO announced expansion.”
+HALLUCINATED
+Contradiction
+0.85
+Opposite trend vs reference
+“Company performed well; CEO optimistic about future growth.”
+HALLUCINATED
+Omission
+0.75
+Key facts missing
+“Revenue fell to $2.5M. CEO abandoned expansion plans.”
+HALLUCINATED
+Fabrication
+0.82
+Opposite claim, hallucinated event
+
+
+All major hallucination types are detected accurately
+	•	Explanations are human-interpretable
+	•	Confidence levels align well with severity
+
+⸻
+
+🧠 Speaker Notes:
+	•	“We benchmarked our system on realistic candidate generations, including subtle and blatant hallucinations.”
+	•	“The classifier not only flags issues — it gives actionable insights.”
+	•	“This is especially helpful in LLM evaluation pipelines.”
+
+
