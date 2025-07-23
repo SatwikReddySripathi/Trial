@@ -1,0 +1,507 @@
+import re
+import json
+import numpy as np
+import pandas as pd
+from typing import List, Dict, Tuple, Any
+from collections import Counter, defaultdict
+import math
+
+# NLP and ML imports
+
+import nltk
+from nltk.tokenize import word_tokenize, sent_tokenize
+from nltk.corpus import stopwords
+import spacy
+from sklearn.feature_extraction.text import TfidfVectorizer
+from sklearn.metrics.pairwise import cosine_similarity
+from sklearn.ensemble import RandomForestClassifier
+from sklearn.preprocessing import LabelEncoder
+import networkx as nx
+
+# Deep learning imports
+
+import torch
+from transformers import AutoTokenizer, AutoModel
+from sentence_transformers import SentenceTransformer
+
+# Visualization imports
+
+import plotly.graph_objects as go
+import plotly.express as px
+from plotly.subplots import make_subplots
+import matplotlib.pyplot as plt
+
+# Download required NLTK data
+
+try:
+nltk.data.find(‘tokenizers/punkt’)
+except LookupError:
+nltk.download(‘punkt’)
+
+try:
+nltk.data.find(‘corpora/stopwords’)
+except LookupError:
+nltk.download(‘stopwords’)
+
+class HallucinationDetectionPipeline:
+def **init**(self):
+# Load NLP models
+self.nlp = spacy.load(“en_core_web_sm”)
+self.sentence_model = SentenceTransformer(‘all-MiniLM-L6-v2’)
+
+```
+    # Initialize components
+    self.tfidf_vectorizer = TfidfVectorizer(max_features=1000, stop_words='english')
+    self.classifier = RandomForestClassifier(n_estimators=100, random_state=42)
+    self.label_encoder = LabelEncoder()
+    
+    # Define categories
+    self.categories = [
+        'Factual error', 'Contradicts', 'Omission', 
+        'Extra information', 'Misleading', 'Consistent paragraphs'
+    ]
+    
+    self.stop_words = set(stopwords.words('english'))
+    
+def preprocess_text(self, text: str) -> str:
+    """Step 1: Preprocess text by removing unnecessary content"""
+    # Remove extra whitespace and newlines
+    text = re.sub(r'\s+', ' ', text)
+    text = re.sub(r'\n+', ' ', text)
+    
+    # Remove special characters but keep punctuation for sentence structure
+    text = re.sub(r'[^\w\s.,!?;:]', '', text)
+    
+    # Strip and normalize
+    text = text.strip()
+    
+    return text
+
+def calculate_semantic_similarity(self, reference: str, candidate: str) -> Dict[str, float]:
+    """Step 2 Part 1: Calculate aggregated semantic similarity scores"""
+    
+    # TF-IDF Cosine Similarity
+    tfidf_matrix = self.tfidf_vectorizer.fit_transform([reference, candidate])
+    tfidf_similarity = cosine_similarity(tfidf_matrix[0:1], tfidf_matrix[1:2])[0][0]
+    
+    # Jaccard Similarity
+    ref_words = set(word_tokenize(reference.lower())) - self.stop_words
+    cand_words = set(word_tokenize(candidate.lower())) - self.stop_words
+    jaccard_similarity = len(ref_words.intersection(cand_words)) / len(ref_words.union(cand_words)) if ref_words.union(cand_words) else 0
+    
+    # BERT-based semantic similarity
+    embeddings = self.sentence_model.encode([reference, candidate])
+    bert_similarity = cosine_similarity([embeddings[0]], [embeddings[1]])[0][0]
+    
+    # Cosine similarity on word embeddings (averaged)
+    ref_embedding = np.mean(embeddings[0].reshape(1, -1), axis=0)
+    cand_embedding = np.mean(embeddings[1].reshape(1, -1), axis=0)
+    cos_similarity = cosine_similarity([ref_embedding], [cand_embedding])[0][0]
+    
+    # Aggregate score
+    aggregate_score = (tfidf_similarity + jaccard_similarity + bert_similarity + cos_similarity) / 4
+    
+    return {
+        'tfidf_similarity': tfidf_similarity,
+        'jaccard_similarity': jaccard_similarity,
+        'bert_similarity': bert_similarity,
+        'cosine_similarity': cos_similarity,
+        'aggregate_semantic_score': aggregate_score
+    }
+
+def calculate_bidirectional_entailment(self, reference: str, candidate: str) -> Dict[str, float]:
+    """Step 2 Part 2: Calculate bidirectional entailment scores"""
+    # Simplified entailment using semantic similarity as proxy
+    # In production, you'd use a dedicated entailment model
+    
+    ref_embedding = self.sentence_model.encode([reference])
+    cand_embedding = self.sentence_model.encode([candidate])
+    
+    # Forward entailment (reference -> candidate)
+    forward_entailment = cosine_similarity(ref_embedding, cand_embedding)[0][0]
+    
+    # Backward entailment (candidate -> reference)
+    backward_entailment = cosine_similarity(cand_embedding, ref_embedding)[0][0]
+    
+    # Bidirectional score
+    bidirectional_score = (forward_entailment + backward_entailment) / 2
+    
+    return {
+        'forward_entailment': forward_entailment,
+        'backward_entailment': backward_entailment,
+        'bidirectional_entailment': bidirectional_score
+    }
+
+def calculate_shannon_entropy(self, paragraphs: List[str]) -> float:
+    """Step 2 Part 3: Calculate Shannon entropy for uncertainty detection"""
+    # Tokenize all paragraphs and create word frequency distribution
+    all_words = []
+    for paragraph in paragraphs:
+        words = word_tokenize(paragraph.lower())
+        all_words.extend([word for word in words if word not in self.stop_words])
+    
+    # Calculate word frequencies
+    word_counts = Counter(all_words)
+    total_words = len(all_words)
+    
+    # Calculate Shannon entropy
+    entropy = 0
+    for count in word_counts.values():
+        probability = count / total_words
+        if probability > 0:
+            entropy -= probability * math.log2(probability)
+    
+    return entropy
+
+def extract_entities(self, text: str) -> Dict[str, List]:
+    """Step 3 Part 1: Extract entities, dates, numbers, and values"""
+    doc = self.nlp(text)
+    
+    entities = {
+        'persons': [],
+        'organizations': [],
+        'locations': [],
+        'dates': [],
+        'numbers': [],
+        'money': [],
+        'misc_entities': []
+    }
+    
+    for ent in doc.ents:
+        if ent.label_ in ['PERSON']:
+            entities['persons'].append(ent.text)
+        elif ent.label_ in ['ORG']:
+            entities['organizations'].append(ent.text)
+        elif ent.label_ in ['GPE', 'LOC']:
+            entities['locations'].append(ent.text)
+        elif ent.label_ in ['DATE', 'TIME']:
+            entities['dates'].append(ent.text)
+        elif ent.label_ in ['CARDINAL', 'ORDINAL', 'QUANTITY']:
+            entities['numbers'].append(ent.text)
+        elif ent.label_ in ['MONEY']:
+            entities['money'].append(ent.text)
+        else:
+            entities['misc_entities'].append(ent.text)
+    
+    return entities
+
+def compare_entities(self, ref_entities: Dict, cand_entities: Dict) -> Dict[str, float]:
+    """Step 3 Part 2: Compare entities between reference and candidate"""
+    entity_scores = {}
+    
+    for entity_type in ref_entities.keys():
+        ref_set = set(ref_entities[entity_type])
+        cand_set = set(cand_entities[entity_type])
+        
+        if not ref_set and not cand_set:
+            entity_scores[f'{entity_type}_similarity'] = 1.0
+        elif not ref_set or not cand_set:
+            entity_scores[f'{entity_type}_similarity'] = 0.0
+        else:
+            intersection = len(ref_set.intersection(cand_set))
+            union = len(ref_set.union(cand_set))
+            entity_scores[f'{entity_type}_similarity'] = intersection / union if union > 0 else 0.0
+    
+    # Overall entity similarity
+    entity_scores['overall_entity_similarity'] = np.mean(list(entity_scores.values()))
+    
+    return entity_scores
+
+def classify_paragraph(self, features: Dict) -> str:
+    """Step 4: Multi-class classification"""
+    # Create feature vector
+    feature_vector = [
+        features.get('aggregate_semantic_score', 0),
+        features.get('bidirectional_entailment', 0),
+        features.get('overall_entity_similarity', 0),
+        features.get('shannon_entropy', 0)
+    ]
+    
+    # Rule-based classification (in production, use trained ML model)
+    semantic_score = features.get('aggregate_semantic_score', 0)
+    entity_score = features.get('overall_entity_similarity', 0)
+    entailment_score = features.get('bidirectional_entailment', 0)
+    
+    if semantic_score < 0.3 and entity_score < 0.3:
+        return 'Factual error'
+    elif entailment_score < 0.4:
+        return 'Contradicts'
+    elif semantic_score > 0.7 and entity_score < 0.5:
+        return 'Omission'
+    elif semantic_score < 0.6 and entity_score > 0.8:
+        return 'Extra information'
+    elif 0.4 <= semantic_score < 0.7:
+        return 'Misleading'
+    else:
+        return 'Consistent paragraphs'
+
+def build_graph(self, paragraphs: List[str], classifications: List[str], 
+               similarities: List[Dict]) -> nx.Graph:
+    """Step 5: Build graph with nodes as paragraphs and edges as relationships"""
+    G = nx.Graph()
+    
+    # Add nodes
+    for i, (paragraph, classification) in enumerate(zip(paragraphs, classifications)):
+        color = self.get_node_color(classification)
+        G.add_node(i, 
+                  text=paragraph[:100] + "..." if len(paragraph) > 100 else paragraph,
+                  classification=classification,
+                  color=color,
+                  full_text=paragraph)
+    
+    # Add edges based on similarity
+    for i in range(len(paragraphs)):
+        for j in range(i + 1, len(paragraphs)):
+            similarity = similarities[i] if i < len(similarities) else {'aggregate_semantic_score': 0}
+            edge_color, edge_weight = self.get_edge_properties(
+                classifications[i], classifications[j], 
+                similarity.get('aggregate_semantic_score', 0)
+            )
+            
+            G.add_edge(i, j, 
+                      color=edge_color, 
+                      weight=edge_weight,
+                      similarity=similarity.get('aggregate_semantic_score', 0))
+    
+    return G
+
+def get_node_color(self, classification: str) -> str:
+    """Get node color based on classification"""
+    color_map = {
+        'Factual error': 'red',
+        'Contradicts': 'red',
+        'Omission': 'orange',
+        'Extra information': 'yellow',
+        'Misleading': 'red',
+        'Consistent paragraphs': 'blue'
+    }
+    return color_map.get(classification, 'gray')
+
+def get_edge_properties(self, class1: str, class2: str, similarity: float) -> Tuple[str, float]:
+    """Get edge color and weight based on classifications and similarity"""
+    if similarity > 0.8:
+        return 'green', 3.0  # Consistent
+    elif similarity > 0.5:
+        return 'yellow', 2.0  # Partial consistency
+    else:
+        return 'red', 1.0    # Inconsistent/Hallucination
+
+def calculate_overall_scores(self, classifications: List[str], 
+                           similarities: List[Dict]) -> Dict[str, float]:
+    """Calculate overall pipeline scores"""
+    # Reliability score (percentage of consistent paragraphs)
+    consistent_count = sum(1 for c in classifications if c == 'Consistent paragraphs')
+    reliability_score = consistent_count / len(classifications) if classifications else 0
+    
+    # Factual score (1 - percentage of factual errors)
+    factual_errors = sum(1 for c in classifications if c in ['Factual error', 'Contradicts'])
+    factual_score = 1 - (factual_errors / len(classifications)) if classifications else 1
+    
+    # Semantic score (average semantic similarity)
+    semantic_scores = [s.get('aggregate_semantic_score', 0) for s in similarities]
+    semantic_score = np.mean(semantic_scores) if semantic_scores else 0
+    
+    # Completeness score (1 - percentage of omissions)
+    omissions = sum(1 for c in classifications if c == 'Omission')
+    completeness_score = 1 - (omissions / len(classifications)) if classifications else 1
+    
+    return {
+        'reliability_score': reliability_score,
+        'factual_score': factual_score,
+        'semantic_score': semantic_score,
+        'information_completeness': completeness_score
+    }
+
+def create_3d_visualization(self, graph: nx.Graph, overall_scores: Dict) -> go.Figure:
+    """Create 3D visualization using Plotly"""
+    # Get node positions using spring layout
+    pos = nx.spring_layout(graph, dim=3, seed=42)
+    
+    # Extract node information
+    node_x = [pos[node][0] for node in graph.nodes()]
+    node_y = [pos[node][1] for node in graph.nodes()]
+    node_z = [pos[node][2] for node in graph.nodes()]
+    
+    node_colors = [graph.nodes[node]['color'] for node in graph.nodes()]
+    node_text = [f"Node {node}<br>Classification: {graph.nodes[node]['classification']}<br>Text: {graph.nodes[node]['text']}" 
+                for node in graph.nodes()]
+    
+    # Create edge traces
+    edge_x, edge_y, edge_z = [], [], []
+    edge_colors = []
+    
+    for edge in graph.edges():
+        x0, y0, z0 = pos[edge[0]]
+        x1, y1, z1 = pos[edge[1]]
+        edge_x.extend([x0, x1, None])
+        edge_y.extend([y0, y1, None])
+        edge_z.extend([z0, z1, None])
+        edge_colors.append(graph.edges[edge]['color'])
+    
+    # Create figure
+    fig = go.Figure()
+    
+    # Add edges
+    fig.add_trace(go.Scatter3d(
+        x=edge_x, y=edge_y, z=edge_z,
+        mode='lines',
+        line=dict(color='gray', width=2),
+        hoverinfo='none',
+        showlegend=False
+    ))
+    
+    # Add nodes
+    fig.add_trace(go.Scatter3d(
+        x=node_x, y=node_y, z=node_z,
+        mode='markers',
+        marker=dict(
+            size=12,
+            color=node_colors,
+            line=dict(width=2, color='black')
+        ),
+        text=node_text,
+        hoverinfo='text',
+        showlegend=False
+    ))
+    
+    # Update layout
+    fig.update_layout(
+        title=f"Hallucination Detection Visualization<br>" +
+              f"Reliability: {overall_scores['reliability_score']:.2f} | " +
+              f"Factual: {overall_scores['factual_score']:.2f} | " +
+              f"Semantic: {overall_scores['semantic_score']:.2f} | " +
+              f"Completeness: {overall_scores['information_completeness']:.2f}",
+        scene=dict(
+            xaxis=dict(showbackground=False),
+            yaxis=dict(showbackground=False),
+            zaxis=dict(showbackground=False),
+        ),
+        showlegend=True,
+        height=700
+    )
+    
+    return fig
+
+def run_pipeline(self, reference_paragraph: str, model_paragraphs: List[str]) -> Dict:
+    """Run the complete pipeline"""
+    # Step 1: Preprocess
+    reference_clean = self.preprocess_text(reference_paragraph)
+    paragraphs_clean = [self.preprocess_text(p) for p in model_paragraphs]
+    
+    # Step 2: Semantic analysis
+    similarities = []
+    entailments = []
+    
+    for paragraph in paragraphs_clean:
+        # Semantic similarity
+        sim_scores = self.calculate_semantic_similarity(reference_clean, paragraph)
+        similarities.append(sim_scores)
+        
+        # Entailment
+        entail_scores = self.calculate_bidirectional_entailment(reference_clean, paragraph)
+        entailments.append(entail_scores)
+    
+    # Shannon entropy
+    shannon_entropy = self.calculate_shannon_entropy(paragraphs_clean)
+    
+    # Step 3: Entity extraction and comparison
+    ref_entities = self.extract_entities(reference_clean)
+    entity_comparisons = []
+    
+    for paragraph in paragraphs_clean:
+        cand_entities = self.extract_entities(paragraph)
+        entity_comp = self.compare_entities(ref_entities, cand_entities)
+        entity_comparisons.append(entity_comp)
+    
+    # Step 4: Classification
+    classifications = []
+    for i, paragraph in enumerate(paragraphs_clean):
+        features = {
+            **similarities[i],
+            **entailments[i],
+            **entity_comparisons[i],
+            'shannon_entropy': shannon_entropy
+        }
+        classification = self.classify_paragraph(features)
+        classifications.append(classification)
+    
+    # Step 5: Build graph
+    graph = self.build_graph(paragraphs_clean, classifications, similarities)
+    
+    # Calculate overall scores
+    overall_scores = self.calculate_overall_scores(classifications, similarities)
+    
+    # Create visualization
+    visualization = self.create_3d_visualization(graph, overall_scores)
+    
+    return {
+        'classifications': classifications,
+        'similarities': similarities,
+        'entailments': entailments,
+        'entity_comparisons': entity_comparisons,
+        'shannon_entropy': shannon_entropy,
+        'graph': graph,
+        'overall_scores': overall_scores,
+        'visualization': visualization,
+        'processed_paragraphs': paragraphs_clean
+    }
+```
+
+# Example usage
+
+def run_example():
+# Initialize pipeline
+pipeline = HallucinationDetectionPipeline()
+
+```
+# Example data
+reference = """
+The Eiffel Tower is a wrought-iron lattice tower on the Champ de Mars in Paris, France. 
+It is named after the engineer Gustave Eiffel, whose company designed and built the tower. 
+Constructed from 1887 to 1889, it was the world's tallest man-made structure until 1930.
+"""
+
+model_paragraphs = [
+    """
+    The Eiffel Tower is located in Paris, France and was built by Gustave Eiffel's company. 
+    It was constructed between 1887 and 1889 and held the record as the world's tallest structure until 1930.
+    """,
+    """
+    The Eiffel Tower in London is made of steel and was built in 1890 by Thomas Edison. 
+    It stands 400 meters tall and is painted blue.
+    """,
+    """
+    The tower in Paris was designed by Gustave Eiffel and is made of wrought iron. 
+    However, it was completed in 1885 and is located near the Seine River.
+    """,
+    """
+    Paris has a famous iron tower called the Eiffel Tower, built in the late 1800s. 
+    It was the tallest building until the 1930s when other structures surpassed it.
+    """
+]
+
+# Run pipeline
+results = pipeline.run_pipeline(reference, model_paragraphs)
+
+# Display results
+print("=== HALLUCINATION DETECTION RESULTS ===")
+print(f"\nOverall Scores:")
+for score_name, score_value in results['overall_scores'].items():
+    print(f"  {score_name}: {score_value:.3f}")
+
+print(f"\nClassifications:")
+for i, classification in enumerate(results['classifications']):
+    print(f"  Paragraph {i+1}: {classification}")
+
+print(f"\nShannon Entropy: {results['shannon_entropy']:.3f}")
+
+# Show visualization
+results['visualization'].show()
+
+return results
+```
+
+# Run the example
+
+if **name** == “**main**”:
+results = run_example()
